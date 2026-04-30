@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CryptoQuant Terminal</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg: #0a0e14;
+    --bg-panel: #0f1419;
+    --border: #1a2332;
+    --text: #bfbdb6;
+    --text-dim: #5c6773;
+    --text-bright: #e6e1cf;
+    --green: #7fd962;
+    --red: #f26d78;
+    --blue: #59c2ff;
+    --yellow: #ffb454;
+    --cyan: #95e6cb;
+    --pink: #d2a6ff;
+    --orange: #ff8f40;
+    --mono: 'Fira Code', 'Cascadia Mono', 'JetBrains Mono', 'Consolas', monospace;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.6;
+    padding: 12px;
+    min-height: 100vh;
+  }
+
+  /* Scanline overlay for CRT feel */
+  body::after {
+    content: "";
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      rgba(0,0,0,0.03) 0px,
+      rgba(0,0,0,0.03) 1px,
+      transparent 1px,
+      transparent 2px
+    );
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  .container { max-width: 900px; margin: 0 auto; }
+
+  /* --- HEADER --- */
+  .header {
+    border-bottom: 1px solid var(--border);
+    padding: 12px 0 16px;
+    margin-bottom: 16px;
+  }
+  .header-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .title {
+    color: var(--cyan);
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 1px;
+  }
+  .title .dim { color: var(--text-dim); font-weight: 400; }
+  .status-line {
+    color: var(--text-dim);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .badge-live { background: rgba(127,217,98,0.12); color: var(--green); }
+  .badge-sim  { background: rgba(255,180,84,0.12); color: var(--yellow); }
+  .badge-off  { background: rgba(242,109,120,0.12); color: var(--red); }
+  .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px; }
+  .dot-green  { background: var(--green);  animation: blink 1.5s infinite; }
+  .dot-yellow { background: var(--yellow); }
+  .dot-red    { background: var(--red); }
+  @keyframes blink { 0%,100%{opacity:1;} 50%{opacity:0.2;} }
+
+  /* --- PRICE TICKER --- */
+  .ticker {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin: 8px 0;
+    flex-wrap: wrap;
+  }
+  .ticker .price {
+    font-size: 36px;
+    font-weight: 700;
+    color: var(--text-bright);
+    letter-spacing: -1px;
+  }
+  .ticker .change {
+    font-size: 18px;
+    font-weight: 600;
+  }
+  .ticker .meta {
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  /* --- GRID --- */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+
+  /* --- PANEL --- */
+  .panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+  }
+  .panel-hdr {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .panel-hdr .label {
+    color: var(--text-dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+  }
+  .panel-hdr .val {
+    color: var(--text);
+    font-size: 11px;
+  }
+
+  /* --- KEY-VALUE --- */
+  .kv { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; }
+  .kv .k { color: var(--text-dim); font-size: 11px; }
+  .kv .v { color: var(--text-bright); font-size: 13px; font-weight: 500; }
+
+  /* --- POSITION --- */
+  .pos-row {
+    display: grid;
+    grid-template-columns: 40px 1fr 1fr 1fr;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(26,35,50,0.5);
+    align-items: center;
+    font-size: 12px;
+  }
+  .pos-row:last-child { border-bottom: none; }
+  .pos-side { font-weight: 700; }
+  .long  { color: var(--green); }
+  .short { color: var(--red); }
+  .pnl-pos { color: var(--green); }
+  .pnl-neg { color: var(--red); }
+  .pos-empty {
+    text-align: center;
+    color: var(--text-dim);
+    padding: 16px;
+    font-size: 12px;
+  }
+
+  /* --- TRADE LOG --- */
+  .trade-log {
+    max-height: 200px;
+    overflow-y: auto;
+    font-size: 11px;
+    line-height: 1.8;
+  }
+  .trade-log::-webkit-scrollbar { width: 4px; }
+  .trade-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .trade-line { padding: 2px 4px; border-radius: 2px; }
+  .trade-line:hover { background: rgba(255,255,255,0.03); }
+  .trade-line .ts { color: var(--text-dim); margin-right: 8px; }
+  .trade-line .act-buy  { color: var(--green);  font-weight: 600; }
+  .trade-line .act-sell { color: var(--red);    font-weight: 600; }
+  .trade-line .act-open { color: var(--yellow); font-weight: 600; }
+  .trade-line .act-close{ color: var(--text); }
+
+  /* --- SIGNAL LOG (live from log) --- */
+  .signal-log {
+    max-height: 180px;
+    overflow-y: auto;
+    font-size: 11px;
+    line-height: 1.7;
+  }
+  .signal-log::-webkit-scrollbar { width: 4px; }
+  .signal-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .signal-line { padding: 2px 4px; border-radius: 2px; font-family: var(--mono); }
+  .signal-line:hover { background: rgba(255,255,255,0.03); }
+  .sig-HOLD  { color: var(--text-dim); }
+  .sig-LONG  { color: var(--green);  font-weight: 600; }
+  .sig-SHORT { color: var(--red);   font-weight: 600; }
+  .sig-SELL  { color: var(--orange); }
+  .sig-COVER { color: var(--cyan); }
+
+  /* --- INDICATOR TABLE --- */
+  .ind-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+  }
+  .ind-table td {
+    padding: 3px 6px;
+  }
+  .ind-table .ind-k { color: var(--text-dim); width: 50%; }
+  .ind-table .ind-v { color: var(--text); text-align: right; font-weight: 500; }
+
+  /* --- SPARKLINE --- */
+  .sparkline-container {
+    margin-top: 8px;
+    height: 50px;
+  }
+
+  /* --- FOOTER --- */
+  .footer {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 10px;
+    padding: 16px 0 8px;
+    border-top: 1px solid var(--border);
+    margin-top: 16px;
+  }
+  .footer .refresh {
+    color: var(--cyan);
+    cursor: pointer;
+  }
+
+  /* Mobile */
+  @media (max-width: 700px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    .ticker .price { font-size: 26px; }
+    .title { font-size: 14px; }
+    body { padding: 8px; font-size: 12px; }
+    .pos-row { grid-template-columns: 32px 1fr 1fr; }
+    .pos-row > *:nth-child(4) { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- ===== HEADER ===== -->
+  <div class="header">
+    <div class="header-top">
+      <div class="title">CryptoQuant<span class="dim">.terminal</span></div>
+      <div>
+        <span class="badge badge-live" id="mode-badge">
+          <span class="dot dot-green"></span>SIM
+        </span>
+      </div>
+    </div>
+    <div class="ticker">
+      <span class="price" id="price">---</span>
+      <span class="change" id="change"></span>
+      <span class="meta">
+        H:<span id="high">--</span> L:<span id="low">--</span>
+      </span>
+    </div>
+    <div class="status-line">
+      <span>⏱ <span id="uptime">--</span></span>
+      &nbsp;·&nbsp;
+      <span>📡 WS: <span id="ws-status" style="color:var(--green)">●</span></span>
+      &nbsp;·&nbsp;
+      <span id="updated">--</span>
+    </div>
+  </div>
+
+  <!-- ===== METRICS ===== -->
+  <div class="grid-2">
+    <div class="panel">
+      <div class="panel-hdr"><span class="label">ACCOUNT</span><span class="val">SIM|1,000</span></div>
+      <div class="kv"><span class="k">权益</span><span class="v" id="equity">--</span></div>
+      <div class="kv"><span class="k">现金</span><span class="v" id="cash">--</span></div>
+      <div class="kv"><span class="k">总收益</span><span class="v" id="total-return">--</span></div>
+    </div>
+    <div class="panel">
+      <div class="panel-hdr"><span class="label">STATS</span><span class="val" id="stats-hdr">-</span></div>
+      <div class="kv"><span class="k">总交易</span><span class="v" id="total-trades">0</span></div>
+      <div class="kv"><span class="k">胜率</span><span class="v" id="win-rate">--</span></div>
+      <div class="kv"><span class="k">连胜</span><span class="v" id="streak">--</span></div>
+    </div>
+  </div>
+
+  <!-- ===== POSITION + INDICATORS ===== -->
+  <div class="grid-2">
+    <div class="panel">
+      <div class="panel-hdr"><span class="label">POSITION</span><span class="val" id="pos-hdr">无</span></div>
+      <div id="position-area"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-hdr"><span class="label">INDICATORS</span><span class="val" id="sig-latest">--</span></div>
+      <table class="ind-table" id="ind-body"></table>
+      <div class="sparkline-container">
+        <svg id="sparkline" width="100%" height="50" viewBox="0 0 300 50" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== SIGNAL LOG + TRADE LOG ===== -->
+  <div class="grid-2">
+    <div class="panel">
+      <div class="panel-hdr"><span class="label">SIGNAL LOG</span><span class="val" id="sig-count">0</span></div>
+      <div class="signal-log" id="signal-log">
+        <div class="signal-line" style="color:var(--text-dim)">等待第一个K线闭合信号...</div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-hdr"><span class="label">TRADE LOG</span><span class="val" id="trade-count">0</span></div>
+      <div class="trade-log" id="trade-log">
+        <div class="trade-line" style="color:var(--text-dim)">暂无交易记录</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== FOOTER ===== -->
+  <div class="footer">
+    CryptoQuant v0.2 · Hermes Agent · <span class="refresh" onclick="fetchData()">↻ refresh</span>
+    · auto-refresh every 3s
+  </div>
+
+</div>
+
+<script>
+// ── State ──
+let lastPrice = 0;
+let priceSeries = [];
+
+// ── Fetch ──
+async function fetchData() {
+  try {
+    const r = await fetch('/api/data?_=' + Date.now());
+    const d = await r.json();
+    render(d);
+  } catch(e) {
+    document.getElementById('ws-status').innerHTML = '<span style="color:var(--red)">✕</span>';
+  }
+}
+
+// ── Render ──
+function render(d) {
+  const p = d.current_price || 0;
+
+  // Mode badge
+  const mb = document.getElementById('mode-badge');
+  if (d.mode === 'LIVE') {
+    mb.className = 'badge badge-live';
+    mb.innerHTML = '<span class="dot dot-green"></span>LIVE';
+  } else {
+    mb.className = 'badge badge-sim';
+    mb.innerHTML = '<span class="dot dot-yellow"></span>SIM';
+  }
+
+  // Ticker
+  document.getElementById('price').textContent = p > 0 ? '$' + p.toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0}) : '---';
+  const cp = d.change_pct || 0;
+  const ch = document.getElementById('change');
+  ch.textContent = cp !== 0 ? (cp > 0 ? '+' : '') + cp.toFixed(2) + '%' : '';
+  ch.style.color = cp > 0 ? 'var(--green)' : cp < 0 ? 'var(--red)' : 'var(--text-dim)';
+  document.getElementById('high').textContent = d.high_24h > 0 ? '$' + d.high_24h.toFixed(0) : '--';
+  document.getElementById('low').textContent  = d.low_24h  > 0 ? '$' + d.low_24h.toFixed(0)  : '--';
+
+  // Status
+  if (p > 0) {
+    if (lastPrice === 0) { lastPrice = p; }
+    document.getElementById('ws-status').innerHTML = '<span style="color:var(--green)">●</span>';
+  }
+  document.getElementById('updated').textContent = d.updated_at || '';
+
+  // Account
+  document.getElementById('equity').textContent  = '$' + (d.equity || 0).toLocaleString(undefined, {minFractionDigits:2,maxFractionDigits:2});
+  document.getElementById('cash').textContent    = '$' + (d.cash || 0).toLocaleString(undefined, {minFractionDigits:2,maxFractionDigits:2});
+  const trEl = document.getElementById('total-return');
+  const tr = d.total_return_pct || 0;
+  trEl.textContent = (tr >= 0 ? '+' : '') + tr.toFixed(2) + '%';
+  trEl.style.color = tr >= 0 ? 'var(--green)' : 'var(--red)';
+
+  // Stats
+  const s = d.stats || {};
+  document.getElementById('total-trades').textContent = s.total_trades || 0;
+  document.getElementById('win-rate').textContent = s.win_rate ? s.win_rate.toFixed(1) + '%' : (s.win_rate === 0 ? '0.0%' : '--');
+  document.getElementById('streak').textContent = s.consecutive_losses ? '-' + s.consecutive_losses : (s.total_trades ? 'N/A' : '--');
+
+  // Position
+  const pa = document.getElementById('position-area');
+  const ph = document.getElementById('pos-hdr');
+  if (d.position) {
+    const pos = d.position;
+    ph.textContent = pos.side.toUpperCase() + ' ' + (pos.leverage || 1) + 'x';
+    const pnlClass = (pos.pnl || 0) >= 0 ? 'pnl-pos' : 'pnl-neg';
+    const pnlSign = (pos.pnl || 0) >= 0 ? '+' : '';
+    pa.innerHTML = `
+      <div class="pos-row">
+        <span class="pos-side ${pos.side === 'long' ? 'long' : 'short'}">${pos.side.toUpperCase()}</span>
+        <span>${pos.size.toFixed(4)} @ $${pos.entry_price.toLocaleString()}</span>
+        <span>now $${pos.current_price.toLocaleString()}</span>
+        <span class="${pnlClass}">${pnlSign}$${Math.abs(pos.pnl||0).toFixed(2)}</span>
+      </div>
+      <div style="margin-top:6px;font-size:11px;color:var(--text-dim);display:flex;gap:16px;flex-wrap:wrap;">
+        <span>杠杆: <b style="color:var(--text)">${pos.leverage || 1}x</b></span>
+        <span>保证金: <b style="color:var(--text)">$${(pos.margin||0).toFixed(0)}</b></span>
+        <span>PnL%: <b style="color:${(pos.pnl_pct||0) >= 0 ? 'var(--green)' : 'var(--red)'}">${(pos.pnl_pct||0) >= 0 ? '+' : ''}${(pos.pnl_pct||0).toFixed(2)}%</b></span>
+      </div>`;
+  } else {
+    ph.textContent = 'FLAT';
+    pa.innerHTML = '<div class="pos-empty">┈ 无持仓 ┈</div>';
+  }
+
+  // Indicators
+  const ind = d.indicators || {};
+  document.getElementById('ind-body').innerHTML = `
+    <tr><td class="ind-k">MA7</td><td class="ind-v">${ind.ma7 ? '$' + ind.ma7.toFixed(0) : '--'}</td></tr>
+    <tr><td class="ind-k">MA25</td><td class="ind-v">${ind.ma25 ? '$' + ind.ma25.toFixed(0) : '--'}</td></tr>
+    <tr><td class="ind-k">MA99</td><td class="ind-v">${ind.ma99 ? '$' + ind.ma99.toFixed(0) : '--'}</td></tr>
+    <tr><td class="ind-k">RSI(14)</td><td class="ind-v" style="color:${ind.rsi > 70 ? 'var(--red)' : ind.rsi < 30 ? 'var(--green)' : 'var(--text)'}">${ind.rsi != null ? ind.rsi.toFixed(1) : '--'}</td></tr>
+    <tr><td class="ind-k">ADX</td><td class="ind-v">${ind.adx != null ? ind.adx.toFixed(1) : '--'}</td></tr>
+    <tr><td class="ind-k">MACD Hist</td><td class="ind-v" style="color:${ind.macd_hist > 0 ? 'var(--green)' : 'var(--red)'}">${ind.macd_hist != null ? (ind.macd_hist >= 0 ? '+' : '') + ind.macd_hist.toFixed(1) : '--'}</td></tr>
+    <tr><td class="ind-k">Volatility</td><td class="ind-v">${ind.volatility != null ? ind.volatility.toFixed(2) + '%' : '--'}</td></tr>
+  `;
+
+  // Sparkline
+  if (p > 0) {
+    priceSeries.push(p);
+    if (priceSeries.length > 80) priceSeries = priceSeries.slice(-80);
+    drawSparkline(priceSeries);
+  }
+  lastPrice = p;
+
+  // Trade log
+  const trades = d.trades || [];
+  const tl = document.getElementById('trade-log');
+  document.getElementById('trade-count').textContent = trades.length;
+  if (trades.length === 0) {
+    tl.innerHTML = '<div class="trade-line" style="color:var(--text-dim)">暂无交易记录</div>';
+  } else {
+    tl.innerHTML = trades.slice(-30).reverse().map(t => {
+      const isOpen = t.action === '做多' || t.action === '做空';
+      const isClose = t.action === '平多' || t.action === '平空';
+      let cls = isOpen ? 'act-open' : (isClose ? 'act-close' : '');
+      if (t.action === '做多' || t.action === '平多') cls = isOpen ? 'act-buy' : 'act-close';
+      if (t.action === '做空' || t.action === '平空') cls = isOpen ? 'act-sell' : 'act-close';
+
+      let detail = t.action + ' @ $' + (t.price||0).toLocaleString();
+      if (t.leverage) detail += ' | ' + t.leverage + 'x';
+      if (t.net_pnl !== undefined && t.net_pnl !== 0) {
+        const sign = t.net_pnl >= 0 ? '+' : '';
+        detail += ' | 净利=' + sign + '$' + t.net_pnl.toFixed(2);
+      }
+      if (t.balance > 0) detail += ' | 余额=$' + t.balance.toFixed(2);
+
+      return '<div class="trade-line"><span class="ts">' + t.time.split(' ')[1] + '</span><span class="' + cls + '">' + detail + '</span></div>';
+    }).join('\n');
+  }
+
+  // Signal log — from recent log lines (via a quick backend fetch)
+  fetchSignalLog();
+}
+
+// ── Signal log from /api/signals ──
+async function fetchSignalLog() {
+  try {
+    const r = await fetch('/api/signals?_=' + Date.now());
+    if (!r.ok) return;  // if endpoint doesn't exist yet, skip silently
+    const signals = await r.json();
+    const sl = document.getElementById('signal-log');
+    document.getElementById('sig-count').textContent = signals.length;
+    if (signals.length === 0) {
+      sl.innerHTML = '<div class="signal-line" style="color:var(--text-dim)">等待K线闭合信号...</div>';
+      document.getElementById('sig-latest').textContent = '--';
+    } else {
+      sl.innerHTML = signals.slice(-40).reverse().map(s => {
+        return '<div class="signal-line"><span class="ts">' + s.time + '</span><span class="sig-' + s.signal + '">' + s.signal + ' @ $' + s.price.toLocaleString() + '</span> <span style="color:var(--text-dim);">Eq=' + (s.equity||0).toLocaleString() + '</span></div>';
+      }).join('\n');
+      const latest = signals[signals.length - 1];
+      if (latest) {
+        document.getElementById('sig-latest').textContent = latest.signal + ' #' + latest.kline;
+      }
+    }
+  } catch(e) {}
+}
+
+// ── SVG Sparkline ──
+function drawSparkline(series) {
+  if (series.length < 2) return;
+  const svg = document.getElementById('sparkline');
+  const w = 300, h = 50, pad = 4;
+  const min = Math.min(...series), max = Math.max(...series);
+  const range = max - min || 1;
+  const step = w / (series.length - 1);
+
+  let path = '';
+  series.forEach((v, i) => {
+    const x = i * step;
+    const y = h - pad - ((v - min) / range * (h - pad*2));
+    path += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+  });
+
+  // Gradient fill
+  svg.innerHTML = `
+    <defs>
+      <linearGradient id="grad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${series[series.length-1] >= series[0] ? 'rgba(127,217,98,0.18)' : 'rgba(242,109,120,0.18)'}"/>
+        <stop offset="100%" stop-color="rgba(0,0,0,0)"/>
+      </linearGradient>
+    </defs>
+    <path d="${path} L${(series.length-1)*step},${h-pad} L0,${h-pad} Z" fill="url(#grad)" stroke="none"/>
+    <path d="${path}" fill="none" stroke="${series[series.length-1] >= series[0] ? 'var(--green)' : 'var(--red)'}" stroke-width="1.5" stroke-linejoin="round"/>
+  `;
+}
+
+// ── Init ──
+fetchData();
+setInterval(fetchData, 3000);
+</script>
+</body>
+</html>

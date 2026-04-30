@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.egg
+.eggs/
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# CryptoQuant - 敏感数据
+data/live_futures_state.json
+data/live_state.json
+data/okx_live_state.json
+data/okx_orders.json
+data/live_trading.log
+data/okx_live_trading.log
+data/dashboard_server.log
+data/ws_price_snapshot.json
+data/decision_snapshots.db
+data/experience_lessons.db
+data/klines/
+data/backtest_results/
+data/__pycache__/
+data/*.db
+
+# Config with secrets
+config/settings.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dashboard test files
+data/test_dashboard_*.html
