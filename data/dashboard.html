@@ -342,7 +342,7 @@
   <!-- ===== FOOTER ===== -->
   <div class="footer">
     CryptoQuant v0.2 · Hermes Agent · <span class="refresh" onclick="fetchData()">↻ refresh</span>
-    · auto-refresh every 3s
+    · <span id="refresh-info" style="color:var(--acc)">waiting...</span>
   </div>
 
 </div>
@@ -351,12 +351,17 @@
 // ── State ──
 let lastPrice = 0;
 let priceSeries = [];
+let refreshCount = 0;
+let lastRefreshTime = '';
 
 // ── Fetch ──
 async function fetchData() {
   try {
     const r = await fetch('/api/data?_=' + Date.now());
     const d = await r.json();
+    refreshCount++;
+    lastRefreshTime = new Date().toLocaleTimeString();
+    document.getElementById('refresh-info').textContent = `refresh #${refreshCount} @ ${lastRefreshTime}`;
     render(d);
   } catch(e) {
     document.getElementById('ws-status').innerHTML = '<span style="color:var(--red)">✕</span>';
@@ -392,6 +397,17 @@ function render(d) {
     document.getElementById('ws-status').innerHTML = '<span style="color:var(--green)">●</span>';
   }
   document.getElementById('updated').textContent = d.updated_at || '';
+
+  // K线倒计时
+  if (d.kline && d.kline.close_time) {
+    const now = Date.now();
+    const remaining = Math.max(0, Math.ceil((d.kline.close_time - now) / 1000));
+    const min = Math.floor(remaining / 60);
+    const sec = remaining % 60;
+    document.getElementById('uptime').textContent = `${min}:${String(sec).padStart(2,'0')} to close`;
+  } else {
+    document.getElementById('uptime').textContent = '--';
+  }
 
   // Account
   document.getElementById('equity').textContent  = '$' + (d.equity || 0).toLocaleString(undefined, {minFractionDigits:2,maxFractionDigits:2});
@@ -537,6 +553,11 @@ function drawSparkline(series) {
 // ── Init ──
 fetchData();
 setInterval(fetchData, 3000);
+
+// 独立心跳：每秒更新标题，验证 JS 事件循环存活
+setInterval(() => {
+  document.title = '📊 ' + new Date().toLocaleTimeString() + ' | CryptoQuant';
+}, 1000);
 </script>
 </body>
 </html>

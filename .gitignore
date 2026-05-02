@@ -35,8 +35,19 @@ data/backtest_results/
 data/__pycache__/
 data/*.db
 
+# 训练和模型数据 (体积大)
+data/training/
+data/models/
+data/factor_reports/
+data/reviews/
+ml/
+
 # Config with secrets
 config/settings.yaml
+
+# 环境变量
+.env
+.env.*
 
 # OS
 .DS_Store
@@ -44,3 +55,7 @@ Thumbs.db
 
 # Dashboard test files
 data/test_dashboard_*.html
+
+# Cron / log outputs
+*.log
+nohup.out

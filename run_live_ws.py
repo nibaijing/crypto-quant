@@ -31,6 +31,8 @@ from core.config import init_config
 from execution.executor_v2 import FuturesExecutor, LiveAccount, LivePosition, LiveOrder
 from strategies.spot.optimized_v6 import OptimizedStrategy
 from data.ws_price_stream import SharedMarketState, BinanceWebSocket, create_price_stream
+from data.alpha_factors import AlphaFactors
+from ml.lgb_predictor import LGBAdapter
 from notifier import notify_trade
 
 # ===== 日志 =====
@@ -52,6 +54,7 @@ market_state: SharedMarketState = None
 ws_client: BinanceWebSocket = None
 executor: FuturesExecutor = None
 strategy: OptimizedStrategy = None
+alpha_factors: AlphaFactors = None
 running = True
 start_time: datetime = None
 kline_count = 0
@@ -75,9 +78,16 @@ def get_uptime() -> str:
 
 
 def fetch_historical_klines() -> pd.DataFrame:
-    """拉取历史200根K线用于策略初始化"""
-    klines = executor.get_klines("BTC-USDT", "15m", 200)
+    """拉取历史200根K线用于策略初始化 (3次重试)"""
+    klines = None
+    for attempt in range(3):
+        klines = executor.get_klines("BTC-USDT", "15m", 200)
+        if klines:
+            break
+        logger.warning(f"K线获取失败 (第{attempt+1}/3次)，5秒后重试...")
+        time.sleep(5)
     if not klines:
+        logger.error("❌ 3次重试后仍无法获取历史K线，将依赖WS在线构建")
         return pd.DataFrame()
     df = pd.DataFrame(klines)
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
@@ -99,6 +109,19 @@ def fetch_historical_klines() -> pd.DataFrame:
         df["macd_hist"] = df["macd"] - df["macd_signal"]
         df["volatility"] = df["close"].pct_change().rolling(20).std()
         df["volume_ma"] = df["volume"].rolling(20).mean()
+
+        # ADX (简版)
+        tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift(1)).abs(), (df['low'] - df['close'].shift(1)).abs()], axis=1).max(axis=1)
+        atr_14 = tr.rolling(14).mean()
+        plus_dm = ((df['high'].diff() > df['low'].diff() * -1) & (df['high'].diff() > 0)).astype(float) * df['high'].diff()
+        minus_dm = ((df['low'].diff() * -1 > df['high'].diff()) & (df['low'].diff() * -1 > 0)).astype(float) * (-df['low'].diff())
+        plus_di = 100 * plus_dm.rolling(14).mean() / atr_14
+        minus_di = 100 * minus_dm.rolling(14).mean() / atr_14
+        dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1)) * 100
+        df["adx"] = dx.rolling(14).mean()
+
+        # Alpha 因子集
+        df = alpha_factors.compute(df)
 
     return df
 
@@ -211,7 +234,7 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
 
 
 def main():
-    global market_state, ws_client, executor, strategy, start_time, kline_count
+    global market_state, ws_client, executor, strategy, alpha_factors, start_time, kline_count
 
     init_config()
     start_time = datetime.now()
@@ -221,6 +244,7 @@ def main():
     logger.info(f"   策略: OptimizedV6 | 合约 | 动态杠杆5-15x")
     logger.info(f"   数据: WebSocket 实时推送 (trade + kline_15m)")
     logger.info(f"   模式: K线闭合触发策略 | 秒级价格更新")
+    logger.info(f"   因子: Alpha 因子集 v1.0 (44个因子)")
     logger.info(f"   初始资金: $1,000")
     logger.info("=" * 60)
 
@@ -231,6 +255,15 @@ def main():
     executor = FuturesExecutor()
     executor.set_leverage(10)
     strategy = OptimizedStrategy()
+    alpha_factors = AlphaFactors()
+
+    # 加载 LightGBM 模型 (可选, 如果不存在则降级为纯 MATrend)
+    lgb_adapter = LGBAdapter(horizon=24)
+    if lgb_adapter.is_loaded():
+        strategy.lgb_adapter = lgb_adapter
+        logger.info(f"🧠 LightGBM 双确认已启用 | AUC={lgb_adapter.predictor.metrics.get('auc', '?'):.3f}")
+    else:
+        logger.info("⚠️ LightGBM 模型未找到, 仅依赖 MATrend 信号")
 
     # 启动 WebSocket
     market_state, ws_client = create_price_stream()
@@ -259,6 +292,17 @@ def main():
     df = fetch_historical_klines()
     if not df.empty:
         logger.info(f"初始数据: {len(df)} 条K线 | {df['datetime'].min()} ~ {df['datetime'].max()}")
+
+        # 初始化 Dashboard 指标（用最后一根K线的值）
+        last_row = df.iloc[-1]
+        init_indicators = {}
+        for key in ["ma_7", "ma_25", "ma_99", "rsi", "adx", "macd_hist", "volatility"]:
+            val = last_row.get(key)
+            if pd.notna(val):
+                init_indicators[key] = round(float(val), 2) if key != "adx" else round(float(val), 1)
+        if not init_indicators.get("adx"):
+            init_indicators["adx"] = 20.0
+        market_state.set_indicators(init_indicators)
 
     # 记录当前K线时间，避免重复触发
     init_kline = market_state.get_kline()
@@ -307,9 +351,22 @@ def main():
             kline_count += 1
             logger.info(f"📦 K线闭合 #{kline_count}: O={closed.open:.0f} H={closed.high:.0f} L={closed.low:.0f} C={closed.close:.0f}")
 
-            # 追加新K线到 DataFrame
+            # 如果 df 为空（初始化拉历史K线失败），用 WS 闭合K线增量构建
+            if df.empty:
+                row_dict = {
+                    "timestamp": closed.open_time, "open": closed.open, "high": closed.high,
+                    "low": closed.low, "close": closed.close, "volume": closed.volume,
+                    "datetime": pd.to_datetime(closed.open_time, unit="ms"),
+                }
+                df = pd.DataFrame([row_dict])
+                logger.info(f"🔧 WS 在线构建: df 从第1根K线开始累积")
+                continue  # 先攒够 100 根再跑策略
+
+            # 追加新K线到 DataFrame（用 loc 而非 concat，保留因子列）
             if not df.empty:
-                new_row = pd.DataFrame([{
+                new_idx = len(df)
+                # 用 loc 追加，保留所有现有列
+                row_dict = {
                     "timestamp": closed.open_time,
                     "open": closed.open,
                     "high": closed.high,
@@ -317,10 +374,10 @@ def main():
                     "close": closed.close,
                     "volume": closed.volume,
                     "datetime": pd.to_datetime(closed.open_time, unit="ms"),
-                }])
-                df = pd.concat([df, new_row], ignore_index=True)
+                }
+                df.loc[new_idx] = row_dict
 
-                # 重新计算指标
+                # 重算基础指标 + Alpha 因子（增量）
                 if len(df) >= 26:
                     df["ma_7"] = df["close"].rolling(7).mean()
                     df["ma_25"] = df["close"].rolling(25).mean()
@@ -335,6 +392,22 @@ def main():
                     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
                     df["macd_hist"] = df["macd"] - df["macd_signal"]
                     df["volatility"] = df["close"].pct_change().rolling(20).std()
+
+                    # ADX
+                    tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift(1)).abs(), (df['low'] - df['close'].shift(1)).abs()], axis=1).max(axis=1)
+                    atr_14 = tr.rolling(14).mean()
+                    plus_dm = ((df['high'].diff() > df['low'].diff() * -1) & (df['high'].diff() > 0)).astype(float) * df['high'].diff()
+                    minus_dm = ((df['low'].diff() * -1 > df['high'].diff()) & (df['low'].diff() * -1 > 0)).astype(float) * (-df['low'].diff())
+                    plus_di = 100 * plus_dm.rolling(14).mean() / atr_14
+                    minus_di = 100 * minus_dm.rolling(14).mean() / atr_14
+                    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1)) * 100
+                    df["adx"] = dx.rolling(14).mean()
+
+                    # Alpha 因子增量更新 (重算最后 ~140 行)
+                    try:
+                        df = alpha_factors.compute_incremental(df, row_dict)
+                    except Exception as e:
+                        logger.warning(f"Alpha因子更新失败: {e}")
 
                 # DF 太长就裁剪
                 if len(df) > 300:

@@ -52,6 +52,7 @@ def _read_snapshot():
             "high_24h": snap.get("high_24h", 0),
             "low_24h": snap.get("low_24h", 0),
             "indicators": snap.get("indicators", {}),
+            "kline": snap.get("kline", {}),
         })
 
     return snap
@@ -188,6 +189,9 @@ def get_all_data():
         high_24h = current_snap.get("high_24h", 0)
         low_24h = current_snap.get("low_24h", 0)
         indicators = current_snap.get("indicators", {})
+        # Normalize MA key names for frontend (ma_7 → ma7, etc.)
+        ma_map = {"ma_7": "ma7", "ma_25": "ma25", "ma_99": "ma99"}
+        indicators = {ma_map.get(k, k): v for k, v in indicators.items()}
         position_info = None
         total_equity = cash
         if pos and pos.get("size", 0) > 0:
@@ -237,6 +241,9 @@ def get_all_data():
         high_24h = current_snap.get("high_24h", 0)
         low_24h = current_snap.get("low_24h", 0)
         indicators = current_snap.get("indicators", {})
+        # Normalize MA key names for frontend (ma_7 → ma7, etc.)
+        ma_map = {"ma_7": "ma7", "ma_25": "ma25", "ma_99": "ma99"}
+        indicators = {ma_map.get(k, k): v for k, v in indicators.items()}
 
         position_info = None
         total_equity = cash
@@ -253,8 +260,8 @@ def get_all_data():
             else:
                 pnl = 0; pnl_pct = 0; total_equity = cash + margin
             position_info = {"side": side, "size": round(size, 6), "entry_price": round(entry, 2),
-                        "current_price": round(current_price, 2), "leverage": lev, "margin": round(margin, 2),
-                        "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2), "equity": round(total_equity, 2)}
+"current_price": round(current_price, 2), "leverage": lev, "margin": round(margin, 2),
+                    "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 2), "equity": round(total_equity, 2)}
 
         total_return = (total_equity - 1000) / 1000 * 100
 
@@ -265,11 +272,11 @@ def get_all_data():
             "current_price": round(current_price, 2), "change_pct": round(change_pct, 2),
             "high_24h": round(high_24h, 2), "low_24h": round(low_24h, 2), "indicators": indicators,
             "position": position_info,
+            "kline": current_snap.get("kline", {}),
             "stats": {"total_trades": total_trades, "winning_trades": winning_trades, "win_rate": round(win_rate, 1)},
             "price_history": [{"time": p["time"], "price": p["price"]} for p in prices[-40:]],
             "trades": trades[-30:],
         }
-
 
 if __name__ == "__main__":
     import sys

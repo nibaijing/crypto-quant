@@ -21,20 +21,20 @@ BEST_LONG_MULT = 1.5    # 做多仓位倍数
 BEST_SHORT_MULT = 2.5   # 做空仓位倍数 (做空信号更稀缺, 加倍)
 
 # === 风控参数 ===
-MAX_POSITION_PCT = 0.30  # 最大仓位比例 30%
-ATR_STOP_LONG = 2.0      # 做多 ATR 止损倍数
-ATR_STOP_SHORT = 2.5     # 做空 ATR 止损倍数 (做空更激进)
+MAX_POSITION_PCT = 0.15  # 最大仓位比例 30%
+ATR_STOP_LONG = 1.2      # 做多 ATR 止损倍数
+ATR_STOP_SHORT = 1.5     # 做空 ATR 止损倍数 (做空更激进)
 MAX_DRAWDOWN_PCT = 0.20  # 最大回撤 20% 熔断
 MAX_HOLD_BARS = 48       # 最大持仓K线数 (12小时)
 
 # === 信号阈值 ===
-RSI_LONG_ENTRY = 40      # 做多: RSI < 40 (回调到位)
-RSI_LONG_EXIT = 75       # 做多: RSI > 75 (过热平仓) — 放宽
-RSI_SHORT_ENTRY = 35     # 做空: RSI > 35 (不超卖时才空) — 放宽
-RSI_SHORT_EXIT = 25      # 做空: RSI < 25 (超卖平空)
+RSI_LONG_ENTRY = 44      # 做多: RSI < 40 (回调到位)
+RSI_LONG_EXIT = 70       # 做多: RSI > 75 (过热平仓) — 放宽
+RSI_SHORT_ENTRY = 50     # 做空: RSI > 35 (不超卖时才空) — 放宽
+RSI_SHORT_EXIT = 45      # 做空: RSI < 25 (超卖平空)
 MACD_LONG_THRESHOLD = 5  # MACD_hist > 5 即确认 (原15太严)
 MACD_SHORT_THRESHOLD = -5  # MACD_hist < -5 即确认 (原-15太严)
-ADX_THRESHOLD = 18       # ADX 须 > 18 过滤震荡 (原20太严)
+ADX_THRESHOLD = 23       # ADX 须 > 18 过滤震荡 (原20太严)
 DEVIATION_BULL = 0.02    # 高于 MA99 2% → 牛市
 DEVIATION_BEAR = -0.02   # 低于 MA99 2% → 熊市
 
@@ -42,11 +42,12 @@ DEVIATION_BEAR = -0.02   # 低于 MA99 2% → 熊市
 class OptimizedStrategy:
     """优化版多空双杀策略 — 向量化 + 实时信号"""
 
-    def __init__(self):
+    def __init__(self, lgb_adapter=None):
         self.name = "OptimizedV6"
         self.last_signal = None
         self.peak_equity = 0
         self.position_size = 0
+        self.lgb_adapter = lgb_adapter  # LightGBM 双确认适配器 (可选)
         
     def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """计算所有指标 (无副作用)"""
@@ -189,16 +190,38 @@ class OptimizedStrategy:
                 if rsi_val < RSI_SHORT_EXIT or (trend_up and strong_trend):
                     return "COVER"
         
-        # === 开仓信号 ===
+        # === 开仓信号 (含 LightGBM 双确认) ===
         if not has_position:
             # 做空: MA死叉 + MACD看跌 + 强势趋势
-            if (m7 < m25 and macdh < MACD_SHORT_THRESHOLD and strong_trend and 
-                regime != "bull" and rsi_val > RSI_SHORT_ENTRY):
+            short_signal = (m7 < m25 and macdh < MACD_SHORT_THRESHOLD and strong_trend and
+                           regime != "bull" and rsi_val > RSI_SHORT_ENTRY)
+            # 做多: MA金叉 + MACD看涨 + 强势趋势
+            long_signal = (m7 > m25 and macdh > MACD_LONG_THRESHOLD and strong_trend and
+                           regime != "bear" and rsi_val < RSI_LONG_EXIT - 5)
+
+            # LightGBM 双确认
+            if self.lgb_adapter and self.lgb_adapter.is_loaded():
+                if short_signal:
+                    confirm = self.lgb_adapter.confirm(row, "SHORT")
+                    if confirm == "agree":
+                        return "SHORT"
+                    elif confirm == "disagree":
+                        return "HOLD"  # LGB明确反对，不开仓
+                    # no_opinion → 仅依赖MATrend
+                if long_signal:
+                    confirm = self.lgb_adapter.confirm(row, "LONG")
+                    if confirm == "agree":
+                        return "LONG"
+                    elif confirm == "disagree":
+                        return "HOLD"  # LGB明确反对，不开仓
+                    # no_opinion → 仅依赖MATrend
+
+            # MATrend 信号 (LGB agree/no_opinion 时生效)
+
+            # 无 LGB 适配器时，原逻辑
+            if short_signal:
                 return "SHORT"
-            
-            # 做多: MA金叉 + MACD看涨 + 强势趋势  
-            if (m7 > m25 and macdh > MACD_LONG_THRESHOLD and strong_trend and 
-                regime != "bear" and rsi_val < RSI_LONG_EXIT - 5):  # RSI < 70 for entry
+            if long_signal:
                 return "LONG"
         
         return "HOLD"

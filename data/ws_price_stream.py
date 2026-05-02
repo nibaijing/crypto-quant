@@ -119,6 +119,8 @@ class SharedMarketState:
                     "high": k.high if k else 0,
                     "low": k.low if k else 0,
                     "close": k.close if k else 0,
+                    "open_time": k.open_time if k else 0,
+                    "close_time": k.close_time if k else 0,
                     "is_closed": k.is_closed if k else False,
                 } if k else None,
                 "indicators": indicators,
@@ -151,7 +153,7 @@ class SharedMarketState:
 class BinanceWebSocket:
     """Binance WebSocket 客户端 — 多流合并"""
 
-    STREAM_URL = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@kline_15m"
+    STREAM_URL = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@kline_15m/btcusdt@ticker"
 
     def __init__(self, state: SharedMarketState):
         self.state = state
@@ -226,6 +228,11 @@ class BinanceWebSocket:
                 k = payload.get('k', payload)
                 if 't' in k:
                     self.state.update_kline(k)
+
+            elif 'ticker' in stream or '24hrTicker' in stream:
+                # Binance ticker: 24hr 统计
+                if 'c' in payload:
+                    self.state.update_ticker(payload)
 
         except json.JSONDecodeError:
             pass
