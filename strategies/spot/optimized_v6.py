@@ -48,6 +48,7 @@ class OptimizedStrategy:
         self.peak_equity = 0
         self.position_size = 0
         self.lgb_adapter = lgb_adapter  # LightGBM 双确认适配器 (可选)
+        self._last_lgb_opinion = 'no_opinion'  # 供 AIOverride 读取
         
     def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """计算所有指标 (无副作用)"""
@@ -203,6 +204,7 @@ class OptimizedStrategy:
             if self.lgb_adapter and self.lgb_adapter.is_loaded():
                 if short_signal:
                     confirm = self.lgb_adapter.confirm(row, "SHORT")
+                    self._last_lgb_opinion = confirm
                     if confirm == "agree":
                         return "SHORT"
                     elif confirm == "disagree":
@@ -210,11 +212,14 @@ class OptimizedStrategy:
                     # no_opinion → 仅依赖MATrend
                 if long_signal:
                     confirm = self.lgb_adapter.confirm(row, "LONG")
+                    self._last_lgb_opinion = confirm
                     if confirm == "agree":
                         return "LONG"
                     elif confirm == "disagree":
                         return "HOLD"  # LGB明确反对，不开仓
                     # no_opinion → 仅依赖MATrend
+            else:
+                self._last_lgb_opinion = 'no_opinion'
 
             # MATrend 信号 (LGB agree/no_opinion 时生效)
 

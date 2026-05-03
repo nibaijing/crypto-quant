@@ -29,6 +29,7 @@ import numpy as np
 
 from core.config import init_config
 from execution.executor_v2 import FuturesExecutor, LiveAccount, LivePosition, LiveOrder
+from execution.ai_override import get_ai_override
 from strategies.spot.optimized_v6 import OptimizedStrategy
 from data.ws_price_stream import SharedMarketState, BinanceWebSocket, create_price_stream
 from data.alpha_factors import AlphaFactors
@@ -180,6 +181,35 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
     except Exception as e:
         logger.error(f"策略错误: {e}", exc_info=True)
 
+    # === AIOverride 决策层 ===
+    if signal and signal != "HOLD":
+        try:
+            ai = get_ai_override()
+            # 获取 LGB 确认结果 (从策略中提取)
+            lgb_opinion = getattr(strategy, '_last_lgb_opinion', 'no_opinion')
+            # 构建 bar 上下文
+            bar_ctx = {
+                "close": close_price,
+                "rsi": float(row.get("rsi", 50)) if pd.notna(row.get("rsi")) else 50.0,
+                "adx": float(row.get("adx", 20)) if pd.notna(row.get("adx")) else 20.0,
+                "macd_hist": float(row.get("macd_hist", 0)) if pd.notna(row.get("macd_hist")) else 0.0,
+                "ma7": float(row.get("ma_7", 0)) if pd.notna(row.get("ma_7")) else 0.0,
+                "ma25": float(row.get("ma_25", 0)) if pd.notna(row.get("ma_25")) else 0.0,
+                "volatility": float(row.get("volatility", 0.003)) if pd.notna(row.get("volatility")) else 0.003,
+                "has_position": executor.position is not None and getattr(executor.position, 'size', 0) > 0,
+                "position_side": executor.position.side if executor.position else "",
+                "position_pnl": float(getattr(executor.position, 'unrealized_pnl_pct', 0)) if executor.position else 0.0,
+                "bars_held": int(getattr(executor.position, 'bars_held', 0)) if executor.position else 0,
+            }
+            ai_decision = ai.judge(signal=signal, lgb_opinion=lgb_opinion, bar_context=bar_ctx)
+            if ai_decision == "reject":
+                logger.info(f"🚫 AIOverride拒绝: signal={signal} | 原因: 模糊边界不满足")
+                signal = "HOLD"
+            elif ai_decision == "approve":
+                logger.info(f"✅ AIOverride同意: signal={signal}")
+        except Exception as e:
+            logger.warning(f"AIOverride异常, fallback原规则: {e}")
+
     # 执行信号
     symbol = "BTC-USDT"
     if signal and signal != "HOLD":
@@ -196,6 +226,8 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
             result = executor.sell(symbol, price=close_price)
             if result:
                 notify_trade("SELL", close_price, f"平多仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
+                ai = get_ai_override()
+                ai.update_trade_result(pnl_pct)
 
         elif signal == "SHORT" and (not executor.position or executor.position.size == 0):
             result = executor.short_sell(symbol, price=close_price)
@@ -208,6 +240,8 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
             result = executor.short_cover(symbol, price=close_price)
             if result:
                 notify_trade("COVER", close_price, f"平空仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
+                ai = get_ai_override()
+                ai.update_trade_result(pnl_pct)
 
     # 状态日志
     status = [f"${close_price:,.0f}", f"Eq=${executor.equity:,.0f}"]
