@@ -43,12 +43,12 @@ DRY_RUN = os.getenv("AI_OVERRIDE_DRY_RUN", "").lower() in ("1", "true", "yes")
 # LLM API 配置 (从 ~/.hermes/config.yaml 读取)
 LLM_API_BASE = os.getenv(
     "AI_OVERRIDE_API_BASE",
-    "https://integrate.api.nvidia.com/v1"
+    "https://api.deepseek.com/v1"
 )
-LLM_API_KEY = os.getenv("AI_OVERRIDE_API_KEY", os.getenv("NVIDIA_API_KEY", ""))
+LLM_API_KEY = os.getenv("AI_OVERRIDE_API_KEY", os.getenv("DEEPSEEK_API_KEY", ""))
 LLM_MODEL = os.getenv(
     "AI_OVERRIDE_MODEL",
-    "deepseek-ai/deepseek-v4-pro"
+    "deepseek-v4-pro"
 )
 
 # ── 触发条件阈值 ────────────────────────────────────────────────────────
