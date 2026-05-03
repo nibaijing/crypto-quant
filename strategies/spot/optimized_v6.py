@@ -28,8 +28,8 @@ MAX_DRAWDOWN_PCT = 0.20  # 最大回撤 20% 熔断
 MAX_HOLD_BARS = 48       # 最大持仓K线数 (12小时)
 
 # === 信号阈值 ===
-RSI_LONG_ENTRY = 44      # 做多: RSI < 40 (回调到位)
-RSI_LONG_EXIT = 70       # 做多: RSI > 75 (过热平仓) — 放宽
+RSI_LONG_ENTRY = 48      # 做多: RSI < 40 (回调到位)
+RSI_LONG_EXIT = 60       # 做多: RSI > 75 (过热平仓) — 放宽
 RSI_SHORT_ENTRY = 50     # 做空: RSI > 35 (不超卖时才空) — 放宽
 RSI_SHORT_EXIT = 45      # 做空: RSI < 25 (超卖平空)
 MACD_LONG_THRESHOLD = 5  # MACD_hist > 5 即确认 (原15太严)

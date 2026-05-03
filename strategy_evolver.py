@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
+import glob
+import re
 
 # 因子 bias 集成
 try:
@@ -71,6 +73,43 @@ def load_strategy_params() -> dict:
         params.setdefault(k, v)
 
     return params
+
+
+def _load_previous_params() -> Optional[dict]:
+    """加载最近一次进化后的参数快照，用于平滑限制"""
+    snapshots = sorted(REVIEW_DIR.glob("params_evolved_*.json"))
+    if len(snapshots) < 2:
+        return None
+    # 取倒数第二个（最近一次是当前已经应用的）
+    return json.loads(snapshots[-2].read_text("utf-8")).get("params", {})
+
+
+def _smooth_delta(param_name: str, new_val: float, current_val: float, max_delta_map: dict) -> float:
+    """参数平滑：限制单次变化幅度不超过 max_delta
+    - 如果新值与当前值的差值在阈值内，允许
+    - 如果超出阈值，截断到阈值边界
+    - 返回平滑后的值
+    """
+    max_delta = max_delta_map.get(param_name)
+    if max_delta is None:
+        return new_val
+    delta = new_val - current_val
+    if abs(delta) <= max_delta:
+        return new_val
+    return current_val + (max_delta if delta > 0 else -max_delta)
+
+
+# 参数平滑: 单次变化上限（防止相邻两天跳变过大）
+SMOOTH_LIMITS = {
+    "RSI_LONG_ENTRY": 3,   # RSI entry 最多 ±3
+    "RSI_LONG_EXIT": 5,    # RSI exit 最多 ±5
+    "RSI_SHORT_ENTRY": 3,
+    "RSI_SHORT_EXIT": 5,
+    "ADX_THRESHOLD": 5,    # ADX 最多 ±5
+    "ATR_STOP_LONG": 0.4,  # ATR 倍数最多 ±0.4
+    "ATR_STOP_SHORT": 0.4,
+    "MAX_POSITION_PCT": 0.05,  # 仓位最多 ±5%
+}
 
 
 def compute_evolved_params(review: dict, current: dict) -> dict:
@@ -134,6 +173,11 @@ def compute_evolved_params(review: dict, current: dict) -> dict:
                     changes.append(f"因子short_bias(置信{bias['confidence']}): 放宽SHORT触发, 收紧LONG")
         except Exception as e:
             changes.append(f"因子bias获取失败: {e}")
+
+    # === 参数平滑: 限制单次变化幅度 ===
+    for key in SMOOTH_LIMITS:
+        if key in evolved and key in current:
+            evolved[key] = _smooth_delta(key, evolved[key], current[key], SMOOTH_LIMITS)
 
     # Clamp
     evolved["RSI_LONG_ENTRY"] = max(min(evolved.get("RSI_LONG_ENTRY", 40), 50), 20)
