@@ -1,7 +1,9 @@
 {
-  "daily_calls": 0,
-  "reset_date": "",
-  "cooldowns": {},
+  "daily_calls": 1,
+  "reset_date": "2026-05-03",
+  "cooldowns": {
+    "early_trade": 1777814103.113132
+  },
   "consecutive_losses": 0,
   "daily_trade_count": 0,
   "last_signal": null

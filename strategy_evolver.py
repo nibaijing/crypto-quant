@@ -46,15 +46,15 @@ def load_strategy_params() -> dict:
 
     patterns = {
         "RSI_LONG_ENTRY": r'RSI_LONG_ENTRY\s*=\s*(\d+)',
+        "RSI_LONG_MAX_ENTRY": r'RSI_LONG_MAX_ENTRY\s*=\s*(\d+)',
         "RSI_LONG_EXIT": r'RSI_LONG_EXIT\s*=\s*(\d+)',
         "RSI_SHORT_ENTRY": r'RSI_SHORT_ENTRY\s*=\s*(\d+)',
+        "RSI_SHORT_MIN_ENTRY": r'RSI_SHORT_MIN_ENTRY\s*=\s*(\d+)',
         "RSI_SHORT_EXIT": r'RSI_SHORT_EXIT\s*=\s*(\d+)',
         "ADX_THRESHOLD": r'ADX_THRESHOLD\s*=\s*(\d+)',
         "ATR_STOP_LONG": r'ATR_STOP_LONG\s*=\s*([\d.]+)',
         "ATR_STOP_SHORT": r'ATR_STOP_SHORT\s*=\s*([\d.]+)',
         "MAX_POSITION_PCT": r'MAX_POSITION_PCT\s*=\s*([\d.]+)',
-        "DEVIATION_BULL": r'DEVIATION_BULL\s*=\s*([\d.]+)',
-        "DEVIATION_BEAR": r'DEVIATION_BEAR\s*=\s*([\d.-]+)',
     }
     params = {}
     for key, pat in patterns.items():
@@ -64,10 +64,10 @@ def load_strategy_params() -> dict:
 
     # Provide defaults for missing params
     defaults = {
-        "RSI_LONG_ENTRY": 40, "RSI_LONG_EXIT": 75,
-        "RSI_SHORT_ENTRY": 35, "RSI_SHORT_EXIT": 25,
-        "ADX_THRESHOLD": 18, "ATR_STOP_LONG": 2.0, "ATR_STOP_SHORT": 2.5,
-        "MAX_POSITION_PCT": 0.30, "DEVIATION_BULL": 0.02, "DEVIATION_BEAR": -0.02,
+        "RSI_LONG_ENTRY": 48, "RSI_LONG_MAX_ENTRY": 65, "RSI_LONG_EXIT": 72,
+        "RSI_SHORT_ENTRY": 50, "RSI_SHORT_MIN_ENTRY": 35, "RSI_SHORT_EXIT": 45,
+        "ADX_THRESHOLD": 23, "ATR_STOP_LONG": 1.2, "ATR_STOP_SHORT": 1.5,
+        "MAX_POSITION_PCT": 0.15,
     }
     for k, v in defaults.items():
         params.setdefault(k, v)
@@ -102,8 +102,10 @@ def _smooth_delta(param_name: str, new_val: float, current_val: float, max_delta
 # 参数平滑: 单次变化上限（防止相邻两天跳变过大）
 SMOOTH_LIMITS = {
     "RSI_LONG_ENTRY": 3,   # RSI entry 最多 ±3
+    "RSI_LONG_MAX_ENTRY": 3,
     "RSI_LONG_EXIT": 5,    # RSI exit 最多 ±5
     "RSI_SHORT_ENTRY": 3,
+    "RSI_SHORT_MIN_ENTRY": 3,
     "RSI_SHORT_EXIT": 5,
     "ADX_THRESHOLD": 5,    # ADX 最多 ±5
     "ATR_STOP_LONG": 0.4,  # ATR 倍数最多 ±0.4
@@ -180,11 +182,13 @@ def compute_evolved_params(review: dict, current: dict) -> dict:
             evolved[key] = _smooth_delta(key, evolved[key], current[key], SMOOTH_LIMITS)
 
     # Clamp
-    evolved["RSI_LONG_ENTRY"] = max(min(evolved.get("RSI_LONG_ENTRY", 40), 50), 20)
-    evolved["RSI_LONG_EXIT"] = max(min(evolved.get("RSI_LONG_EXIT", 75), 90), 60)
-    evolved["RSI_SHORT_ENTRY"] = max(min(evolved.get("RSI_SHORT_ENTRY", 35), 55), 25)
-    evolved["RSI_SHORT_EXIT"] = max(min(evolved.get("RSI_SHORT_EXIT", 25), 45), 15)
-    evolved["ADX_THRESHOLD"] = max(min(evolved.get("ADX_THRESHOLD", 18), 35), 12)
+    evolved["RSI_LONG_ENTRY"] = max(min(evolved.get("RSI_LONG_ENTRY", 48), 55), 20)
+    evolved["RSI_LONG_MAX_ENTRY"] = max(min(evolved.get("RSI_LONG_MAX_ENTRY", 65), 75), 50)
+    evolved["RSI_LONG_EXIT"] = max(min(evolved.get("RSI_LONG_EXIT", 72), 90), 55)
+    evolved["RSI_SHORT_ENTRY"] = max(min(evolved.get("RSI_SHORT_ENTRY", 50), 65), 30)
+    evolved["RSI_SHORT_MIN_ENTRY"] = max(min(evolved.get("RSI_SHORT_MIN_ENTRY", 35), 50), 20)
+    evolved["RSI_SHORT_EXIT"] = max(min(evolved.get("RSI_SHORT_EXIT", 45), 55), 20)
+    evolved["ADX_THRESHOLD"] = max(min(evolved.get("ADX_THRESHOLD", 23), 35), 12)
 
     evolved["_changes"] = changes
     evolved["_evolved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -199,8 +203,10 @@ def apply_params(new_params: dict) -> bool:
 
     param_map = {
         "RSI_LONG_ENTRY": "RSI_LONG_ENTRY",
+        "RSI_LONG_MAX_ENTRY": "RSI_LONG_MAX_ENTRY",
         "RSI_LONG_EXIT": "RSI_LONG_EXIT",
         "RSI_SHORT_ENTRY": "RSI_SHORT_ENTRY",
+        "RSI_SHORT_MIN_ENTRY": "RSI_SHORT_MIN_ENTRY",
         "RSI_SHORT_EXIT": "RSI_SHORT_EXIT",
         "ADX_THRESHOLD": "ADX_THRESHOLD",
         "ATR_STOP_LONG": "ATR_STOP_LONG",

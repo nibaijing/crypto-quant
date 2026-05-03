@@ -41,14 +41,14 @@ MAX_DAILY_LLM_CALLS = 12          # 每日最多LLM调用次数
 DRY_RUN = os.getenv("AI_OVERRIDE_DRY_RUN", "").lower() in ("1", "true", "yes")
 
 # LLM API 配置 (从 ~/.hermes/config.yaml 读取)
+LLM_API_KEY = os.getenv("DEEPSEEK_API_KEY", "") or os.getenv("NVIDIA_API_KEY", "")
+LLM_MODEL = os.getenv(
+    "AI_OVERRIDE_MODEL",
+    "deepseek-ai/deepseek-v4-pro"
+)
 LLM_API_BASE = os.getenv(
     "AI_OVERRIDE_API_BASE",
     "https://api.deepseek.com/v1"
-)
-LLM_API_KEY = os.getenv("AI_OVERRIDE_API_KEY", os.getenv("DEEPSEEK_API_KEY", ""))
-LLM_MODEL = os.getenv(
-    "AI_OVERRIDE_MODEL",
-    "deepseek-v4-pro"
 )
 
 # ── 触发条件阈值 ────────────────────────────────────────────────────────
