@@ -29,14 +29,14 @@ MAX_HOLD_BARS = 48       # 最大持仓K线数 (12小时)
 
 # === 信号阈值 ===
 RSI_LONG_ENTRY = 48      # 做多: RSI < 40 (回调到位)
-RSI_LONG_EXIT = 60       # 做多: RSI > 75 (过热平仓) — 放宽
+RSI_LONG_EXIT = 70       # 做多: RSI > 70 (过热平仓) — 牛市中允许RSI偏高
 RSI_SHORT_ENTRY = 50     # 做空: RSI > 35 (不超卖时才空) — 放宽
 RSI_SHORT_EXIT = 45      # 做空: RSI < 25 (超卖平空)
 MACD_LONG_THRESHOLD = 5  # MACD_hist > 5 即确认 (原15太严)
 MACD_SHORT_THRESHOLD = -5  # MACD_hist < -5 即确认 (原-15太严)
 ADX_THRESHOLD = 23       # ADX 须 > 18 过滤震荡 (原20太严)
-DEVIATION_BULL = 0.02    # 高于 MA99 2% → 牛市
-DEVIATION_BEAR = -0.02   # 低于 MA99 2% → 熊市
+# 方向判定: 不再用 price/MA99 偏离 (15mK线偏差2%太苛刻且与RSI互斥)
+# 改用 MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
 
 
 class OptimizedStrategy:
@@ -148,9 +148,9 @@ class OptimizedStrategy:
         if np.isnan(rsi_val) or np.isnan(adx_val):
             return "HOLD"
         
-        # 市场状态
-        dev = c / max(ma99, 1) - 1
-        regime = "bull" if dev > DEVIATION_BULL else ("bear" if dev < DEVIATION_BEAR else "neutral")
+        # 市场状态 — 用 MA 排列判断方向，不用 MA99 偏离
+        m99 = float(row.get('ma_99', c))
+        regime = "bull" if (m7 > m25 and m25 > m99) else ("bear" if (m7 < m25 and m25 < m99) else "neutral")
         
         # 趋势方向
         trend_up = m7 > m25 and macdh > -50     # MA金叉 + MACD不严重看跌
@@ -196,9 +196,9 @@ class OptimizedStrategy:
             # 做空: MA死叉 + MACD看跌 + 强势趋势
             short_signal = (m7 < m25 and macdh < MACD_SHORT_THRESHOLD and strong_trend and
                            regime != "bull" and rsi_val > RSI_SHORT_ENTRY)
-            # 做多: MA金叉 + MACD看涨 + 强势趋势
+            # 做多: MA金叉 + MACD看涨 + 强势趋势 + regime非熊
             long_signal = (m7 > m25 and macdh > MACD_LONG_THRESHOLD and strong_trend and
-                           regime != "bear" and rsi_val < RSI_LONG_EXIT - 5)
+                           regime != "bear" and rsi_val < RSI_LONG_EXIT)
 
             # LightGBM 双确认
             if self.lgb_adapter and self.lgb_adapter.is_loaded():
