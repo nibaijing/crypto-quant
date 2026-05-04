@@ -111,34 +111,134 @@ class OptimizedStrategy:
         
         return df
     
-    def on_bar(self, bar: Dict[str, Any], account: Any = None) -> Optional[str]:
+    def on_bar(self, bar: Dict[str, Any], account: Any = None) -> "SignalReport":
         """
-        基于一根 K 线生成信号。
-        
+        基于一根 K 线生成结构化信号报告，供决策层消费。
+
         bar: {
             'close': float, 'high': float, 'low': float,
             'history': DataFrame (所有历史 K 线到当前),
             'index': int (当前在 history 中的索引),
             'position': Optional[LivePosition]
         }
-        
-        返回: "LONG" | "SHORT" | "COVER" | "SELL" | "HOLD" | None
+
+        返回: SignalReport (含条件得分 + 指标快照)
         """
-        
+        from execution.signals import SignalReport
+
+        # ── 辅助: 构建 SignalReport ──
+        def _build_report(raw_signal="HOLD", exit_signal=None):
+            bars_since_exit = idx - self.last_exit_bar
+            is_cooldown = bars_since_exit < COOLDOWN_BARS
+
+            # 各条件单独判定
+            cond_short = {
+                "MA": bool(m7 < m25),
+                "MACD": bool(macdh < MACD_SHORT_THRESHOLD),
+                "ADX": bool(strong_trend),
+                "Reg": bool(regime != "bull"),
+                "RSI": bool(RSI_SHORT_MIN_ENTRY < rsi_val < RSI_SHORT_ENTRY + 20),
+                "VOL": bool(vol_surge),
+            }
+            cond_long = {
+                "MA": bool(m7 > m25),
+                "MACD": bool(macdh > MACD_LONG_THRESHOLD),
+                "ADX": bool(strong_trend),
+                "Reg": bool(regime != "bear"),
+                "RSI": bool(RSI_LONG_ENTRY < rsi_val < RSI_LONG_MAX_ENTRY),
+                "VOL": bool(vol_surge),
+            }
+            n_conditions = 6
+            short_score = sum(1 for v in cond_short.values() if v) / n_conditions
+            long_score = sum(1 for v in cond_long.values() if v) / n_conditions
+
+            # 价格趋势 (近5根K线)
+            if idx >= 5:
+                closes_5 = df['close'].iloc[idx-4:idx+1].values
+                price_chg_5 = (closes_5[-1] - closes_5[0]) / closes_5[0] if closes_5[0] > 0 else 0
+                if price_chg_5 > 0.005:
+                    price_trend = "up"
+                elif price_chg_5 < -0.005:
+                    price_trend = "down"
+                else:
+                    price_trend = "sideways"
+            else:
+                price_trend = "sideways"
+
+            # RSI 趋势
+            if idx >= 5:
+                rsi_vals = df['rsi'].iloc[idx-4:idx+1].dropna()
+                if len(rsi_vals) >= 2:
+                    rsi_delta = rsi_vals.iloc[-1] - rsi_vals.iloc[0]
+                    if rsi_delta > 3:
+                        rsi_trend = "rising"
+                    elif rsi_delta < -3:
+                        rsi_trend = "falling"
+                    else:
+                        rsi_trend = "flat"
+                else:
+                    rsi_trend = "flat"
+            else:
+                rsi_trend = "flat"
+
+            # ADX 趋势
+            if idx >= 5:
+                adx_vals = df['adx'].iloc[idx-4:idx+1].dropna()
+                if len(adx_vals) >= 2:
+                    adx_delta = adx_vals.iloc[-1] - adx_vals.iloc[0]
+                    if adx_delta > 2:
+                        adx_trend = "rising"
+                    elif adx_delta < -2:
+                        adx_trend = "falling"
+                    else:
+                        adx_trend = "flat"
+                else:
+                    adx_trend = "flat"
+            else:
+                adx_trend = "flat"
+
+            return SignalReport(
+                timestamp=int(row.get('timestamp', 0)),
+                price=c,
+                raw_signal=raw_signal,
+                exit_signal=exit_signal,
+                long_score=long_score,
+                short_score=short_score,
+                conditions_long=cond_long,
+                conditions_short=cond_short,
+                rsi=rsi_val,
+                adx=adx_val,
+                macd_hist=macdh,
+                ma7=m7,
+                ma25=m25,
+                ma99=m99,
+                volatility=float(row.get('volatility', 0.003)) if pd.notna(row.get('volatility')) else 0.003,
+                volume_surge=vol_surge,
+                regime=regime,
+                price_trend_5bars=price_trend,
+                rsi_trend=rsi_trend,
+                adx_trend=adx_trend,
+                bars_since_last_trade=bars_since_exit,
+                is_cooldown=is_cooldown,
+                lgb_opinion=self._last_lgb_opinion,
+            )
+
+        # ── 主逻辑 ──
+
         df = bar.get('history')
         if df is None or len(df) < 100:
-            return "HOLD"
-        
+            return _build_report("HOLD")
+
         idx = bar.get('index', -1)
         if idx < 99:
-            return "HOLD"
-        
+            return _build_report("HOLD")
+
         # 计算指标 (如果还没算)
         if 'rsi' not in df.columns or 'adx' not in df.columns:
             df = self.compute_indicators(df)
-        
+
         row = df.iloc[idx]
-        
+
         c = float(row['close'])
         h = float(row['high'])
         l = float(row['low'])
@@ -146,88 +246,81 @@ class OptimizedStrategy:
         atr_val = float(row.get('atr', 0))
         adx_val = float(row.get('adx', 0))
         macdh = float(row.get('macd_hist', 0))
-        ma99 = float(row.get('ma_99', c))
         m7 = float(row.get('ma_7', c))
         m25 = float(row.get('ma_25', c))
-        vol_surge = bool(row.get('volume_surge', False))
-        
-        if np.isnan(rsi_val) or np.isnan(adx_val):
-            return "HOLD"
-        
-        # 市场状态 — 用 MA 排列判断方向，不用 MA99 偏离
         m99 = float(row.get('ma_99', c))
+        vol_surge = bool(row.get('volume_surge', False))
+
+        if np.isnan(rsi_val) or np.isnan(adx_val):
+            return _build_report("HOLD")
+
+        # 市场状态
         regime = "bull" if (m7 > m25 and m25 > m99) else ("bear" if (m7 < m25 and m25 < m99) else "neutral")
-        
+
         # 趋势方向
-        trend_up = m7 > m25 and macdh > -50     # MA金叉 + MACD不严重看跌
-        trend_down = m7 < m25 and macdh < 50     # MA死叉 + MACD不严重看涨
+        trend_up = m7 > m25 and macdh > -50
+        trend_down = m7 < m25 and macdh < 50
         strong_trend = adx_val > ADX_THRESHOLD
-        
-        # MACD 趋势强度 (独立于MA)
-        macd_bearish = macdh < -20
-        macd_bullish = macdh > 20
-        
+
         # 当前持仓
         pos = bar.get('position')
         has_position = pos is not None and getattr(pos, 'size', 0) > 0
         pos_side = getattr(pos, 'side', None) if has_position else None
         pos_entry = getattr(pos, 'avg_price', 0) if has_position else 0
-        pos_leverage = getattr(pos, 'leverage', 1) if has_position else 1
-        
-        # === 风控检查: 持仓时 ===
-        if has_position and pos_entry > 0 and atr_val > 0:
-            # bars_held: 优先从 position.bars_held; 次选 entry_bar 计算; 兜底 1
-            bars_held = 1
+
+        # 持仓bars计数
+        bars_held = 1
+        if has_position:
             if hasattr(pos, 'bars_held'):
                 bars_held = max(1, int(pos.bars_held))
             elif pos_entry > 0 and hasattr(pos, 'entry_bar') and pos.entry_bar >= 0:
                 bars_held = max(1, idx - pos.entry_bar)
-            
+
+        # === 风控检查: 持仓时 ===
+        if has_position and pos_entry > 0 and atr_val > 0:
             # ATR 止损
             if pos_side == 'long' and c <= pos_entry - atr_val * ATR_STOP_LONG:
                 self.last_exit_bar = idx
-                return "SELL"
+                return _build_report("SELL", "SELL")
             elif pos_side == 'short' and c >= pos_entry + atr_val * ATR_STOP_SHORT:
                 self.last_exit_bar = idx
-                return "COVER"
-            
-            # 最大持仓时间: 浮亏加速平仓, 浮盈延长持有
+                return _build_report("COVER", "COVER")
+
+            # 最大持仓时间
             if bars_held >= MAX_HOLD_BARS:
-                # 计算当前盈亏
                 if pos_side == 'long':
                     pnl_pct = (c - pos_entry) / pos_entry
                 else:
                     pnl_pct = (pos_entry - c) / pos_entry
-                # 浮亏 → 立即平仓; 浮盈 → 放宽到 2x 时间
                 max_bars = MAX_HOLD_BARS if pnl_pct < 0 else MAX_HOLD_BARS * 2
                 if bars_held >= max_bars:
                     logger.info(f"⏰ 最大持仓时间平仓 | bars={bars_held} | PnL={pnl_pct:+.2%}")
                     self.last_exit_bar = idx
-                    return "SELL" if pos_side == 'long' else "COVER"
-        
+                    exit_sig = "SELL" if pos_side == 'long' else "COVER"
+                    return _build_report(exit_sig, exit_sig)
+
         # === 平仓信号 ===
         if has_position:
             if pos_side == 'long':
                 if (rsi_val > RSI_LONG_EXIT and bars_held >= MIN_HOLD_BARS) or (trend_down and strong_trend):
                     self.last_exit_bar = idx
-                    return "SELL"
+                    return _build_report("SELL", "SELL")
             elif pos_side == 'short':
                 if (rsi_val < RSI_SHORT_EXIT and bars_held >= MIN_HOLD_BARS) or (trend_up and strong_trend):
                     self.last_exit_bar = idx
-                    return "COVER"
-        
+                    return _build_report("COVER", "COVER")
+
         # === 开仓信号 (含 LightGBM 双确认) ===
         if not has_position:
-            # 冷却检查: 上次平仓后必须等待 COOLDOWN_BARS 根K线
             bars_since_exit = idx - self.last_exit_bar
             if bars_since_exit < COOLDOWN_BARS:
-                return "HOLD"
+                return _build_report("HOLD")
 
-            # 做空: MA死叉 + MACD看跌 + 强势趋势 + regime非牛 + RSI不过低 + 放量
+            # 做空条件判定
             short_signal = (m7 < m25 and macdh < MACD_SHORT_THRESHOLD and strong_trend and
                            regime != "bull" and RSI_SHORT_MIN_ENTRY < rsi_val < RSI_SHORT_ENTRY + 20 and
                            vol_surge)
-            # 做多: MA金叉 + MACD看涨 + 强势趋势 + regime非熊 + RSI不过高 + 放量
+            # 做多条件判定
             long_signal = (m7 > m25 and macdh > MACD_LONG_THRESHOLD and strong_trend and
                            regime != "bear" and RSI_LONG_ENTRY < rsi_val < RSI_LONG_MAX_ENTRY and
                            vol_surge)
@@ -239,51 +332,34 @@ class OptimizedStrategy:
                     self._last_lgb_opinion = confirm
                     if confirm == "agree":
                         self.last_entry_bar = idx
-                        return "SHORT"
+                        return _build_report("SHORT")
                     elif confirm == "disagree":
-                        return "HOLD"  # LGB明确反对，不开仓
-                    # no_opinion → 仅依赖MATrend
+                        return _build_report("HOLD")
                 if long_signal:
                     confirm = self.lgb_adapter.confirm(row, "LONG")
                     self._last_lgb_opinion = confirm
                     if confirm == "agree":
                         self.last_entry_bar = idx
-                        return "LONG"
+                        return _build_report("LONG")
                     elif confirm == "disagree":
-                        return "HOLD"  # LGB明确反对，不开仓
-                    # no_opinion → 仅依赖MATrend
+                        return _build_report("HOLD")
             else:
                 self._last_lgb_opinion = 'no_opinion'
 
-            # MATrend 信号 (LGB agree/no_opinion 时生效)
-
-            # 无 LGB 适配器时，原逻辑
+            # 无 LGB 适配器时 / LGB no_opinion 时
             if short_signal:
                 self.last_entry_bar = idx
-                return "SHORT"
+                return _build_report("SHORT")
             if long_signal:
                 self.last_entry_bar = idx
-                return "LONG"
+                return _build_report("LONG")
 
-            # 诊断: 开仓条件未满足时, 打印各条件状态
-            if not has_position and bars_since_exit >= COOLDOWN_BARS:
-                short_parts = []
-                short_parts.append(f"MA={'✓' if m7<m25 else '✗'}")
-                short_parts.append(f"MACD={'✓' if macdh<MACD_SHORT_THRESHOLD else f'✗({macdh:.0f})'}")
-                short_parts.append(f"ADX={'✓' if strong_trend else f'✗({adx_val:.0f})'}")
-                short_parts.append(f"Reg={'✓' if regime!='bull' else '✗'}")
-                short_parts.append(f"RSI={'✓' if RSI_SHORT_MIN_ENTRY<rsi_val<RSI_SHORT_ENTRY+20 else f'✗({rsi_val:.0f})'}")
-                short_parts.append(f"VOL={'✓' if vol_surge else '✗'}")
-                long_parts = []
-                long_parts.append(f"MA={'✓' if m7>m25 else '✗'}")
-                long_parts.append(f"MACD={'✓' if macdh>MACD_LONG_THRESHOLD else f'✗({macdh:.0f})'}")
-                long_parts.append(f"ADX={'✓' if strong_trend else f'✗({adx_val:.0f})'}")
-                long_parts.append(f"Reg={'✓' if regime!='bear' else '✗'}")
-                long_parts.append(f"RSI={'✓' if RSI_LONG_ENTRY<rsi_val<RSI_LONG_MAX_ENTRY else f'✗({rsi_val:.0f})'}")
-                long_parts.append(f"VOL={'✓' if vol_surge else '✗'}")
-                logger.info(f"🔍 HOLD | SHORT[{' '.join(short_parts)}] | LONG[{' '.join(long_parts)}]")
-        
-        return "HOLD"
+            # HOLD — 诊断日志内置在 SignalReport.summary() 中
+            report = _build_report("HOLD")
+            logger.info(f"🔍 {report.summary()}")
+            return report
+
+        return _build_report("HOLD")
     
     def get_position_size(self, cash: float, price: float, leverage: int,
                           atr: float = 0, side: str = 'long') -> float:

@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-AIOverride — 模糊边界AI决策层
+DecisionEngine — AI 决策层 (取代 ai_override.py)
 
-在规则信号触发但处于模糊场景时，调用LLM进行二次判断。
-非每根K线都调用，仅在预设触发条件满足时介入。
+架构:
+  Strategy Layer → SignalReport → DecisionEngine → FinalDecision → Execution
 
-触发条件:
-  1. LGB 返回 no_opinion（规则有信号但ML不确定）
-  2. 连亏2次后首次信号
-  3. ADX 边缘 (20-25) 的震荡转趋势区域
-  4. 每日前2次交易
-  5. 平仓时 RSI 接近但未触及阈值
+职责:
+  1. 接收策略层的 SignalReport (含条件得分 + 指标快照)
+  2. 自主判断是否开仓/平仓 (不限于 approve/reject)
+  3. 在 HOLD 信号时也可主动决策开仓 (当条件得分足够高时)
+  4. 风控平仓 (exit_signal) 直接放行
 
-LLM 通过 hermes chat -q 非交互式调用，超时 10 秒降级到原规则。
+调用策略:
+  - 信号极清晰 (6/6 vs ≤1/6) → 自动放行, 不调 LLM
+  - 信号模糊 (4~5/6)       → 调 LLM 二次判断
+  - HOLD + 某方向 ≥4/6      → 调 LLM, 可能主动开仓
+  - 每日限额 12 次          → 超限后仅自动放行
 """
 
 from __future__ import annotations
@@ -25,38 +28,33 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Dict, Any, List
 
-logger = logging.getLogger("CryptoQuant.AIOverride")
+from execution.signals import SignalReport, FinalDecision
+
+logger = logging.getLogger("CryptoQuant.DecisionEngine")
 
 PROJECT = Path(__file__).resolve().parent.parent
-LOG_FILE = PROJECT / "data" / "ai_override.log"
-STATE_FILE = PROJECT / "data" / "ai_override_state.json"
+LOG_FILE = PROJECT / "data" / "decision_engine.log"
+STATE_FILE = PROJECT / "data" / "decision_engine_state.json"
 
 # ── 配置 ────────────────────────────────────────────────────────────────
-LLM_TIMEOUT_SECONDS = 10          # LLM 调用超时
-HERMES_BIN = "hermes"             # hermes CLI 路径 (备选)
-COOLDOWN_SECONDS = 900            # 同一触发类型15分钟内不重复调
-MAX_DAILY_LLM_CALLS = 12          # 每日最多LLM调用次数
+LLM_TIMEOUT_SECONDS = 12
+MAX_DAILY_LLM_CALLS = 12
+COOLDOWN_SECONDS = 900            # 同一决策类型15分钟冷却
 DRY_RUN = os.getenv("AI_OVERRIDE_DRY_RUN", "").lower() in ("1", "true", "yes")
 
-# LLM API 配置 (从 ~/.hermes/config.yaml 读取)
-LLM_API_KEY = os.getenv("DEEPSEEK_API_KEY", "") or os.getenv("NVIDIA_API_KEY", "")
-LLM_MODEL = os.getenv(
-    "AI_OVERRIDE_MODEL",
-    "deepseek-ai/deepseek-v4-pro"
-)
-LLM_API_BASE = os.getenv(
-    "AI_OVERRIDE_API_BASE",
-    "https://api.deepseek.com/v1"
-)
+# 自动放行阈值 — 策略信号满足度达到此值, 不调 LLM
+AUTO_CLEAR_LONG_THRESHOLD = 0.83   # 5/6
+AUTO_CLEAR_SHORT_THRESHOLD = 0.83
 
-# ── 触发条件阈值 ────────────────────────────────────────────────────────
-ADX_EDGE_LOW = 20
-ADX_EDGE_HIGH = 25
-CONSECUTIVE_LOSSES_THRESHOLD = 2
-DAILY_EARLY_TRADES = 2
-RSI_EXIT_EDGE_MARGIN = 5          # RSI 离平仓阈值差 5 以内 → AI判断
+# AI 主动介入阈值 — HOLD 时某方向达到此值, 调 LLM
+AI_INTERVENE_THRESHOLD = 0.67     # 4/6
+
+# LLM API
+LLM_API_KEY = os.getenv("NVIDIA_API_KEY", "") or os.getenv("DEEPSEEK_API_KEY", "")
+LLM_MODEL = os.getenv("AI_OVERRIDE_MODEL", "deepseek-ai/deepseek-v4-pro")
+LLM_API_BASE = os.getenv("AI_OVERRIDE_API_BASE", "https://api.deepseek.com/v1")
 
 
 def _ensure_log():
@@ -64,18 +62,15 @@ def _ensure_log():
     if not LOG_FILE.exists():
         LOG_FILE.write_text("")
 
-
 def _log(level: str, msg: str):
     _ensure_log()
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"{ts} | {level:5s} | {msg}"
-    logger.info(line)
+    getattr(logger, level if hasattr(logger, level) else "info")(line)
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
 
-
-def _load_state() -> Dict[str, Any]:
-    """加载状态: 调用计数、冷却时间、连亏次数"""
+def _load_state() -> dict:
     try:
         if STATE_FILE.exists():
             return json.loads(STATE_FILE.read_text())
@@ -84,35 +79,26 @@ def _load_state() -> Dict[str, Any]:
     return {
         "daily_calls": 0,
         "reset_date": datetime.now().strftime("%Y-%m-%d"),
-        "cooldowns": {},      # {trigger_type: last_call_timestamp}
-        "consecutive_losses": 0,
-        "daily_trade_count": 0,
-        "last_signal": None,
+        "cooldowns": {},
+        "total_decisions": 0,
+        "ai_decisions": 0,
+        "auto_decisions": 0,
     }
 
-
-def _save_state(state: Dict[str, Any]):
+def _save_state(state: dict):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
 
 
-class AIOverride:
-    """AI 决策层，封装 LLM 调用逻辑。
-
-    用法:
-      ai = AIOverride()
-      decision = ai.judge(signal_context)
-      # → 'approve' | 'reject' | 'fallback'
-    """
+class DecisionEngine:
+    """AI 决策层 — 从策略信号到最终执行决策"""
 
     def __init__(self):
         self.state = _load_state()
         self._reset_daily_if_needed()
-        self.calls_saved = 0
 
     def _reset_daily_if_needed(self):
         today = datetime.now().strftime("%Y-%m-%d")
-        # 首次运行时 reset_date 为空 → 初始化为今天，避免每次都重置
         if not self.state.get("reset_date"):
             self.state["reset_date"] = today
             _save_state(self.state)
@@ -121,371 +107,349 @@ class AIOverride:
             self.state["daily_calls"] = 0
             self.state["reset_date"] = today
             self.state["cooldowns"] = {}
-            self.state["daily_trade_count"] = 0
             _save_state(self.state)
-            _log("info", "每日状态重置")
+            _log("info", "每日决策状态重置")
 
-    # ── 触发条件判断 ────────────────────────────────────────────────────
+    # ── 主入口 ──────────────────────────────────────────────────────────
 
-    def _should_trigger_lgb_edge(self, signal: str, lgb_opinion: str) -> bool:
-        """LGB 双确认边缘: 规则有信号但LGB返回no_opinion"""
-        return signal in ("LONG", "SHORT") and lgb_opinion == "no_opinion"
-
-    def _should_trigger_after_losses(self) -> bool:
-        """连亏2次后的首次信号"""
-        return self.state.get("consecutive_losses", 0) >= CONSECUTIVE_LOSSES_THRESHOLD
-
-    def _should_trigger_adx_edge(self, adx_val: float) -> bool:
-        """ADX 边缘区域"""
-        return ADX_EDGE_LOW <= adx_val <= ADX_EDGE_HIGH
-
-    def _should_trigger_early_trade(self) -> bool:
-        """每日前N笔交易"""
-        return self.state.get("daily_trade_count", 0) < DAILY_EARLY_TRADES
-
-    def _should_trigger_rsi_exit_edge(self, signal: str, rsi_val: float) -> bool:
-        """平仓RSI接近阈值"""
-        from strategies.spot.optimized_v6 import RSI_LONG_EXIT, RSI_SHORT_EXIT
-        if signal == "SELL":   # 平多
-            return RSI_LONG_EXIT - RSI_EXIT_EDGE_MARGIN <= rsi_val <= RSI_LONG_EXIT
-        if signal == "COVER":  # 平空
-            return RSI_SHORT_EXIT <= rsi_val <= RSI_SHORT_EXIT + RSI_EXIT_EDGE_MARGIN
-        return False
-
-    def _on_cooldown(self, trigger_type: str) -> bool:
-        """特定触发类型是否在冷却中"""
-        last = self.state["cooldowns"].get(trigger_type, 0)
-        return (time.time() - last) < COOLDOWN_SECONDS
-
-    def _set_cooldown(self, trigger_type: str):
-        self.state["cooldowns"][trigger_type] = time.time()
-
-    def _exceeded_daily_limit(self) -> bool:
-        return self.state["daily_calls"] >= MAX_DAILY_LLM_CALLS
-
-    # ── 核心判断逻辑 ────────────────────────────────────────────────────
-
-    def judge(
-        self,
-        signal: str,
-        lgb_opinion: str,
-        bar_context: Dict[str, Any],
-    ) -> str:
-        """主入口：判断是否触发AI，如果需要则调用LLM。
+    def decide(self, report: SignalReport) -> FinalDecision:
+        """
+        主决策入口。
 
         Parameters
         ----------
-        signal : 原始 MATrend 信号 ('LONG'|'SHORT'|'SELL'|'COVER'|'HOLD')
-        lgb_opinion : LGB 确认结果 ('agree'|'disagree'|'no_opinion')
-        bar_context : 当前K线上下文
-            {
-                'close': float, 'rsi': float, 'adx': float,
-                'macd_hist': float, 'ma7': float, 'ma25': float,
-                'volatility': float, 'has_position': bool,
-                'position_side': str, 'position_pnl': float,
-                'bars_held': int,
-            }
+        report : SignalReport
+            策略层输出的结构化信号报告
 
         Returns
         -------
-        'approve'  — AI 同意执行
-        'reject'   — AI 建议放弃
-        'fallback' — 不触发AI，走原规则
+        FinalDecision
         """
-        if signal == "HOLD":
-            return "fallback"
-
         self._reset_daily_if_needed()
 
-        # 确定触发原因
-        trigger_reasons: List[str] = []
-        adx_val = bar_context.get("adx", 0)
-        rsi_val = bar_context.get("rsi", 50)
+        # 1. 风控平仓 — 直接放行, 不经过 AI
+        if report.exit_signal:
+            _log("info", f"🚨 风控平仓: {report.exit_signal} | price=${report.price:,.0f}")
+            return FinalDecision(
+                action=report.exit_signal,
+                source="risk_management",
+                reasoning=f"Risk management exit: {report.exit_signal}",
+                confidence=1.0,
+            )
 
-        if self._should_trigger_lgb_edge(signal, lgb_opinion):
-            trigger_reasons.append("lgb_edge")
-        if self._should_trigger_after_losses():
-            trigger_reasons.append("after_losses")
-        if self._should_trigger_adx_edge(adx_val):
-            trigger_reasons.append(f"adx_edge(adx={adx_val:.0f})")
-        if self._should_trigger_early_trade():
-            trigger_reasons.append("early_trade")
-        if self._should_trigger_rsi_exit_edge(signal, rsi_val):
-            trigger_reasons.append(f"rsi_exit_edge(rsi={rsi_val:.0f})")
+        # 2. 冷却期 — 不放行 (除非 AI 判断极端行情)
+        if report.is_cooldown:
+            return FinalDecision(
+                action="HOLD",
+                source="auto_clear",
+                reasoning="Cooldown period active",
+                confidence=1.0,
+            )
 
-        if not trigger_reasons:
-            return "fallback"
+        # 3. 信号极清晰 → 自动放行
+        auto = self._auto_clear(report)
+        if auto:
+            return auto
 
-        # 冷却检查
-        active_reasons = [r for r in trigger_reasons if not self._on_cooldown(r)]
-        if not active_reasons:
-            _log("debug", f"所有触发原因在冷却中: {trigger_reasons}")
-            return "fallback"
+        # 4. 信号模糊 或 HOLD + 高分 → 调 LLM
+        if self._should_call_llm(report):
+            return self._call_llm_decide(report)
 
-        # 每日限额
-        if self._exceeded_daily_limit():
-            _log("warn", f"超过每日LLM调用上限({MAX_DAILY_LLM_CALLS})，fallback")
-            return "fallback"
+        # 5. 信号弱 → HOLD
+        return FinalDecision(
+            action="HOLD",
+            source="auto_clear",
+            reasoning="Strategy conditions insufficient, no AI intervention threshold met",
+            confidence=0.9,
+        )
 
-        # 调用 LLM
-        _log("info", f"🤖 AIOverride触发: {active_reasons} | signal={signal}")
-        result = self._call_llm(signal, lgb_opinion, bar_context, active_reasons)
+    # ── 自动放行 ────────────────────────────────────────────────────────
+
+    def _auto_clear(self, report: SignalReport) -> Optional[FinalDecision]:
+        """信号极清晰时自动放行, 跳过 LLM。
+
+        LONG: long_score ≥ 5/6 AND short_score ≤ 1/6 → auto LONG
+        SHORT: short_score ≥ 5/6 AND long_score ≤ 1/6 → auto SHORT
+        """
+        # LONG 极强
+        if (report.long_score >= AUTO_CLEAR_LONG_THRESHOLD
+                and report.short_score <= 0.17
+                and report.raw_signal == "LONG"):
+            _log("info", f"⚡ 自动放行 LONG | score={report.long_score:.0%} | ${report.price:,.0f}")
+            return FinalDecision(
+                action="LONG",
+                source="auto_clear",
+                reasoning=f"Clear LONG signal: {report.long_score:.0%} conditions met, SHORT only {report.short_score:.0%}",
+                confidence=report.long_score,
+            )
+
+        # SHORT 极强
+        if (report.short_score >= AUTO_CLEAR_SHORT_THRESHOLD
+                and report.long_score <= 0.17
+                and report.raw_signal == "SHORT"):
+            _log("info", f"⚡ 自动放行 SHORT | score={report.short_score:.0%} | ${report.price:,.0f}")
+            return FinalDecision(
+                action="SHORT",
+                source="auto_clear",
+                reasoning=f"Clear SHORT signal: {report.short_score:.0%} conditions met, LONG only {report.long_score:.0%}",
+                confidence=report.short_score,
+            )
+
+        return None
+
+    # ── AI 调判断 ────────────────────────────────────────────────────────
+
+    def _should_call_llm(self, report: SignalReport) -> bool:
+        """判断是否需要调 LLM。
+
+        触发条件:
+        - raw_signal 为非 HOLD 且 long_score/short_score 在 3~5/6 之间
+        - raw_signal 为 HOLD 但某方向 ≥ 4/6
+        - 每日限额未超
+        """
+        if self.state["daily_calls"] >= MAX_DAILY_LLM_CALLS:
+            return False
+
+        if DRY_RUN:
+            return False
+
+        # 非 HOLD 信号: 分数不够自动放行 → 调 LLM
+        if report.raw_signal in ("LONG", "SHORT"):
+            score = report.long_score if report.raw_signal == "LONG" else report.short_score
+            if 0.33 <= score < AUTO_CLEAR_LONG_THRESHOLD:
+                return True
+
+        # HOLD 信号: 某方向 ≥ 4/6 → AI 可能主动开仓
+        if report.raw_signal == "HOLD":
+            if report.long_score >= AI_INTERVENE_THRESHOLD or report.short_score >= AI_INTERVENE_THRESHOLD:
+                return True
+
+        return False
+
+    def _call_llm_decide(self, report: SignalReport) -> FinalDecision:
+        """调 LLM 做最终决策。
+
+        返回 FinalDecision with source='ai_decision'
+        失败时 fallback 到 'auto_clear' with HOLD
+        """
+        reasons = self._get_trigger_reasons(report)
+        _log("info", f"🤖 AI决策触发: {reasons} | ${report.price:,.0f} "
+              f"LONG={report.long_score:.0%} SHORT={report.short_score:.0%}")
+
+        prompt = self._build_decision_prompt(report, reasons)
+        result = self._invoke_llm(prompt)
+
+        if result is None:
+            _log("warn", "LLM 调用失败, fallback HOLD")
+            return FinalDecision(action="HOLD", source="auto_clear",
+                                reasoning="LLM call failed, fallback to HOLD", confidence=0.5)
 
         # 更新状态
-        for r in active_reasons:
-            self._set_cooldown(r)
         self.state["daily_calls"] += 1
-        self.calls_saved += 1
+        self.state["ai_decisions"] = self.state.get("ai_decisions", 0) + 1
+        self.state["total_decisions"] = self.state.get("total_decisions", 0) + 1
         _save_state(self.state)
 
-        return result
+        action = result.get("action", "HOLD")
+        reasoning = result.get("reasoning", "AI decision")
+        confidence = result.get("confidence", 0.5)
+
+        # 如果 AI 说 HOLD 但策略已经建议 HOLD, 保持
+        if action not in ("LONG", "SHORT", "HOLD"):
+            action = "HOLD"
+
+        _log("info", f"{'✅' if action != 'HOLD' else '⏸️'} AI决策: {action} | "
+              f"confidence={confidence:.0%} | {reasoning[:80]}")
+
+        return FinalDecision(
+            action=action,
+            source="ai_decision",
+            reasoning=reasoning,
+            confidence=confidence,
+        )
+
+    def _get_trigger_reasons(self, report: SignalReport) -> List[str]:
+        reasons = []
+        if report.raw_signal in ("LONG", "SHORT"):
+            score = report.long_score if report.raw_signal == "LONG" else report.short_score
+            reasons.append(f"borderline_{report.raw_signal.lower()}({score:.0%})")
+        if report.raw_signal == "HOLD":
+            if report.long_score >= AI_INTERVENE_THRESHOLD:
+                reasons.append(f"hold_but_long_viable({report.long_score:.0%})")
+            if report.short_score >= AI_INTERVENE_THRESHOLD:
+                reasons.append(f"hold_but_short_viable({report.short_score:.0%})")
+        if report.lgb_opinion == "no_opinion":
+            reasons.append("lgb_uncertain")
+        return reasons
+
+    # ── Prompt 构建 ──────────────────────────────────────────────────────
+
+    def _build_decision_prompt(self, report: SignalReport, reasons: List[str]) -> str:
+        """构建 AI 决策提示词。
+
+        核心思路: 给 AI 完整的市场快照 + 策略评估, 让它做交易员式的综合判断。
+        """
+        # 基础上下文
+        parts = [
+            "You are the AI Decision Layer for a crypto quantitative trading system (BTC-USDT perpetual futures, 15-min bars).",
+            "Strategy layer provides technical indicators and condition scores. You make the FINAL call.",
+            "",
+            report.to_ai_context(),
+            "",
+            "## Rules",
+            "- You can OVERRIDE the strategy: if strategy says HOLD but conditions look good, you can say LONG/SHORT.",
+            "- Conversely, if strategy says LONG/SHORT but market looks risky, say HOLD.",
+            "- Consider RSI extremes: >75 is overbought (risky to long), <25 is oversold (risky to short).",
+            "- Consider ADX: <25 means ranging/choppy (avoid trading), >35 means trending (trade with trend).",
+            "- Consider price context: is this a breakout or a fakeout?",
+            f"- Trigger reason: {', '.join(reasons)}",
+            "",
+            "Reply format (choose ONE):",
+            "LONG",
+            "SHORT",
+            "HOLD",
+            "",
+            "You may append a one-line reasoning after the decision word.",
+            "Example: LONG | Strong bullish alignment with volume confirmation, RSI cooling from peak",
+            "",
+            "Decision:",
+        ]
+        return "\n".join(parts)
 
     # ── LLM 调用 ────────────────────────────────────────────────────────
 
-    def _call_llm(
-        self,
-        signal: str,
-        lgb_opinion: str,
-        bar: Dict[str, Any],
-        reasons: List[str],
-    ) -> str:
-        """调用 LLM (首选 OpenAI-compatible API，备选 hermes CLI)。
+    def _invoke_llm(self, prompt: str) -> Optional[dict]:
+        """调 LLM API, 返回解析后的决策 dict。
 
-        返回 'approve' | 'reject' | 'fallback'
+        Returns
+        -------
+        dict or None
+            {"action": "LONG", "reasoning": "...", "confidence": 0.8}
         """
-        prompt = self._build_prompt(signal, lgb_opinion, bar, reasons)
-
-        if DRY_RUN:
-            _log("info", f"DRY_RUN 模式, prompt={len(prompt)}chars → fallback")
-            return "fallback"
-
-        # 策略1: 直接调 OpenAI-compatible API (更快)
+        # 策略1: OpenAI-compatible API
         if LLM_API_KEY:
             result = self._call_openai_api(prompt)
-            if result is not None:
+            if result:
                 return result
 
         # 策略2: hermes CLI (备选)
         result = self._call_hermes_cli(prompt)
-        if result is not None:
+        if result:
             return result
 
-        _log("error", "所有 LLM 调用方式均失败")
-        return "fallback"
+        return None
 
-    def _call_openai_api(self, prompt: str) -> Optional[str]:
-        """通过 curl 调用 OpenAI-compatible API。
-
-        返回 'approve' | 'reject' | 'fallback' | None (失败)
-        """
+    def _call_openai_api(self, prompt: str) -> Optional[dict]:
         payload = json.dumps({
             "model": LLM_MODEL,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 10,       # 只需要一个词
-            "temperature": 0.1,     # 确定性输出
+            "max_tokens": 50,
+            "temperature": 0.2,
         })
 
         try:
             proc = subprocess.run(
-                [
-                    "curl", "-s", "--max-time", str(LLM_TIMEOUT_SECONDS),
-                    f"{LLM_API_BASE}/chat/completions",
-                    "-H", f"Authorization: Bearer {LLM_API_KEY}",
-                    "-H", "Content-Type: application/json",
-                    "-d", payload,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=LLM_TIMEOUT_SECONDS + 2,
+                ["curl", "-s", "--max-time", str(LLM_TIMEOUT_SECONDS),
+                 f"{LLM_API_BASE}/chat/completions",
+                 "-H", f"Authorization: Bearer {LLM_API_KEY}",
+                 "-H", "Content-Type: application/json",
+                 "-d", payload],
+                capture_output=True, text=True,
+                timeout=LLM_TIMEOUT_SECONDS + 3,
             )
-
             if proc.returncode != 0:
-                _log("warn", f"curl 失败: {proc.returncode} | stderr={proc.stderr[:200]}")
+                _log("warn", f"curl failed: rc={proc.returncode}")
                 return None
 
             data = json.loads(proc.stdout)
-            choice = data.get("choices", [{}])[0]
-            content = choice.get("message", {}).get("content", "").strip()
-            _log("info", f"API 回复 ({len(content)} chars): {content[:100]}")
-
-            return self._parse_llm_response(content)
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            _log("debug", f"LLM raw response: {content[:200]}")
+            return self._parse_decision(content)
 
         except subprocess.TimeoutExpired:
-            _log("warn", f"API 调用超时 ({LLM_TIMEOUT_SECONDS}s)")
-            return None
+            _log("warn", f"API timeout ({LLM_TIMEOUT_SECONDS}s)")
         except json.JSONDecodeError as e:
-            _log("warn", f"API 返回不是合法 JSON: {e} | stdout={proc.stdout[:200]}")
-            return None
+            _log("warn", f"API response not valid JSON: {e}")
         except Exception as e:
-            _log("error", f"API 调用异常: {e}")
-            return None
+            _log("error", f"API exception: {e}")
 
-    def _call_hermes_cli(self, prompt: str) -> Optional[str]:
-        """备选: 通过 hermes CLI 调用。
+        return None
 
-        返回 'approve' | 'reject' | 'fallback' | None (失败)
-        """
+    def _call_hermes_cli(self, prompt: str) -> Optional[dict]:
         try:
             result = subprocess.run(
-                [HERMES_BIN, "chat", "-q", prompt, "-Q"],
-                capture_output=True,
-                text=True,
+                ["hermes", "chat", "-q", prompt, "-Q"],
+                capture_output=True, text=True,
                 timeout=LLM_TIMEOUT_SECONDS + 5,
                 env={**os.environ, "HERMES_MAX_TURNS": "1"},
                 cwd=str(PROJECT),
             )
-
             if result.returncode != 0:
-                _log("warn", f"hermes CLI 返回非0: {result.returncode}")
                 return None
-
-            output = result.stdout.strip()
-            _log("info", f"hermes CLI 回复 ({len(output)} chars): {output[:300]}")
-            return self._parse_llm_response(output)
-
-        except subprocess.TimeoutExpired:
-            _log("warn", f"hermes CLI 超时")
-            return None
-        except FileNotFoundError:
-            _log("error", f"hermes CLI 不可用: {HERMES_BIN}")
-            return None
+            return self._parse_decision(result.stdout.strip())
         except Exception as e:
-            _log("error", f"hermes CLI 异常: {e}")
-            return None
+            _log("warn", f"hermes CLI failed: {e}")
+        return None
 
-    def _build_prompt(
-        self,
-        signal: str,
-        lgb_opinion: str,
-        bar: Dict[str, Any],
-        reasons: List[str],
-    ) -> str:
-        """构建 LLM 提示词。
+    def _parse_decision(self, text: str) -> Optional[dict]:
+        """从 LLM 输出中提取决策。"""
+        text_clean = text.strip()
 
-        要求 LLM 只回复一个词: APPROVE / REJECT / FALLBACK。
-        不给模型太多上下文避免思考过深——只需要判断模糊边界。
-        """
+        # 提取第一行
+        first_line = text_clean.split("\n")[0].strip().upper()
 
-        signal_meaning = {
-            "LONG": "开多仓",
-            "SHORT": "开空仓",
-            "SELL": "平多仓",
-            "COVER": "平空仓",
-        }
+        action = "HOLD"
+        if re.search(r'\bLONG\b', first_line):
+            action = "LONG"
+        elif re.search(r'\bSHORT\b', first_line):
+            action = "SHORT"
 
-        parts = [
-            "你是加密货币量化交易系统的AI决策层。只回复一个词：APPROVE / REJECT / FALLBACK。不要解释。",
-            "",
-            f"信号: {signal_meaning.get(signal, signal)} ({signal})",
-            f"触发原因: {', '.join(reasons)}",
-            f"LGB确认: {lgb_opinion}",
-            f"价格: ${bar.get('close', 0):.0f}",
-            f"RSI: {bar.get('rsi', 50):.1f}",
-            f"ADX: {bar.get('adx', 20):.1f}",
-            f"MACD_Hist: {bar.get('macd_hist', 0):.2f}",
-            f"MA7: ${bar.get('ma7', 0):.0f}",
-            f"MA25: ${bar.get('ma25', 0):.0f}",
-            f"波动率: {bar.get('volatility', 0) * 100:.2f}%",
-        ]
+        # 提取推理 (第一行中 | 后面的部分)
+        reasoning = ""
+        if "|" in text_clean.split("\n")[0]:
+            reasoning = text_clean.split("\n")[0].split("|", 1)[1].strip()
+        elif len(text_clean.split("\n")) > 1:
+            reasoning = text_clean.split("\n")[1].strip()[:150]
+        else:
+            reasoning = "No reasoning provided"
 
-        if bar.get("has_position"):
-            parts.extend([
-                f"持仓方向: {bar['position_side']}",
-                f"持仓盈亏: {bar.get('position_pnl', 0) * 100:.2f}%",
-                f"已持仓K线数: {bar.get('bars_held', 0)}",
-            ])
+        # 置信度 (如果有)
+        confidence = 0.7
+        conf_match = re.search(r'confidence[=:]\s*([\d.]+)', text_clean, re.IGNORECASE)
+        if conf_match:
+            confidence = float(conf_match.group(1))
 
-        parts.extend([
-            f"连续亏损次数: {self.state.get('consecutive_losses', 0)}",
-            f"当日交易次数: {self.state.get('daily_trade_count', 0)}",
-            "",
-            "APPROVE = 同意执行信号, REJECT = 放弃, FALLBACK = 不干预",
-            "只在信号明显不合理(如震荡市强行方向交易)时才REJECT。默认APPROVE。",
-        ])
+        return {"action": action, "reasoning": reasoning[:200], "confidence": confidence}
 
-        return "\n".join(parts)
-
-    def _parse_llm_response(self, output: str) -> str:
-        """从 LLM 输出中提取决策词。"""
-        # 标准化
-        output_clean = output.strip().upper()
-
-        # 精确匹配
-        if re.search(r'\bAPPROVE\b', output_clean):
-            return "approve"
-        if re.search(r'\bREJECT\b', output_clean):
-            return "reject"
-        if re.search(r'\bFALLBACK\b', output_clean):
-            return "fallback"
-
-        # 常见中文
-        if any(w in output.lower() for w in ["同意", "执行", "开仓", "平仓"]):
-            return "approve"
-        if any(w in output.lower() for w in ["拒绝", "放弃", "不执行", "跳过"]):
-            return "reject"
-
-        # 兜底: 任何非reject的明确回复 → approve
-        _log("info", f"LLM回复无法解析决策词, 默认fallback: {output[:100]}")
-        return "fallback"
-
-    # ── 状态更新 ────────────────────────────────────────────────────────
+    # ── 状态管理 ────────────────────────────────────────────────────────
 
     def update_trade_result(self, pnl: float):
-        """交易结束后更新连亏计数"""
-        if pnl < 0:
-            self.state["consecutive_losses"] += 1
-        else:
-            self.state["consecutive_losses"] = 0
-        self.state["daily_trade_count"] += 1
-        self.state["last_signal"] = None
+        """交易结束后更新状态 (保留兼容)"""
+        self.state["total_decisions"] = self.state.get("total_decisions", 0) + 1
         _save_state(self.state)
 
-    def set_last_signal(self, signal: str):
-        """记录当前信号（用于下次判断）"""
-        self.state["last_signal"] = signal
-        _save_state(self.state)
-
-    def flush(self):
-        """确保状态落盘"""
-        if self.calls_saved > 0:
-            _save_state(self.state)
-            _log("info", f"状态已保存 ({self.calls_saved} 次LLM调用)")
-            self.calls_saved = 0
+    def get_stats(self) -> dict:
+        return {
+            "daily_calls": self.state.get("daily_calls", 0),
+            "max_daily_calls": MAX_DAILY_LLM_CALLS,
+            "ai_decisions": self.state.get("ai_decisions", 0),
+            "auto_decisions": self.state.get("auto_decisions", 0),
+            "total_decisions": self.state.get("total_decisions", 0),
+        }
 
 
-# ── 工厂 ────────────────────────────────────────────────────────────────
+# ── 全局单例 ────────────────────────────────────────────────────────────
 
-_global_override: Optional[AIOverride] = None
-
-
-def get_ai_override() -> AIOverride:
-    global _global_override
-    if _global_override is None:
-        _global_override = AIOverride()
-    return _global_override
+_global_engine: Optional[DecisionEngine] = None
 
 
-# ── CLI 测试 ────────────────────────────────────────────────────────────
+def get_decision_engine() -> DecisionEngine:
+    global _global_engine
+    if _global_engine is None:
+        _global_engine = DecisionEngine()
+    return _global_engine
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-    ai = get_ai_override()
-
-    # 模拟信号
-    ctx = {
-        "close": 78620.0,
-        "rsi": 48.5,
-        "adx": 22.0,
-        "macd_hist": -3.2,
-        "ma7": 78500.0,
-        "ma25": 78200.0,
-        "volatility": 0.003,
-        "has_position": False,
-        "position_side": "",
-        "position_pnl": 0.0,
-        "bars_held": 0,
-    }
-
-    result = ai.judge(signal="LONG", lgb_opinion="no_opinion", bar_context=ctx)
-    print(f"\n决策结果: {result}")
+# 保留旧接口兼容
+def get_ai_override():
+    return get_decision_engine()
