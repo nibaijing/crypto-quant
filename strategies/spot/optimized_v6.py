@@ -36,8 +36,8 @@ RSI_LONG_EXIT = 75       # 做多平仓: RSI > 75 (让盈利奔跑)
 RSI_SHORT_ENTRY = 55     # 做空: RSI > 55 (等待更强反弹再介入)
 RSI_SHORT_MIN_ENTRY = 35 # 做空: RSI < 35 拒绝开仓 (拒绝追低)
 RSI_SHORT_EXIT = 40      # 做空平仓: RSI < 40 (持有到超卖区域)
-MACD_LONG_THRESHOLD = 25 # MACD_hist > 20 才确认做多 (严格过滤15m噪音)
-MACD_SHORT_THRESHOLD = -25 # MACD_hist < -20 才确认做空
+MACD_LONG_THRESHOLD = 15  # MACD_hist > 15 确认做多 (15m放宽, 从25下调)
+MACD_SHORT_THRESHOLD = -15 # MACD_hist < -15 确认做空 (15m放宽, 从-25上调)
 ADX_THRESHOLD = 35       # ADX 须 > 35 过滤震荡 (15m需要更强趋势)
 # 方向判定: 不再用 price/MA99 偏离 (15mK线偏差2%太苛刻且与RSI互斥)
 # 改用 MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
@@ -264,6 +264,24 @@ class OptimizedStrategy:
             if long_signal:
                 self.last_entry_bar = idx
                 return "LONG"
+
+            # 诊断: 开仓条件未满足时, 打印各条件状态
+            if not has_position and bars_since_exit >= COOLDOWN_BARS:
+                short_parts = []
+                short_parts.append(f"MA={'✓' if m7<m25 else '✗'}")
+                short_parts.append(f"MACD={'✓' if macdh<MACD_SHORT_THRESHOLD else f'✗({macdh:.0f})'}")
+                short_parts.append(f"ADX={'✓' if strong_trend else f'✗({adx_val:.0f})'}")
+                short_parts.append(f"Reg={'✓' if regime!='bull' else '✗'}")
+                short_parts.append(f"RSI={'✓' if RSI_SHORT_MIN_ENTRY<rsi_val<RSI_SHORT_ENTRY+20 else f'✗({rsi_val:.0f})'}")
+                short_parts.append(f"VOL={'✓' if vol_surge else '✗'}")
+                long_parts = []
+                long_parts.append(f"MA={'✓' if m7>m25 else '✗'}")
+                long_parts.append(f"MACD={'✓' if macdh>MACD_LONG_THRESHOLD else f'✗({macdh:.0f})'}")
+                long_parts.append(f"ADX={'✓' if strong_trend else f'✗({adx_val:.0f})'}")
+                long_parts.append(f"Reg={'✓' if regime!='bear' else '✗'}")
+                long_parts.append(f"RSI={'✓' if RSI_LONG_ENTRY<rsi_val<RSI_LONG_MAX_ENTRY else f'✗({rsi_val:.0f})'}")
+                long_parts.append(f"VOL={'✓' if vol_surge else '✗'}")
+                logger.info(f"🔍 HOLD | SHORT[{' '.join(short_parts)}] | LONG[{' '.join(long_parts)}]")
         
         return "HOLD"
     

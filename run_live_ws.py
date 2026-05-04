@@ -427,6 +427,10 @@ def main():
                     df["macd_hist"] = df["macd"] - df["macd_signal"]
                     df["volatility"] = df["close"].pct_change().rolling(20).std()
 
+                    # 成交量确认 (修复: 之前遗漏未重算)
+                    df["volume_ma"] = df["volume"].rolling(20).mean()
+                    df["volume_surge"] = df["volume"] > df["volume_ma"] * 1.5
+
                     # ADX
                     tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift(1)).abs(), (df['low'] - df['close'].shift(1)).abs()], axis=1).max(axis=1)
                     atr_14 = tr.rolling(14).mean()
