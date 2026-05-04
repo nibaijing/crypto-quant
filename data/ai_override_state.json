@@ -1,10 +1,12 @@
 {
-  "daily_calls": 1,
-  "reset_date": "2026-05-03",
+  "daily_calls": 3,
+  "reset_date": "2026-05-04",
   "cooldowns": {
-    "early_trade": 1777814103.113132
+    "adx_edge(adx=23)": 1777827601.29344,
+    "early_trade": 1777853701.3077166,
+    "adx_edge(adx=24)": 1777842901.5822425
   },
-  "consecutive_losses": 0,
-  "daily_trade_count": 0,
+  "consecutive_losses": 2,
+  "daily_trade_count": 2,
   "last_signal": null
 }

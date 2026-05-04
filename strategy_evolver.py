@@ -197,8 +197,28 @@ def compute_evolved_params(review: dict, current: dict) -> dict:
     return evolved
 
 
-def apply_params(new_params: dict) -> bool:
-    """将新参数写入 strategy 文件 (模块级常量)"""
+def restart_engine() -> bool:
+    """重启 crypto-quant.service (systemd user)"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", "crypto-quant.service"],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0:
+            return True
+        print(f"⚠️ 引擎重启失败: {result.stderr.strip()}")
+        return False
+    except subprocess.TimeoutExpired:
+        print("⚠️ 引擎重启超时")
+        return False
+    except FileNotFoundError:
+        print("⚠️ systemctl 不可用，请手动重启: systemctl --user restart crypto-quant.service")
+        return False
+
+
+def apply_params(new_params: dict, auto_restart: bool = True) -> bool:
+    """将新参数写入 strategy 文件 (模块级常量), 可选自动重启引擎"""
     content = STRATEGY_FILE.read_text("utf-8")
 
     param_map = {
@@ -237,6 +257,14 @@ def apply_params(new_params: dict) -> bool:
         }
         snapshot_path = PROJECT / "data" / "reviews" / f"params_evolved_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         snapshot_path.write_text(json.dumps(params_snapshot, ensure_ascii=False, indent=2), "utf-8")
+
+        # 自动重启引擎加载新参数
+        if auto_restart:
+            print("🔄 正在重启交易引擎...")
+            if restart_engine():
+                print("✅ 引擎已重启，新策略参数已生效")
+            else:
+                print("⚠️ 自动重启失败，请手动执行: systemctl --user restart crypto-quant.service")
         return True
 
     return False
@@ -275,7 +303,6 @@ if __name__ == "__main__":
         if apply_params(evolved):
             print()
             print("✅ 策略参数已更新到 optimized_v6.py")
-            print("⚠️ 需重启 crypto-quant.service 生效")
         else:
             print("⚠️ 参数写入失败（可能参数名不匹配）")
     elif not dry_run:

@@ -28,15 +28,15 @@ MAX_DRAWDOWN_PCT = 0.20  # 最大回撤 20% 熔断
 MAX_HOLD_BARS = 48       # 最大持仓K线数 (12小时)
 
 # === 信号阈值 ===
-RSI_LONG_ENTRY = 48      # 做多: RSI < 48 (回调到位时介入)
+RSI_LONG_ENTRY = 45      # 做多: RSI < 48 (回调到位时介入)
 RSI_LONG_MAX_ENTRY = 65  # 做多: RSI > 65 拒绝开仓 (拒绝追高) — 区别于平仓阈值
 RSI_LONG_EXIT = 72       # 做多平仓: RSI > 72 (极端过热)
 RSI_SHORT_ENTRY = 50     # 做空: RSI > 50 (反弹到位时介入)
 RSI_SHORT_MIN_ENTRY = 35 # 做空: RSI < 35 拒绝开仓 (拒绝追低)
-RSI_SHORT_EXIT = 45      # 做空平仓: RSI < 45 (超卖反弹)
+RSI_SHORT_EXIT = 50      # 做空平仓: RSI < 45 (超卖反弹)
 MACD_LONG_THRESHOLD = 5  # MACD_hist > 5 即确认 (原15太严)
 MACD_SHORT_THRESHOLD = -5  # MACD_hist < -5 即确认 (原-15太严)
-ADX_THRESHOLD = 23       # ADX 须 > 23 过滤震荡 (原20太严)
+ADX_THRESHOLD = 28       # ADX 须 > 23 过滤震荡 (原20太严)
 # 方向判定: 不再用 price/MA99 偏离 (15mK线偏差2%太苛刻且与RSI互斥)
 # 改用 MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
 
