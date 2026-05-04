@@ -135,14 +135,10 @@ def compute_evolved_params(review: dict, current: dict) -> dict:
 
     changes = []
 
-    # Rule 1: 胜率太低 → 收紧 ADX, RSI entry 阈值
+    # Rule 1: 胜率太低 → 提高 ADX (更严格的趋势过滤)
     if total_trades >= 5 and win_rate < 40:
-        evolved["ADX_THRESHOLD"] = min(evolved.get("ADX_THRESHOLD", 18) + 5, 28)
-        evolved["RSI_LONG_ENTRY"] = evolved.get("RSI_LONG_ENTRY", 40) - 5
-        evolved["RSI_LONG_EXIT"] = evolved.get("RSI_LONG_EXIT", 75) + 5
-        evolved["RSI_SHORT_ENTRY"] = evolved.get("RSI_SHORT_ENTRY", 35) - 5
-        evolved["RSI_SHORT_EXIT"] = evolved.get("RSI_SHORT_EXIT", 25) + 5
-        changes.append(f"ADX+5 → {evolved['ADX_THRESHOLD']}, RSI收窄")
+        evolved["ADX_THRESHOLD"] = min(evolved.get("ADX_THRESHOLD", 35) + 5, 45)
+        changes.append(f"ADX+5 → {evolved['ADX_THRESHOLD']} (提高趋势门槛)")
 
     # Rule 2: 大额亏损 → 收紧ATR止损
     if abs(max_loss) > 50:
@@ -151,35 +147,32 @@ def compute_evolved_params(review: dict, current: dict) -> dict:
         evolved["MAX_POSITION_PCT"] = max(evolved.get("MAX_POSITION_PCT", 0.30) - 0.05, 0.15)
         changes.append(f"ATR止损收紧, MAX_POSITION→{evolved['MAX_POSITION_PCT']:.0%}")
 
-    # Rule 3: LONG 连续亏 → 更难触发
+    # Rule 3: LONG 连续亏 → 更严格过滤 (提高 ADX，收紧 MACD)
     long_data = d.get("long", {})
     if long_data.get("count", 0) >= 3 and long_data.get("pnl", 0) < -30:
-        evolved["RSI_LONG_ENTRY"] = max(evolved.get("RSI_LONG_ENTRY", 40) - 3, 25)
-        evolved["RSI_LONG_EXIT"] = min(evolved.get("RSI_LONG_EXIT", 75) - 5, 85)
-        changes.append("LONG亏损偏多，降低触发 & 更早退出")
+        evolved["ADX_THRESHOLD"] = min(evolved.get("ADX_THRESHOLD", 35) + 3, 45)
+        evolved["MACD_LONG_THRESHOLD"] = min(evolved.get("MACD_LONG_THRESHOLD", 20) + 5, 35)
+        changes.append("LONG亏损偏多，提高ADX+MACD门槛")
 
-    # Rule 4: SHORT 连续亏
+    # Rule 4: SHORT 连续亏 → 更严格过滤
     short_data = d.get("short", {})
     if short_data.get("count", 0) >= 3 and short_data.get("pnl", 0) < -30:
-        evolved["RSI_SHORT_ENTRY"] = min(evolved.get("RSI_SHORT_ENTRY", 35) + 3, 50)
-        evolved["RSI_SHORT_EXIT"] = max(evolved.get("RSI_SHORT_EXIT", 25) + 5, 40)
-        changes.append("SHORT亏损偏多，调高门槛")
+        evolved["ADX_THRESHOLD"] = min(evolved.get("ADX_THRESHOLD", 35) + 3, 45)
+        evolved["MACD_SHORT_THRESHOLD"] = max(evolved.get("MACD_SHORT_THRESHOLD", -20) - 5, -35)
+        changes.append("SHORT亏损偏多，提高ADX+MACD门槛")
 
-    # Rule 5: 因子 bias — 来自 factor_analysis.py 的外部信号
+    # Rule 5: 因子 bias — 适度偏向但不破坏风控
     if _FACTOR_BIAS_AVAILABLE:
         try:
             bias = get_active_factor_bias()
             if bias["confidence"] > 0.3 and bias["bias"] != "neutral":
                 if bias["bias"] == "long_bias":
-                    # 因子看好做多 → 放宽 LONG entry, 收紧 SHORT entry
-                    evolved["RSI_LONG_ENTRY"] = max(evolved.get("RSI_LONG_ENTRY", 40) - 5, 25)
-                    evolved["RSI_SHORT_ENTRY"] = min(evolved.get("RSI_SHORT_ENTRY", 35) + 5, 50)
-                    changes.append(f"因子long_bias(置信{bias['confidence']}): 放宽LONG触发, 收紧SHORT")
+                    # 因子看好做多 → 略微增加冷却期，不轻易放宽
+                    evolved["COOLDOWN_BARS"] = min(evolved.get("COOLDOWN_BARS", 6) + 2, 12)
+                    changes.append(f"因子long_bias(置信{bias['confidence']}): 延长冷却期")
                 elif bias["bias"] == "short_bias":
-                    # 因子看好做空 → 放宽 SHORT entry, 收紧 LONG entry
-                    evolved["RSI_SHORT_ENTRY"] = min(evolved.get("RSI_SHORT_ENTRY", 35) + 5, 50)
-                    evolved["RSI_LONG_ENTRY"] = max(evolved.get("RSI_LONG_ENTRY", 40) + 5, 30)
-                    changes.append(f"因子short_bias(置信{bias['confidence']}): 放宽SHORT触发, 收紧LONG")
+                    evolved["COOLDOWN_BARS"] = min(evolved.get("COOLDOWN_BARS", 6) + 2, 12)
+                    changes.append(f"因子short_bias(置信{bias['confidence']}): 延长冷却期")
         except Exception as e:
             changes.append(f"因子bias获取失败: {e}")
 
@@ -189,13 +182,13 @@ def compute_evolved_params(review: dict, current: dict) -> dict:
             evolved[key] = _smooth_delta(key, evolved[key], current[key], SMOOTH_LIMITS)
 
     # Clamp
-    evolved["RSI_LONG_ENTRY"] = max(min(evolved.get("RSI_LONG_ENTRY", 48), 55), 20)
+    evolved["RSI_LONG_ENTRY"] = max(min(evolved.get("RSI_LONG_ENTRY", 35), 45), 20)
     evolved["RSI_LONG_MAX_ENTRY"] = max(min(evolved.get("RSI_LONG_MAX_ENTRY", 65), 75), 50)
-    evolved["RSI_LONG_EXIT"] = max(min(evolved.get("RSI_LONG_EXIT", 72), 90), 55)
-    evolved["RSI_SHORT_ENTRY"] = max(min(evolved.get("RSI_SHORT_ENTRY", 50), 65), 30)
-    evolved["RSI_SHORT_MIN_ENTRY"] = max(min(evolved.get("RSI_SHORT_MIN_ENTRY", 35), 50), 20)
-    evolved["RSI_SHORT_EXIT"] = max(min(evolved.get("RSI_SHORT_EXIT", 45), 55), 20)
-    evolved["ADX_THRESHOLD"] = max(min(evolved.get("ADX_THRESHOLD", 23), 35), 12)
+    evolved["RSI_LONG_EXIT"] = max(min(evolved.get("RSI_LONG_EXIT", 75), 85), 65)
+    evolved["RSI_SHORT_ENTRY"] = max(min(evolved.get("RSI_SHORT_ENTRY", 55), 65), 40)
+    evolved["RSI_SHORT_MIN_ENTRY"] = max(min(evolved.get("RSI_SHORT_MIN_ENTRY", 35), 45), 20)
+    evolved["RSI_SHORT_EXIT"] = max(min(evolved.get("RSI_SHORT_EXIT", 40), 50), 25)
+    evolved["ADX_THRESHOLD"] = max(min(evolved.get("ADX_THRESHOLD", 35), 50), 25)
 
     evolved["_changes"] = changes
     evolved["_evolved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

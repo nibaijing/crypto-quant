@@ -27,17 +27,17 @@ ATR_STOP_SHORT = 1.5     # 做空 ATR 止损倍数 (做空更激进)
 MAX_DRAWDOWN_PCT = 0.20  # 最大回撤 20% 熔断
 MAX_HOLD_BARS = 32       # 最大持仓K线数 (8小时)
 MIN_HOLD_BARS = 4        # 最小持仓K线数 (前4根K线不能RSI平仓, ATR止损除外)
-COOLDOWN_BARS = 6        # 冷却K线数 (90分钟, 避免频繁交易)
+COOLDOWN_BARS = 8        # 冷却K线数 (90分钟, 避免频繁交易)
 
 # === 信号阈值 ===
 RSI_LONG_ENTRY = 35      # 做多: RSI < 35 (深度回调介入, 更安全)
-RSI_LONG_MAX_ENTRY = 65  # 做多: RSI > 65 拒绝开仓 (拒绝追高) — 区别于平仓阈值
+RSI_LONG_MAX_ENTRY = 65  # 做多: RSI > 65 拒绝开仓 (拒绝追高)
 RSI_LONG_EXIT = 75       # 做多平仓: RSI > 75 (让盈利奔跑)
 RSI_SHORT_ENTRY = 55     # 做空: RSI > 55 (等待更强反弹再介入)
 RSI_SHORT_MIN_ENTRY = 35 # 做空: RSI < 35 拒绝开仓 (拒绝追低)
 RSI_SHORT_EXIT = 40      # 做空平仓: RSI < 40 (持有到超卖区域)
-MACD_LONG_THRESHOLD = 20 # MACD_hist > 20 才确认做多 (严格过滤15m噪音)
-MACD_SHORT_THRESHOLD = -20 # MACD_hist < -20 才确认做空 (严格过滤15m噪音)
+MACD_LONG_THRESHOLD = 25 # MACD_hist > 20 才确认做多 (严格过滤15m噪音)
+MACD_SHORT_THRESHOLD = -25 # MACD_hist < -20 才确认做空
 ADX_THRESHOLD = 35       # ADX 须 > 35 过滤震荡 (15m需要更强趋势)
 # 方向判定: 不再用 price/MA99 偏离 (15mK线偏差2%太苛刻且与RSI互斥)
 # 改用 MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
