@@ -25,18 +25,20 @@ MAX_POSITION_PCT = 0.15  # 最大仓位比例 30%
 ATR_STOP_LONG = 1.2      # 做多 ATR 止损倍数
 ATR_STOP_SHORT = 1.5     # 做空 ATR 止损倍数 (做空更激进)
 MAX_DRAWDOWN_PCT = 0.20  # 最大回撤 20% 熔断
-MAX_HOLD_BARS = 48       # 最大持仓K线数 (12小时)
+MAX_HOLD_BARS = 32       # 最大持仓K线数 (8小时)
+MIN_HOLD_BARS = 4        # 最小持仓K线数 (前4根K线不能RSI平仓, ATR止损除外)
+COOLDOWN_BARS = 6        # 冷却K线数 (90分钟, 避免频繁交易)
 
 # === 信号阈值 ===
-RSI_LONG_ENTRY = 45      # 做多: RSI < 48 (回调到位时介入)
+RSI_LONG_ENTRY = 35      # 做多: RSI < 35 (深度回调介入, 更安全)
 RSI_LONG_MAX_ENTRY = 65  # 做多: RSI > 65 拒绝开仓 (拒绝追高) — 区别于平仓阈值
-RSI_LONG_EXIT = 72       # 做多平仓: RSI > 72 (极端过热)
-RSI_SHORT_ENTRY = 50     # 做空: RSI > 50 (反弹到位时介入)
+RSI_LONG_EXIT = 75       # 做多平仓: RSI > 75 (让盈利奔跑)
+RSI_SHORT_ENTRY = 55     # 做空: RSI > 55 (等待更强反弹再介入)
 RSI_SHORT_MIN_ENTRY = 35 # 做空: RSI < 35 拒绝开仓 (拒绝追低)
-RSI_SHORT_EXIT = 50      # 做空平仓: RSI < 45 (超卖反弹)
-MACD_LONG_THRESHOLD = 5  # MACD_hist > 5 即确认 (原15太严)
-MACD_SHORT_THRESHOLD = -5  # MACD_hist < -5 即确认 (原-15太严)
-ADX_THRESHOLD = 28       # ADX 须 > 23 过滤震荡 (原20太严)
+RSI_SHORT_EXIT = 40      # 做空平仓: RSI < 40 (持有到超卖区域)
+MACD_LONG_THRESHOLD = 20 # MACD_hist > 20 才确认做多 (严格过滤15m噪音)
+MACD_SHORT_THRESHOLD = -20 # MACD_hist < -20 才确认做空 (严格过滤15m噪音)
+ADX_THRESHOLD = 35       # ADX 须 > 35 过滤震荡 (15m需要更强趋势)
 # 方向判定: 不再用 price/MA99 偏离 (15mK线偏差2%太苛刻且与RSI互斥)
 # 改用 MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
 
@@ -51,6 +53,8 @@ class OptimizedStrategy:
         self.position_size = 0
         self.lgb_adapter = lgb_adapter  # LightGBM 双确认适配器 (可选)
         self._last_lgb_opinion = 'no_opinion'  # 供 AIOverride 读取
+        self.last_exit_bar = -COOLDOWN_BARS  # 上次平仓的K线索引 (初始化为足够早, 允许首笔交易)
+        self.last_entry_bar = -1  # 上次开仓的K线索引
         
     def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """计算所有指标 (无副作用)"""
@@ -172,12 +176,19 @@ class OptimizedStrategy:
         
         # === 风控检查: 持仓时 ===
         if has_position and pos_entry > 0 and atr_val > 0:
-            bars_held = getattr(pos, 'bars_held', 0) if hasattr(pos, 'bars_held') else 0
+            # bars_held: 优先从 position.bars_held; 次选 entry_bar 计算; 兜底 1
+            bars_held = 1
+            if hasattr(pos, 'bars_held'):
+                bars_held = max(1, int(pos.bars_held))
+            elif pos_entry > 0 and hasattr(pos, 'entry_bar') and pos.entry_bar >= 0:
+                bars_held = max(1, idx - pos.entry_bar)
             
             # ATR 止损
             if pos_side == 'long' and c <= pos_entry - atr_val * ATR_STOP_LONG:
+                self.last_exit_bar = idx
                 return "SELL"
             elif pos_side == 'short' and c >= pos_entry + atr_val * ATR_STOP_SHORT:
+                self.last_exit_bar = idx
                 return "COVER"
             
             # 最大持仓时间: 浮亏加速平仓, 浮盈延长持有
@@ -191,25 +202,35 @@ class OptimizedStrategy:
                 max_bars = MAX_HOLD_BARS if pnl_pct < 0 else MAX_HOLD_BARS * 2
                 if bars_held >= max_bars:
                     logger.info(f"⏰ 最大持仓时间平仓 | bars={bars_held} | PnL={pnl_pct:+.2%}")
+                    self.last_exit_bar = idx
                     return "SELL" if pos_side == 'long' else "COVER"
         
         # === 平仓信号 ===
         if has_position:
             if pos_side == 'long':
-                if rsi_val > RSI_LONG_EXIT or (trend_down and strong_trend):
+                if (rsi_val > RSI_LONG_EXIT and bars_held >= MIN_HOLD_BARS) or (trend_down and strong_trend):
+                    self.last_exit_bar = idx
                     return "SELL"
             elif pos_side == 'short':
-                if rsi_val < RSI_SHORT_EXIT or (trend_up and strong_trend):
+                if (rsi_val < RSI_SHORT_EXIT and bars_held >= MIN_HOLD_BARS) or (trend_up and strong_trend):
+                    self.last_exit_bar = idx
                     return "COVER"
         
         # === 开仓信号 (含 LightGBM 双确认) ===
         if not has_position:
-            # 做空: MA死叉 + MACD看跌 + 强势趋势 + regime非牛 + RSI不过低
+            # 冷却检查: 上次平仓后必须等待 COOLDOWN_BARS 根K线
+            bars_since_exit = idx - self.last_exit_bar
+            if bars_since_exit < COOLDOWN_BARS:
+                return "HOLD"
+
+            # 做空: MA死叉 + MACD看跌 + 强势趋势 + regime非牛 + RSI不过低 + 放量
             short_signal = (m7 < m25 and macdh < MACD_SHORT_THRESHOLD and strong_trend and
-                           regime != "bull" and RSI_SHORT_MIN_ENTRY < rsi_val < RSI_SHORT_ENTRY + 20)
-            # 做多: MA金叉 + MACD看涨 + 强势趋势 + regime非熊 + RSI不过高
+                           regime != "bull" and RSI_SHORT_MIN_ENTRY < rsi_val < RSI_SHORT_ENTRY + 20 and
+                           vol_surge)
+            # 做多: MA金叉 + MACD看涨 + 强势趋势 + regime非熊 + RSI不过高 + 放量
             long_signal = (m7 > m25 and macdh > MACD_LONG_THRESHOLD and strong_trend and
-                           regime != "bear" and RSI_LONG_ENTRY < rsi_val < RSI_LONG_MAX_ENTRY)
+                           regime != "bear" and RSI_LONG_ENTRY < rsi_val < RSI_LONG_MAX_ENTRY and
+                           vol_surge)
 
             # LightGBM 双确认
             if self.lgb_adapter and self.lgb_adapter.is_loaded():
@@ -217,6 +238,7 @@ class OptimizedStrategy:
                     confirm = self.lgb_adapter.confirm(row, "SHORT")
                     self._last_lgb_opinion = confirm
                     if confirm == "agree":
+                        self.last_entry_bar = idx
                         return "SHORT"
                     elif confirm == "disagree":
                         return "HOLD"  # LGB明确反对，不开仓
@@ -225,6 +247,7 @@ class OptimizedStrategy:
                     confirm = self.lgb_adapter.confirm(row, "LONG")
                     self._last_lgb_opinion = confirm
                     if confirm == "agree":
+                        self.last_entry_bar = idx
                         return "LONG"
                     elif confirm == "disagree":
                         return "HOLD"  # LGB明确反对，不开仓
@@ -236,8 +259,10 @@ class OptimizedStrategy:
 
             # 无 LGB 适配器时，原逻辑
             if short_signal:
+                self.last_entry_bar = idx
                 return "SHORT"
             if long_signal:
+                self.last_entry_bar = idx
                 return "LONG"
         
         return "HOLD"

@@ -55,6 +55,11 @@ def load_strategy_params() -> dict:
         "ATR_STOP_LONG": r'ATR_STOP_LONG\s*=\s*([\d.]+)',
         "ATR_STOP_SHORT": r'ATR_STOP_SHORT\s*=\s*([\d.]+)',
         "MAX_POSITION_PCT": r'MAX_POSITION_PCT\s*=\s*([\d.]+)',
+        "MACD_LONG_THRESHOLD": r'MACD_LONG_THRESHOLD\s*=\s*(\d+)',
+        "MACD_SHORT_THRESHOLD": r'MACD_SHORT_THRESHOLD\s*=\s*(-?\d+)',
+        "MAX_HOLD_BARS": r'MAX_HOLD_BARS\s*=\s*(\d+)',
+        "MIN_HOLD_BARS": r'MIN_HOLD_BARS\s*=\s*(\d+)',
+        "COOLDOWN_BARS": r'COOLDOWN_BARS\s*=\s*(\d+)',
     }
     params = {}
     for key, pat in patterns.items():
@@ -64,10 +69,12 @@ def load_strategy_params() -> dict:
 
     # Provide defaults for missing params
     defaults = {
-        "RSI_LONG_ENTRY": 48, "RSI_LONG_MAX_ENTRY": 65, "RSI_LONG_EXIT": 72,
-        "RSI_SHORT_ENTRY": 50, "RSI_SHORT_MIN_ENTRY": 35, "RSI_SHORT_EXIT": 45,
-        "ADX_THRESHOLD": 23, "ATR_STOP_LONG": 1.2, "ATR_STOP_SHORT": 1.5,
+        "RSI_LONG_ENTRY": 35, "RSI_LONG_MAX_ENTRY": 65, "RSI_LONG_EXIT": 75,
+        "RSI_SHORT_ENTRY": 55, "RSI_SHORT_MIN_ENTRY": 35, "RSI_SHORT_EXIT": 40,
+        "ADX_THRESHOLD": 35, "ATR_STOP_LONG": 1.2, "ATR_STOP_SHORT": 1.5,
         "MAX_POSITION_PCT": 0.15,
+        "MACD_LONG_THRESHOLD": 20, "MACD_SHORT_THRESHOLD": -20,
+        "MAX_HOLD_BARS": 32, "MIN_HOLD_BARS": 4, "COOLDOWN_BARS": 6,
     }
     for k, v in defaults.items():
         params.setdefault(k, v)
@@ -232,6 +239,11 @@ def apply_params(new_params: dict, auto_restart: bool = True) -> bool:
         "ATR_STOP_LONG": "ATR_STOP_LONG",
         "ATR_STOP_SHORT": "ATR_STOP_SHORT",
         "MAX_POSITION_PCT": "MAX_POSITION_PCT",
+        "MACD_LONG_THRESHOLD": "MACD_LONG_THRESHOLD",
+        "MACD_SHORT_THRESHOLD": "MACD_SHORT_THRESHOLD",
+        "MAX_HOLD_BARS": "MAX_HOLD_BARS",
+        "MIN_HOLD_BARS": "MIN_HOLD_BARS",
+        "COOLDOWN_BARS": "COOLDOWN_BARS",
     }
 
     import re
@@ -239,7 +251,7 @@ def apply_params(new_params: dict, auto_restart: bool = True) -> bool:
     for key, var_name in param_map.items():
         if key in new_params:
             val = new_params[key]
-            pattern = rf'({var_name}\s*=\s*)(\d+\.?\d*)'
+            pattern = rf'({var_name}\s*=\s*)(-?\d+\.?\d*)'
             replacement = rf'\g<1>{val}'
             new_content, n = re.subn(pattern, replacement, content)
             if n > 0:
