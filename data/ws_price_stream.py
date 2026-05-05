@@ -153,7 +153,7 @@ class SharedMarketState:
 class BinanceWebSocket:
     """Binance WebSocket 客户端 — 多流合并"""
 
-    STREAM_URL = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@kline_15m/btcusdt@ticker"
+    STREAM_URL = "wss://fstream.binance.com/stream?streams=btcusdt@trade/btcusdt@kline_15m/btcusdt@ticker"
 
     def __init__(self, state: SharedMarketState):
         self.state = state

@@ -536,7 +536,7 @@ class FuturesExecutor:
         try:
             import requests
             binance_symbol = symbol.replace("-", "")
-            url = f"https://api.binance.com/api/v3/klines"
+            url = f"https://fapi.binance.com/fapi/v1/klines"
             params = {
                 "symbol": binance_symbol,
                 "interval": interval,
