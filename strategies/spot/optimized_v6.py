@@ -27,7 +27,7 @@ ATR_STOP_SHORT = 1.5     # 做空 ATR 止损倍数 (做空更激进)
 MAX_DRAWDOWN_PCT = 0.20  # 最大回撤 20% 熔断
 MAX_HOLD_BARS = 32       # 最大持仓K线数 (8小时)
 MIN_HOLD_BARS = 4        # 最小持仓K线数 (前4根K线不能RSI平仓, ATR止损除外)
-COOLDOWN_BARS = 8        # 冷却K线数 (90分钟, 避免频繁交易)
+COOLDOWN_BARS = 10        # 冷却K线数 (90分钟, 避免频繁交易)
 
 # === 信号阈值 ===
 RSI_LONG_ENTRY = 35      # 做多: RSI < 35 (深度回调介入, 更安全)

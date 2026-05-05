@@ -52,8 +52,8 @@ AUTO_CLEAR_SHORT_THRESHOLD = 0.83
 AI_INTERVENE_THRESHOLD = 0.67     # 4/6
 
 # LLM API
-LLM_API_KEY = os.getenv("NVIDIA_API_KEY", "") or os.getenv("DEEPSEEK_API_KEY", "")
-LLM_MODEL = os.getenv("AI_OVERRIDE_MODEL", "deepseek-ai/deepseek-v4-pro")
+LLM_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+LLM_MODEL = os.getenv("AI_OVERRIDE_MODEL", "deepseek-v4-flash")
 LLM_API_BASE = os.getenv("AI_OVERRIDE_API_BASE", "https://api.deepseek.com/v1")
 
 
@@ -127,13 +127,16 @@ class DecisionEngine:
         """
         self._reset_daily_if_needed()
 
-        # 1. 风控平仓 — 直接放行, 不经过 AI
+        # 1. 平仓信号 — 送 AI 二次确认 (AI 可 override 为 HOLD, 失败则执行原平仓)
         if report.exit_signal:
-            _log("info", f"🚨 风控平仓: {report.exit_signal} | price=${report.price:,.0f}")
+            if self._should_call_llm(report):
+                return self._call_llm_decide(report, is_exit=True)
+            # 配额耗尽 → 直接执行平仓
+            _log("info", f"🚨 平仓(配额耗尽): {report.exit_signal} | price=${report.price:,.0f}")
             return FinalDecision(
                 action=report.exit_signal,
-                source="risk_management",
-                reasoning=f"Risk management exit: {report.exit_signal}",
+                source="auto_clear",
+                reasoning=f"Daily LLM quota exhausted, executing exit: {report.exit_signal}",
                 confidence=1.0,
             )
 
@@ -203,6 +206,7 @@ class DecisionEngine:
         """判断是否需要调 LLM。
 
         触发条件:
+        - 平仓信号 (exit_signal) 始终触发 (受配额限制)
         - raw_signal 为非 HOLD 且 long_score/short_score 在 3~5/6 之间
         - raw_signal 为 HOLD 但某方向 ≥ 4/6
         - 每日限额未超
@@ -211,6 +215,14 @@ class DecisionEngine:
             return False
 
         if DRY_RUN:
+            return False
+
+        # 平仓信号 → 始终调 LLM
+        if report.exit_signal:
+            return True
+
+        # 已有持仓且无平仓信号 → 跳过 LLM (避免浪费配额)
+        if report.current_position:
             return False
 
         # 非 HOLD 信号: 分数不够自动放行 → 调 LLM
@@ -226,20 +238,36 @@ class DecisionEngine:
 
         return False
 
-    def _call_llm_decide(self, report: SignalReport) -> FinalDecision:
+    def _call_llm_decide(self, report: SignalReport, is_exit: bool = False) -> FinalDecision:
         """调 LLM 做最终决策。
 
+        Parameters
+        ----------
+        is_exit : bool
+            True=平仓场景, prompt 不同, fallback 为执行原平仓而非 HOLD
+
         返回 FinalDecision with source='ai_decision'
-        失败时 fallback 到 'auto_clear' with HOLD
+        失败时: 平仓场景 fallback 到原 exit_signal; 开仓场景 fallback HOLD
         """
-        reasons = self._get_trigger_reasons(report)
-        _log("info", f"🤖 AI决策触发: {reasons} | ${report.price:,.0f} "
+        if is_exit:
+            reasons = [f"exit_signal.{report.exit_signal}"]
+            prompt = self._build_exit_prompt(report, reasons)
+        else:
+            reasons = self._get_trigger_reasons(report)
+            prompt = self._build_decision_prompt(report, reasons)
+
+        _log("info", f"{'🚨' if is_exit else '🤖'} AI决策触发: {reasons} | ${report.price:,.0f} "
               f"LONG={report.long_score:.0%} SHORT={report.short_score:.0%}")
 
-        prompt = self._build_decision_prompt(report, reasons)
         result = self._invoke_llm(prompt)
 
         if result is None:
+            if is_exit:
+                _log("warn", f"LLM 调用失败, 执行原平仓: {report.exit_signal}")
+                return FinalDecision(action=report.exit_signal or "SELL",
+                                     source="auto_clear",
+                                     reasoning=f"LLM failed, fallback to exit: {report.exit_signal}",
+                                     confidence=1.0)
             _log("warn", "LLM 调用失败, fallback HOLD")
             return FinalDecision(action="HOLD", source="auto_clear",
                                 reasoning="LLM call failed, fallback to HOLD", confidence=0.5)
@@ -254,11 +282,16 @@ class DecisionEngine:
         reasoning = result.get("reasoning", "AI decision")
         confidence = result.get("confidence", 0.5)
 
-        # 如果 AI 说 HOLD 但策略已经建议 HOLD, 保持
-        if action not in ("LONG", "SHORT", "HOLD"):
-            action = "HOLD"
+        # 平仓场景: AI 可输出 SELL/COVER(确认平仓) 或 HOLD(驳回), 不允许 LONG/SHORT
+        if is_exit:
+            if action not in ("SELL", "COVER", "HOLD"):
+                action = report.exit_signal or "SELL"
+        else:
+            if action not in ("LONG", "SHORT", "HOLD"):
+                action = "HOLD"
 
-        _log("info", f"{'✅' if action != 'HOLD' else '⏸️'} AI决策: {action} | "
+        emoji = "🚨" if is_exit and action != "HOLD" else ("✅" if action != "HOLD" else "⏸️")
+        _log("info", f"{emoji} AI决策: {action} | "
               f"confidence={confidence:.0%} | {reasoning[:80]}")
 
         return FinalDecision(
@@ -316,6 +349,43 @@ class DecisionEngine:
         ]
         return "\n".join(parts)
 
+    def _build_exit_prompt(self, report: SignalReport, reasons: List[str]) -> str:
+        """构建平仓决策提示词 — AI 确认或驳回平仓信号。"""
+        exit_type = report.exit_signal or "SELL"
+        exit_desc = {"SELL": "平多仓 (close long)", "COVER": "平空仓 (close short)"}.get(exit_type, exit_type)
+
+        parts = [
+            "You are the AI Decision Layer for a crypto quantitative trading system (BTC-USDT perpetual futures, 15-min bars).",
+            f"⚠️ EXIT SCENARIO: Strategy layer wants to {exit_desc}.",
+            "Your job: confirm the exit or override it (keep the position).",
+            "Only override if you have HIGH conviction the position will recover/improve.",
+            "When in doubt, respect the strategy exit — safety first.",
+            "",
+            report.to_ai_context(),
+            "",
+            "## Exit Context",  
+            f"- Exit Type: {exit_desc}",
+            f"- Trigger: {', '.join(reasons)}",
+            f"- LONG Score: {report.long_score:.0%} | SHORT Score: {report.short_score:.0%}",
+            "",
+            "## Rules",  
+            "- Say SELL (for long exit) or COVER (for short exit) to confirm the strategy exit.",
+            "- Say HOLD to REJECT the exit — only if you are highly confident the position will be profitable.",
+            "- Consider: Is this a real reversal or a temporary pullback? Is volume confirming?",  
+            "- Overriding an exit is RISKY. Default to confirming unless evidence is strong.",
+            "- RSI extreme + ADX confirming trend → likely real exit. RSI mild + low ADX → possible fakeout.",
+            "",  
+            "Reply format (choose ONE):",  
+            f"{exit_type}  (confirm exit)",
+            "HOLD    (reject exit, keep position)",  
+            "",  
+            "One-line reasoning after the decision.",  
+            f"Example: {exit_type} | RSI overbought at 78 with ADX 38 confirming trend exhaustion",  
+            "",  
+            "Decision:",
+        ]
+        return "\n".join(parts)
+
     # ── LLM 调用 ────────────────────────────────────────────────────────
 
     def _invoke_llm(self, prompt: str) -> Optional[dict]:
@@ -343,7 +413,7 @@ class DecisionEngine:
         payload = json.dumps({
             "model": LLM_MODEL,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 50,
+            "max_tokens": 200,
             "temperature": 0.2,
         })
 
@@ -362,7 +432,11 @@ class DecisionEngine:
                 return None
 
             data = json.loads(proc.stdout)
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            msg = data.get("choices", [{}])[0].get("message", {})
+            content = msg.get("content", "").strip()
+            # 推理模型 (v4-flash/v4-pro) 可能把输出放 reasoning_content
+            if not content:
+                content = msg.get("reasoning_content", "").strip()
             _log("debug", f"LLM raw response: {content[:200]}")
             return self._parse_decision(content)
 

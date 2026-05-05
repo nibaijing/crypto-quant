@@ -47,6 +47,7 @@ class SignalReport:
     bars_since_last_trade: int = 0
     is_cooldown: bool = False
     lgb_opinion: str = "no_opinion"  # agree | disagree | no_opinion
+    current_position: Optional[str] = None  # None | "long" | "short"
 
     def to_dict(self) -> dict:
         return asdict(self)
