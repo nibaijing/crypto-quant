@@ -126,6 +126,17 @@ class SharedMarketState:
                 "indicators": indicators,
             }
 
+    def update_kline_from_rest(self, bar: KlineBar):
+        """REST 轮询更新当前K线 (不触发闭合事件)"""
+        with self._lock:
+            self.current_kline = bar
+
+    def on_kline_closed(self, bar: KlineBar):
+        """REST 轮询检测到K线闭合"""
+        with self._lock:
+            self.closed_kline = bar
+            self.kline_closed_event.set()
+
     def set_indicators(self, ind: dict):
         """策略运行后更新指标"""
         with self._lock:
@@ -150,10 +161,89 @@ class SharedMarketState:
         return None
 
 
+class RESTKlinePoller:
+    """REST API K线/Ticker 轮询器 — fstream WS 不推送 kline/ticker 时的回退方案"""
+
+    KLINE_URL = "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=2"
+    TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=BTCUSDT"
+    POLL_INTERVAL = 2.0  # 秒
+
+    def __init__(self, state: SharedMarketState):
+        self.state = state
+        self._thread: threading.Thread = None
+        self._running = False
+        self._last_close_time = 0  # 上次闭合K线的 close_time
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        logger.info("📡 REST K线/Ticker 轮询已启动")
+
+    def stop(self):
+        self._running = False
+
+    def _poll_loop(self):
+        import urllib.request
+        while self._running:
+            try:
+                # 1. 拉取最新2根K线 (最近闭合的 + 当前未闭合的)
+                req = urllib.request.Request(self.KLINE_URL)
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    raw = json.loads(resp.read().decode())
+                    if len(raw) >= 1:
+                        # 最新一根可能是未闭合的, 用 REST 数据更新 current_kline
+                        latest = raw[-1]
+                        # Binance REST kline: [open_time, open, high, low, close, volume, close_time, ...]
+                        bar = KlineBar(
+                            open_time=latest[0],
+                            close_time=latest[6],
+                            open=float(latest[1]),
+                            high=float(latest[2]),
+                            low=float(latest[3]),
+                            close=float(latest[4]),
+                            volume=float(latest[5]),
+                            is_closed=latest[6] <= int(time.time() * 1000) - 60000,  # 1min buffer
+                        )
+                        self.state.update_kline_from_rest(bar)
+                        # 检测闭合: close_time 变化 → 上一根闭合
+                        if bar.close_time != self._last_close_time and self._last_close_time > 0:
+                            # 用倒数第二根作为闭合K线
+                            if len(raw) >= 2:
+                                closed = raw[-2]
+                                closed_bar = KlineBar(
+                                    open_time=closed[0], close_time=closed[6],
+                                    open=float(closed[1]), high=float(closed[2]),
+                                    low=float(closed[3]), close=float(closed[4]),
+                                    volume=float(closed[5]), is_closed=True,
+                                )
+                                self.state.on_kline_closed(closed_bar)
+                        self._last_close_time = bar.close_time
+
+                # 2. 拉取 24hr ticker
+                req2 = urllib.request.Request(self.TICKER_URL)
+                with urllib.request.urlopen(req2, timeout=5) as resp2:
+                    raw_ticker = json.loads(resp2.read().decode())
+                    # REST 字段名 → WS 格式映射
+                    ticker = {
+                        'c': raw_ticker.get('lastPrice', 0),
+                        'h': raw_ticker.get('highPrice', 0),
+                        'l': raw_ticker.get('lowPrice', 0),
+                        'P': raw_ticker.get('priceChangePercent', 0),
+                        'v': raw_ticker.get('volume', 0),
+                    }
+                    self.state.update_ticker(ticker)
+
+            except Exception as e:
+                logger.debug(f"REST 轮询异常: {e}")
+
+            time.sleep(self.POLL_INTERVAL)
+
+
 class BinanceWebSocket:
     """Binance WebSocket 客户端 — 多流合并"""
 
-    STREAM_URL = "wss://fstream.binance.com/stream?streams=btcusdt@trade/btcusdt@kline_15m/btcusdt@ticker"
+    STREAM_URL = "wss://fstream.binance.com/stream?streams=btcusdt@trade"
 
     def __init__(self, state: SharedMarketState):
         self.state = state
@@ -212,7 +302,7 @@ class BinanceWebSocket:
     def _on_open(self, ws):
         self._connected = True
         self._reconnect_count = 0
-        logger.info("🔗 WebSocket 已连接 (ticker + kline_15m)")
+        logger.info("🔗 WebSocket 已连接 (trade 实时价格, kline/ticker 走 REST)")
 
     def _on_message(self, ws, message: str):
         try:
@@ -223,16 +313,6 @@ class BinanceWebSocket:
             if 'trade' in stream:
                 if 'p' in payload:
                     self.state.update_price(float(payload['p']))
-
-            elif 'kline' in stream:
-                k = payload.get('k', payload)
-                if 't' in k:
-                    self.state.update_kline(k)
-
-            elif 'ticker' in stream or '24hrTicker' in stream:
-                # Binance ticker: 24hr 统计
-                if 'c' in payload:
-                    self.state.update_ticker(payload)
 
         except json.JSONDecodeError:
             pass
@@ -253,6 +333,11 @@ def create_price_stream() -> tuple[SharedMarketState, BinanceWebSocket]:
     """创建价格流 → 返回 (state, ws_client)"""
     state = SharedMarketState()
     ws = BinanceWebSocket(state)
+    # 启动 REST K线/Ticker 轮询 (fstream WS 不推送 kline/ticker)
+    poller = RESTKlinePoller(state)
+    poller.start()
+    # 附加到 ws 对象以便 stop 时清理
+    ws._rest_poller = poller
     return state, ws
 
 
