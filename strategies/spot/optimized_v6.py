@@ -260,6 +260,14 @@ class OptimizedStrategy:
         if idx < 99:
             return _build_report("HOLD")
 
+        # 因子偏向 — 提前初始化 (ATR/MAX_HOLD_BARS 退出也可能引用)
+        _factor_bias = None
+        try:
+            from services.factor_analysis import get_active_factor_bias
+            _factor_bias = get_active_factor_bias()
+        except Exception:
+            _factor_bias = {"bias": "neutral", "confidence": 0.0, "active_factors": []}
+
         # 计算指标 (如果还没算)
         if 'rsi' not in df.columns or 'adx' not in df.columns:
             df = self.compute_indicators(df)
@@ -329,16 +337,17 @@ class OptimizedStrategy:
                 bars_held = max(1, idx - pos.entry_bar)
 
         # === 风控检查: 持仓时 ===
-        if has_position and pos_entry > 0 and atr_val > 0:
-            # ATR 止损
-            if pos_side == 'long' and c <= pos_entry - atr_val * ATR_STOP_LONG:
-                self.last_exit_bar = idx
-                return _build_report("SELL", "SELL")
-            elif pos_side == 'short' and c >= pos_entry + atr_val * ATR_STOP_SHORT:
-                self.last_exit_bar = idx
-                return _build_report("COVER", "COVER")
+        if has_position and pos_entry > 0:
+            # ATR 止损（需要有效 ATR）
+            if atr_val > 0:
+                if pos_side == 'long' and c <= pos_entry - atr_val * ATR_STOP_LONG:
+                    self.last_exit_bar = idx
+                    return _build_report("SELL", "SELL")
+                elif pos_side == 'short' and c >= pos_entry + atr_val * ATR_STOP_SHORT:
+                    self.last_exit_bar = idx
+                    return _build_report("COVER", "COVER")
 
-            # 最大持仓时间
+            # 最大持仓时间（不依赖 ATR）
             if bars_held >= MAX_HOLD_BARS:
                 if pos_side == 'long':
                     pnl_pct = (c - pos_entry) / pos_entry
@@ -352,16 +361,6 @@ class OptimizedStrategy:
                     return _build_report(exit_sig, exit_sig)
 
         # === 平仓信号 ===
-
-        # 因子偏向 — 全局获取一次，供 _build_report 和阈值调整使用
-        _factor_bias = None
-        try:
-            from services.factor_analysis import get_active_factor_bias
-            _factor_bias = get_active_factor_bias()
-        except Exception:
-            _factor_bias = {"bias": "neutral", "confidence": 0.0, "active_factors": []}
-
-        # === 平仓信号 (续) ===
         if has_position:
             if pos_side == 'long':
                 if (rsi_val > RSI_LONG_EXIT and bars_held >= MIN_HOLD_BARS) or (trend_down and strong_trend):

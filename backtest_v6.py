@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from execution.executor_v2 import FuturesExecutor
 from strategies.spot.optimized_v6 import OptimizedStrategy
+import strategies.spot.optimized_v6 as strat_mod
 
 DATA = Path(__file__).parent / "data" / "backtest_btc_15m.csv"
 
@@ -36,6 +37,7 @@ def run_backtest():
     equity_curve = []
 
     n = len(df)
+    COOLDOWN = 4  # 冷却期: 1小时
     for i in range(100, n):
         row = df.iloc[i]
         close_price = float(row["close"])
@@ -81,8 +83,14 @@ def run_backtest():
         # 执行策略
         signal = None
         try:
-            signal = strat.on_bar(bar, executor)
+            raw = strat.on_bar(bar, executor)
             executor.update_bars_held()
+            # on_bar() 返回 SignalReport（新）或 str（旧）
+            if raw is not None:
+                if hasattr(raw, 'raw_signal'):
+                    signal = raw.raw_signal  # SignalReport → 提取信号字符串
+                else:
+                    signal = str(raw)
         except Exception as e:
             pass
 
@@ -101,13 +109,21 @@ def run_backtest():
             })
 
         if signal == "LONG" and (not executor.position or executor.position.size == 0):
-            executor.buy(symbol, price=close_price)
+            bars_since_exit = i - strat.last_exit_bar if strat.last_exit_bar >= 0 else COOLDOWN + 1
+            if bars_since_exit <= COOLDOWN:
+                pass  # 冷却中
+            else:
+                executor.buy(symbol, price=close_price)
         elif signal == "SELL" and executor.position and executor.position.side == "long":
             pnl = (close_price - executor.position.entry_price) / executor.position.entry_price * 100 * executor.position.leverage
             executor.sell(symbol, price=close_price)
             trades.append(("LONG", close_price, pnl, row["datetime"]))
         elif signal == "SHORT" and (not executor.position or executor.position.size == 0):
-            executor.short_sell(symbol, price=close_price)
+            bars_since_exit = i - strat.last_exit_bar if strat.last_exit_bar >= 0 else COOLDOWN + 1
+            if bars_since_exit <= COOLDOWN:
+                pass  # 冷却中
+            else:
+                executor.short_sell(symbol, price=close_price)
         elif signal == "COVER" and executor.position and executor.position.side == "short":
             pnl = (executor.position.entry_price - close_price) / executor.position.entry_price * 100 * executor.position.leverage
             executor.short_cover(symbol, price=close_price)
