@@ -252,7 +252,15 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
                 logger.warning(f"🚫 Gate 拒绝 ({signal}): {gate_result.reason}")
 
         if signal == "LONG" and (not executor.position or executor.position.size == 0):
-            gated_size = gate_result.allowed_size if gate_result and gate_result.passed else None
+            if gate_result and gate_result.passed:
+                gated_size = gate_result.allowed_size
+            else:
+                # Gate 未通过 → 策略层资金管理兜底 (Kelly + 固定比例)
+                gated_size = strategy.get_position_size(
+                    cash=executor.cash, price=close_price,
+                    leverage=executor._sim_leverage, atr=atr_val, side='long'
+                )
+                logger.info(f"🎯 策略兜底仓位: {gated_size:.6f} BTC (Gate未通过)")
             result = executor.buy(symbol, size=gated_size, price=close_price)
             if result:
                 notify_trade("LONG", close_price, f"开多仓 {executor._sim_leverage}x")
@@ -270,7 +278,14 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
                     strategy.last_exit_bar = latest_idx
 
         elif signal == "SHORT" and (not executor.position or executor.position.size == 0):
-            gated_size = gate_result.allowed_size if gate_result and gate_result.passed else None
+            if gate_result and gate_result.passed:
+                gated_size = gate_result.allowed_size
+            else:
+                gated_size = strategy.get_position_size(
+                    cash=executor.cash, price=close_price,
+                    leverage=executor._sim_leverage, atr=atr_val, side='short'
+                )
+                logger.info(f"🎯 策略兜底仓位: {gated_size:.6f} BTC (Gate未通过)")
             result = executor.short_sell(symbol, size=gated_size, price=close_price)
             if result:
                 notify_trade("SHORT", close_price, f"开空仓 {executor._sim_leverage}x")

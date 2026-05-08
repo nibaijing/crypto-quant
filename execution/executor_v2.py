@@ -232,10 +232,14 @@ class FuturesExecutor:
     def _check_risk(self, symbol: str, side: str, size: float, price: float) -> tuple[bool, str]:
         """风控检查：单笔上限 + 总仓位上限 + 保证金 + 反向持仓拦截。
 
+        期货语义: max_single/max_total_position_pct 控制的是保证金占权益比例。
+        例如 pct=0.2 在 10x 杠杆下 → trade_value ≤ equity × 200%。
+
         Returns (pass, reason)。
         """
         equity = self.equity
         trade_value = size * price
+        margin = trade_value / self._sim_leverage
 
         # 1. 反向持仓拦截 (防御层)
         if self._sim_position and self._sim_position.size > 0:
@@ -243,27 +247,32 @@ class FuturesExecutor:
             if (current_side == "long" and side == "short") or (current_side == "short" and side == "long"):
                 return False, f"已持有{current_side}仓, 禁止开反向仓"
 
-        # 2. 单笔上限 — 单次开仓价值 ≤ equity × max_single_position_pct
-        max_single = equity * self.config.risk.max_single_position_pct
-        if trade_value > max_single:
+        # 2. 单笔上限 — 保证金 ≤ equity × max_single_position_pct
+        max_single_margin = equity * self.config.risk.max_single_position_pct
+        if margin > max_single_margin:
+            max_trade = max_single_margin * self._sim_leverage
             return False, (
-                f"单笔仓位 ${trade_value:,.0f} 超过上限 "
-                f"${max_single:,.0f} (equity ${equity:,.0f} × {self.config.risk.max_single_position_pct:.0%})"
+                f"保证金 ${margin:,.0f} (仓位 ${trade_value:,.0f}) 超过单笔上限 "
+                f"${max_single_margin:,.0f} (equity ${equity:,.0f} × {self.config.risk.max_single_position_pct:.0%}"
+                f" → 最大仓位 ${max_trade:,.0f})"
             )
 
-        # 3. 总仓位上限 — 所有持仓价值 ≤ equity × max_total_position_pct
+        # 3. 总仓位上限 — 总保证金 ≤ equity × max_total_position_pct
         current_value = 0.0
         if self._sim_position and self._sim_position.size > 0:
             current_value = self._sim_position.size * price
-        max_total = equity * self.config.risk.max_total_position_pct
-        if current_value + trade_value > max_total:
+        current_margin = current_value / self._sim_leverage if self._sim_leverage > 0 else 0
+        total_margin = current_margin + margin
+        max_total_margin = equity * self.config.risk.max_total_position_pct
+        if total_margin > max_total_margin:
+            max_total_trade = max_total_margin * self._sim_leverage
             return False, (
-                f"总仓位 ${current_value + trade_value:,.0f} 超过上限 "
-                f"${max_total:,.0f} (equity ${equity:,.0f} × {self.config.risk.max_total_position_pct:.0%})"
+                f"总保证金 ${total_margin:,.0f} 超过上限 "
+                f"${max_total_margin:,.0f} (equity ${equity:,.0f} × {self.config.risk.max_total_position_pct:.0%}"
+                f" → 最大总仓位 ${max_total_trade:,.0f})"
             )
 
         # 4. 保证金充足
-        margin = trade_value / self._sim_leverage
         available = self._sim_cash * 0.95  # 留5%缓冲
         if margin > available:
             return False, f"保证金不足: 需要 ${margin:,.0f} > 可用 ${available:,.0f}"
@@ -271,25 +280,28 @@ class FuturesExecutor:
         return True, "通过"
 
     def _get_max_allowed_size(self, price: float) -> float:
-        """基于风控上限计算单次开仓最大数量。
+        """基于风控上限计算单次开仓最大数量（期货：保证金约束）。
 
-        取 min(现金可买, 单笔上限, 总仓位剩余空间)。
+        取 min(现金可买, 单笔保证金上限, 总仓位剩余保证金空间)。
+        max_single/max_total_position_pct = 保证金占权益比例。
         """
         equity = self.equity
 
-        # 现金可买
+        # 现金可买 (杠杆放大购买力)
         max_from_cash = (self._sim_cash * self._sim_leverage * 0.9) / price if price > 0 else 0
 
-        # 单笔上限
-        max_from_single = (equity * self.config.risk.max_single_position_pct) / price
+        # 单笔保证金上限 → 最大仓位
+        max_single_margin = equity * self.config.risk.max_single_position_pct
+        max_from_single = (max_single_margin * self._sim_leverage) / price if price > 0 else 0
 
-        # 总仓位剩余
+        # 总仓位剩余保证金 → 最大仓位
         current_value = 0.0
         if self._sim_position and self._sim_position.size > 0:
             current_value = self._sim_position.size * price
-        max_total = equity * self.config.risk.max_total_position_pct
-        remaining = max(max_total - current_value, 0)
-        max_from_total = remaining / price if price > 0 else 0
+        current_margin = current_value / self._sim_leverage if self._sim_leverage > 0 else 0
+        max_total_margin = equity * self.config.risk.max_total_position_pct
+        remaining_margin = max(max_total_margin - current_margin, 0)
+        max_from_total = (remaining_margin * self._sim_leverage) / price if price > 0 else 0
 
         return max(0.0001, min(max_from_cash, max_from_single, max_from_total))
 

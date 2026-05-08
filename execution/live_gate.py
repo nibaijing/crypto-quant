@@ -109,20 +109,26 @@ class LiveGate:
                 )
         details["opposite_block"] = "ok"
 
-        # 4. 止损价合理性
+        # 4. 止损价合理性 (ATR 紧止损容忍: 强制设最小距离而非拒绝)
+        MIN_STOP_DIST_PCT = 0.001  # 最小止损距离 0.1%
         if stop_loss <= 0:
             return GateResult(False, "止损价未设定或无效", details=details)
-        if side == "long" and stop_loss >= price:
-            return GateResult(
-                False, f"多头止损价 ${stop_loss:,.0f} ≥ 入场价 ${price:,.0f}",
-                details=details,
-            )
-        if side == "short" and stop_loss <= price:
-            return GateResult(
-                False, f"空头止损价 ${stop_loss:,.0f} ≤ 入场价 ${price:,.0f}",
-                details=details,
-            )
+        original_stop = stop_loss
+        if side == "long":
+            min_stop = price * (1 - MIN_STOP_DIST_PCT)
+            if stop_loss >= price:
+                stop_loss = min_stop
+            elif stop_loss > min_stop:
+                stop_loss = min_stop
+        elif side == "short":
+            min_stop = price * (1 + MIN_STOP_DIST_PCT)
+            if stop_loss <= price:
+                stop_loss = min_stop
+            elif stop_loss < min_stop:
+                stop_loss = min_stop
         details["stop_valid"] = "ok"
+        if stop_loss != original_stop:
+            details["stop_adjusted"] = f"${original_stop:,.0f}→${stop_loss:,.0f} (min {MIN_STOP_DIST_PCT:.1%} dist)"
 
         # 5. 以损定仓
         size = self._calc_position_size(
@@ -209,8 +215,8 @@ class LiveGate:
         # 现金约束
         size_from_cash = (cash * leverage * 0.9) / price if price > 0 else 0
 
-        # 单笔上限约束
-        size_from_single = (equity * self.config.risk.max_single_position_pct) / price
+        # 单笔上限约束 (期货语义: pct 控制保证金占比, 杠杆放大得仓位)
+        size_from_single = (equity * self.config.risk.max_single_position_pct * leverage) / price
 
         size = min(size_from_loss, size_from_cash, size_from_single)
 

@@ -511,7 +511,8 @@ class OptimizedStrategy:
     def get_position_size(self, cash: float, price: float, leverage: int,
                           atr: float = 0, side: str = 'long') -> float:
         """
-        资金管理：凯利公式 + 固定比例
+        资金管理：凯利公式 + 固定比例（期货语义：cash × leverage = 购买力）。
+        MAX_POSITION_PCT = 保证金占权益比例，杠杆放大后得实际仓位。
         """
         
         if side == 'long':
@@ -519,8 +520,11 @@ class OptimizedStrategy:
         else:
             mult = BEST_SHORT_MULT
         
-        # 基础仓位
-        base_size = (cash * MAX_POSITION_PCT * mult) / price
+        # 期货购买力 = 现金 × 杠杆
+        buying_power = cash * leverage
+        
+        # 基础仓位（保证金占比 × 购买力 × Kelly 乘数）
+        base_size = (buying_power * MAX_POSITION_PCT * mult) / price
         
         # ATR 调整: 高波动降仓位
         if atr > 0 and price > 0:
@@ -530,10 +534,7 @@ class OptimizedStrategy:
             elif atr_pct > 0.004:
                 base_size *= 0.85
         
-        # 杠杆下调整 (合约: cash * 杠杆 = 购买力)
-        adjusted = base_size / leverage
-        
-        return max(adjusted, 0.001)
+        return max(base_size, 0.001)
     
     def get_dynamic_leverage(self, volatility: float) -> int:
         """动态杠杆: 低波动加杠杆, 高波动降杠杆"""
