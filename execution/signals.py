@@ -50,6 +50,7 @@ class SignalReport:
     is_cooldown: bool = False
     lgb_opinion: str = "no_opinion"  # agree | disagree | no_opinion
     current_position: Optional[str] = None  # None | "long" | "short"
+    position_pnl_pct: Optional[float] = None  # 当前持仓未实现盈亏% (杠杆回报), 平仓决策时注入
 
     # === K线形态 ===
     is_pinbar: bool = False              # 当前K线是否为 pin bar (冲高回落/探底回升)
@@ -137,6 +138,9 @@ class SignalReport:
 
         lines.append("")
         lines.append("## Context")
+        if self.current_position:
+            pnl_str = f"{self.position_pnl_pct:+.1f}%" if self.position_pnl_pct is not None else "N/A"
+            lines.append(f"Current position: {self.current_position.upper()} | Unrealized PnL: {pnl_str}")
         lines.append(f"Bars since last trade: {self.bars_since_last_trade}")
         if self.is_cooldown:
             lines.append("\u26a0\ufe0f In cooldown period (recently exited a position)")

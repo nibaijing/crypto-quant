@@ -187,7 +187,8 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
     if report is not None:
         # 注入当前持仓状态, 供 DecisionEngine 感知
         if executor.position and executor.position.size > 0:
-            report.current_position = executor.position.side  # "long" or "short"
+            report.current_position = executor.position.side
+            report.position_pnl_pct = executor.position.unrealized_pnl_pct
         engine = get_decision_engine()
         decision = engine.decide(report)
 
