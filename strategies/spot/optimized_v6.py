@@ -322,6 +322,26 @@ class OptimizedStrategy:
         trend_down = m7 < m25 and macdh < 50
         strong_trend = adx_val > ADX_THRESHOLD
 
+        # === 加权评分 (提前计算, 持仓中也要用) ===
+        cond_short = {
+            "MA": bool(m7 < m25),
+            "MACD": bool(macdh < MACD_SHORT_THRESHOLD),
+            "ADX": bool(strong_trend),
+            "Reg": bool(regime != "bull"),
+            "RSI": bool(RSI_SHORT_MIN_ENTRY < rsi_val < RSI_SHORT_ENTRY + 20),
+            "VOL": bool(vol_surge),
+        }
+        cond_long = {
+            "MA": bool(m7 > m25),
+            "MACD": bool(macdh > MACD_LONG_THRESHOLD),
+            "ADX": bool(strong_trend),
+            "Reg": bool(regime != "bear"),
+            "RSI": bool(RSI_LONG_ENTRY < rsi_val < RSI_LONG_MAX_ENTRY),
+            "VOL": bool(vol_surge),
+        }
+        short_score_w = sum(CONDITION_WEIGHTS.get(n, 0.0) for n, p in cond_short.items() if p)
+        long_score_w = sum(CONDITION_WEIGHTS.get(n, 0.0) for n, p in cond_long.items() if p)
+
         # 当前持仓
         pos = bar.get('position')
         has_position = pos is not None and getattr(pos, 'size', 0) > 0
@@ -371,6 +391,34 @@ class OptimizedStrategy:
                     self.last_exit_bar = idx
                     return _build_report("COVER", "COVER")
 
+        # === 仓位缩放: 持仓中 (加仓/减仓) ===
+        if has_position and pos_entry > 0:
+            pos_leverage = getattr(pos, 'leverage', 10)
+            pos_size = getattr(pos, 'size', 0)
+            pos_addition_count = getattr(pos, 'addition_count', 0)
+            max_additions = getattr(executor, 'MAX_ADDITIONS', 2) if executor else 2
+
+            # 计算未实现盈亏 (杠杆回报)
+            if pos_side == 'long':
+                unrealized_pnl_pct = (c - pos_entry) / pos_entry * pos_leverage * 100
+            else:
+                unrealized_pnl_pct = (pos_entry - c) / pos_entry * pos_leverage * 100
+
+            # REDUCE: 盈利 > 30% 杠杆回报 → 减半锁定利润
+            if unrealized_pnl_pct > 30:
+                logger.info(f"💰 减仓止盈: {pos_side} | PnL={unrealized_pnl_pct:+.1f}% | 减50%锁定利润")
+                return _build_report("REDUCE")
+
+            # ADD: 浮亏 > 5% 但评分仍超阈值 → 顺势补仓摊低成本
+            if unrealized_pnl_pct < -5 and pos_addition_count < max_additions:
+                if bars_held < MAX_HOLD_BARS // 2:  # 仅在持仓前半段加仓
+                    if pos_side == 'long' and long_score_w >= SIGNAL_THRESHOLD:
+                        logger.info(f"📈 加仓信号: LONG | 浮亏{unrealized_pnl_pct:+.1f}% | 评分{long_score_w:.3f}")
+                        return _build_report("ADD_LONG")
+                    elif pos_side == 'short' and short_score_w >= SIGNAL_THRESHOLD:
+                        logger.info(f"📉 加仓信号: SHORT | 浮亏{unrealized_pnl_pct:+.1f}% | 评分{short_score_w:.3f}")
+                        return _build_report("ADD_SHORT")
+
         # === 开仓信号 (含 LightGBM 双确认) ===
         if not has_position:
             # === Pin Bar 方向过滤 ===
@@ -396,26 +444,6 @@ class OptimizedStrategy:
 
             # === 加权评分判定 (替代 6/6 硬否决) ===
             local_threshold = SIGNAL_THRESHOLD
-
-            # 计算当前 K 线的条件状态（从 _build_report 提取，供信号判定使用）
-            cond_short = {
-                "MA": bool(m7 < m25),
-                "MACD": bool(macdh < MACD_SHORT_THRESHOLD),
-                "ADX": bool(strong_trend),
-                "Reg": bool(regime != "bull"),
-                "RSI": bool(RSI_SHORT_MIN_ENTRY < rsi_val < RSI_SHORT_ENTRY + 20),
-                "VOL": bool(vol_surge),
-            }
-            cond_long = {
-                "MA": bool(m7 > m25),
-                "MACD": bool(macdh > MACD_LONG_THRESHOLD),
-                "ADX": bool(strong_trend),
-                "Reg": bool(regime != "bear"),
-                "RSI": bool(RSI_LONG_ENTRY < rsi_val < RSI_LONG_MAX_ENTRY),
-                "VOL": bool(vol_surge),
-            }
-            short_score_w = sum(CONDITION_WEIGHTS.get(n, 0.0) for n, p in cond_short.items() if p)
-            long_score_w = sum(CONDITION_WEIGHTS.get(n, 0.0) for n, p in cond_long.items() if p)
 
             # 因子 bias 动态调阈 — short_bias 时降低 SHORT 门槛, long_bias 时降低 LONG 门槛
             bias = _factor_bias or {}

@@ -32,6 +32,7 @@ from execution.executor_v2 import FuturesExecutor, LiveAccount, LivePosition, Li
 from execution.ai_override import get_decision_engine
 from execution.signals import SignalReport, FinalDecision
 from strategies.spot.optimized_v6 import OptimizedStrategy
+import strategies.spot.optimized_v6 as strat_mod
 from data.ws_price_stream import SharedMarketState, BinanceWebSocket, create_price_stream
 from data.alpha_factors import AlphaFactors
 from ml.lgb_predictor import LGBAdapter
@@ -221,9 +222,9 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
         atr_val = float(row.get('atr', 0)) if pd.notna(row.get('atr', 0)) else 0
         if signal in ("LONG", "SHORT"):
             if signal == "LONG":
-                stop_loss = close_price - atr_val * strategy.ATR_STOP_LONG
+                stop_loss = close_price - atr_val * strat_mod.ATR_STOP_LONG
             else:
-                stop_loss = close_price + atr_val * strategy.ATR_STOP_SHORT
+                stop_loss = close_price + atr_val * strat_mod.ATR_STOP_SHORT
         else:
             stop_loss = 0
 
@@ -283,6 +284,30 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
                 engine.update_trade_result(pnl_pct)
                 if hasattr(strategy, 'last_exit_bar'):
                     strategy.last_exit_bar = latest_idx
+
+        elif signal == "ADD_LONG" and executor.position and executor.position.side == "long":
+            add_size = executor.position.size * 0.5  # 加仓50%
+            result = executor.add_to_long(symbol, add_size, close_price)
+            if result:
+                notify_trade("ADD_LONG", close_price, f"加多仓 +50% | 均价→{executor.position.entry_price:,.0f}")
+
+        elif signal == "ADD_SHORT" and executor.position and executor.position.side == "short":
+            add_size = executor.position.size * 0.5
+            result = executor.add_to_short(symbol, add_size, close_price)
+            if result:
+                notify_trade("ADD_SHORT", close_price, f"加空仓 +50% | 均价→{executor.position.entry_price:,.0f}")
+
+        elif signal == "REDUCE" and executor.position:
+            reduce_size = executor.position.size * 0.5  # 减仓50%
+            if executor.position.side == "long":
+                result = executor.sell(symbol, price=close_price, size=reduce_size)
+                if result:
+                    pnl = close_price - executor.position.entry_price
+                    notify_trade("REDUCE", close_price, f"减多仓 -50% | 均价→{executor.position.entry_price:,.0f}")
+            else:
+                result = executor.short_cover(symbol, price=close_price, size=reduce_size)
+                if result:
+                    notify_trade("REDUCE", close_price, f"减空仓 -50% | 均价→{executor.position.entry_price:,.0f}")
 
     # 状态日志
     status = [f"${close_price:,.0f}", f"Eq=${executor.equity:,.0f}"]

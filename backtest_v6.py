@@ -128,6 +128,18 @@ def run_backtest():
             pnl = (executor.position.entry_price - close_price) / executor.position.entry_price * 100 * executor.position.leverage
             executor.short_cover(symbol, price=close_price)
             trades.append(("SHORT", close_price, pnl, row["datetime"]))
+        elif signal == "ADD_LONG" and executor.position and executor.position.side == "long":
+            add_size = executor.position.size * 0.5
+            executor.add_to_long(symbol, add_size, close_price)
+        elif signal == "ADD_SHORT" and executor.position and executor.position.side == "short":
+            add_size = executor.position.size * 0.5
+            executor.add_to_short(symbol, add_size, close_price)
+        elif signal == "REDUCE" and executor.position:
+            reduce_size = executor.position.size * 0.5
+            if executor.position.side == "long":
+                executor.sell(symbol, price=close_price, size=reduce_size)
+            else:
+                executor.short_cover(symbol, price=close_price, size=reduce_size)
 
         equity_curve.append((row["datetime"], executor.equity))
 

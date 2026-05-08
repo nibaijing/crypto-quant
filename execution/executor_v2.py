@@ -42,6 +42,7 @@ class LivePosition:
     margin: float = 0
     timestamp: int = 0
     bars_held: int = 0  # 持仓 K 线数
+    addition_count: int = 0  # 加仓次数
 
 
 @dataclass
@@ -442,6 +443,87 @@ class FuturesExecutor:
 
         self._save_state()
         return f"sim_cover_{int(time.time() * 1000)}"
+
+    # ==================== 仓位缩放 — 加仓 / 减仓 ====================
+
+    MAX_ADDITIONS = 2  # 单边最多加仓次数，防无底洞补仓
+
+    def add_to_long(self, symbol: str, add_size: float, price: float) -> Optional[str]:
+        """加多：增加现有做多仓位，计算加权均价"""
+        if not self._sim_position or self._sim_position.side != "long":
+            logger.warning("无做多持仓, 无法加仓")
+            return None
+        if self._sim_position.addition_count >= self.MAX_ADDITIONS:
+            logger.warning(f"加仓次数已达上限 ({self.MAX_ADDITIONS}), 拒绝加仓")
+            return None
+
+        ok, reason = self._check_risk(symbol, "long", add_size, price)
+        if not ok:
+            logger.warning(f"❌ 加仓风控拒绝: {reason}")
+            return None
+
+        cost = add_size * price
+        margin = cost / self._sim_leverage
+        commission = cost * self.config.backtest.commission
+
+        # 加权均价
+        old_size = self._sim_position.size
+        old_total = old_size * self._sim_position.entry_price
+        new_size = old_size + add_size
+        new_entry = (old_total + cost) / new_size
+
+        self._sim_cash -= (margin + commission)
+        self._sim_position.size = new_size
+        self._sim_position.entry_price = new_entry
+        self._sim_position.margin += margin
+        self._sim_position.addition_count += 1
+        self._sim_total_trades += 1
+        self._save_state()
+
+        logger.info(
+            f"📈 加多: +{add_size:.4f} → 总{new_size:.4f} | "
+            f"均价${new_entry:.0f} | 加{self._sim_position.addition_count}/{self.MAX_ADDITIONS}次 | "
+            f"{self._sim_leverage}x"
+        )
+        return f"sim_add_long_{int(time.time() * 1000)}"
+
+    def add_to_short(self, symbol: str, add_size: float, price: float) -> Optional[str]:
+        """加空：增加现有做空仓位，计算加权均价"""
+        if not self._sim_position or self._sim_position.side != "short":
+            logger.warning("无做空持仓, 无法加仓")
+            return None
+        if self._sim_position.addition_count >= self.MAX_ADDITIONS:
+            logger.warning(f"加仓次数已达上限 ({self.MAX_ADDITIONS}), 拒绝加仓")
+            return None
+
+        ok, reason = self._check_risk(symbol, "short", add_size, price)
+        if not ok:
+            logger.warning(f"❌ 加仓风控拒绝: {reason}")
+            return None
+
+        cost = add_size * price
+        margin = cost / self._sim_leverage
+        commission = cost * self.config.backtest.commission
+
+        old_size = self._sim_position.size
+        old_total = old_size * self._sim_position.entry_price
+        new_size = old_size + add_size
+        new_entry = (old_total + cost) / new_size
+
+        self._sim_cash -= (margin + commission)
+        self._sim_position.size = new_size
+        self._sim_position.entry_price = new_entry
+        self._sim_position.margin += margin
+        self._sim_position.addition_count += 1
+        self._sim_total_trades += 1
+        self._save_state()
+
+        logger.info(
+            f"📉 加空: +{add_size:.4f} → 总{new_size:.4f} | "
+            f"均价${new_entry:.0f} | 加{self._sim_position.addition_count}/{self.MAX_ADDITIONS}次 | "
+            f"{self._sim_leverage}x"
+        )
+        return f"sim_add_short_{int(time.time() * 1000)}"
 
     # ==================== 行情 & 账户 ====================
 
