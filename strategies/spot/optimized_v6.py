@@ -282,7 +282,8 @@ class OptimizedStrategy:
             return _build_report("HOLD")
 
         # === Pin Bar 检测 ===
-        # 定义: 影线占比 > 40%, 实体占比 < 60% (放宽以捕获 shooting star 变体)
+        # 定义: 影线占比 > 50%, 实体占比 < 50% (比 40%/60% 更严格, 减少小碎针误杀)
+        # 只有真正冲高回落/探底回升的 K 线才触发
         o = float(row.get('open', c))
         candle_range = h - l
         is_pinbar = False
@@ -296,12 +297,12 @@ class OptimizedStrategy:
             body_pct = body / candle_range
             close_position = (c - l) / candle_range  # 0=底部 1=顶部
 
-            # Bearish pin bar: 长上影(>40%), 实体不主导(<60%), 收盘偏下(<0.6) — LONG陷阱
-            if upper_wick_pct > 0.4 and body_pct < 0.6 and close_position < 0.6:
+            # Bearish pin bar: 长上影(>50%), 实体不主导(<50%), 收盘偏下(<0.5)
+            if upper_wick_pct > 0.50 and body_pct < 0.50 and close_position < 0.50:
                 is_pinbar = True
                 pinbar_direction = "bearish"
-            # Bullish pin bar: 长下影(>40%), 实体不主导(<60%), 收盘偏上(>0.4) — SHORT陷阱
-            elif lower_wick_pct > 0.4 and body_pct < 0.6 and close_position > 0.4:
+            # Bullish pin bar: 长下影(>50%), 实体不主导(<50%), 收盘偏上(>0.5)
+            elif lower_wick_pct > 0.50 and body_pct < 0.50 and close_position > 0.50:
                 is_pinbar = True
                 pinbar_direction = "bullish"
 
@@ -373,23 +374,26 @@ class OptimizedStrategy:
 
         # === 开仓信号 (含 LightGBM 双确认) ===
         if not has_position:
-            # === Pin Bar 硬过滤 ===
-            # Pin bar 时直接从策略层返回 None — 不进入 DecisionEngine，不调 AI
-            # 理由：K线形态陷阱是结构性的，不应被 AI override
-            if is_pinbar and pinbar_direction == "bearish":
+            # === Pin Bar 方向过滤 ===
+            # Pin bar 不再全部挡死，而是只挡方向冲突的一方。
+            # Bearish pin bar(冲高回落) → 对 LONG 是陷阱，对 SHORT 反而是确认
+            # Bullish pin bar(探底回升) → 对 SHORT 是陷阱，对 LONG 反而是确认
+            # 冲突方的信号被强制设为 HOLD 且降低 raw_signal 权重。
+            pinbar_block_long = is_pinbar and pinbar_direction == "bearish"
+            pinbar_block_short = is_pinbar and pinbar_direction == "bullish"
+
+            if is_pinbar:
+                direction_name = "Bearish" if pinbar_direction == "bearish" else "Bullish"
+                wick_key = "upper wick" if pinbar_direction == "bearish" else "lower wick"
+                wick_val = (h - max(o, c)) if pinbar_direction == "bearish" else (min(o, c) - l)
+                wick_pct = wick_val / max(candle_range, 1) * 100
+                blocked_side = "LONG" if pinbar_direction == "bearish" else "SHORT"
+                allowed_side = "SHORT" if pinbar_direction == "bearish" else "LONG"
                 logger.warning(
-                    f"🕯 Bearish pin bar @ ${c:,.0f} — "
-                    f"upper wick={(h-max(o,c))/max(candle_range,1)*100:.0f}% "
-                    f"of range, blocking ALL entries to avoid bull trap"
+                    f"🕯 {direction_name} pin bar @ ${c:,.0f} — "
+                    f"{wick_key}={wick_pct:.0f}% of range, "
+                    f"blocking {blocked_side} (trap), allowing {allowed_side}"
                 )
-                return None
-            if is_pinbar and pinbar_direction == "bullish":
-                logger.warning(
-                    f"🕯 Bullish pin bar @ ${c:,.0f} — "
-                    f"lower wick={(min(o,c)-l)/max(candle_range,1)*100:.0f}% "
-                    f"of range, blocking ALL entries to avoid bear trap"
-                )
-                return None
 
             # === 加权评分判定 (替代 6/6 硬否决) ===
             local_threshold = SIGNAL_THRESHOLD
@@ -427,6 +431,19 @@ class OptimizedStrategy:
             # 用加权分判定信号
             short_signal = short_score_w >= local_threshold
             long_signal = long_score_w >= local_threshold
+
+            # Pin bar 方向阻断: 冲突方信号降级
+            if pinbar_block_long:
+                long_signal = False
+            if pinbar_block_short:
+                short_signal = False
+
+            # Pin bar 同向加码: 对齐方降低阈值 (顺势做入确认方向)
+            if is_pinbar:
+                if pinbar_direction == "bearish":
+                    short_signal = short_signal or short_score_w >= local_threshold - 0.05
+                elif pinbar_direction == "bullish":
+                    long_signal = long_signal or long_score_w >= local_threshold - 0.05
 
             # LightGBM 双确认
             if self.lgb_adapter and self.lgb_adapter.is_loaded():
