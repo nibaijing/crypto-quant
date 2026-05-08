@@ -28,8 +28,13 @@ OUTPUT_DIR = PROJECT / "data" / "reviews"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def parse_trades(log_path: Path) -> list[dict]:
-    """从日志解析所有交易"""
+def parse_trades(log_path: Path, since_date: str | None = None,
+                  since_datetime: str | None = None) -> list[dict]:
+    """从日志解析所有交易，可选过滤
+
+    since_date:     YYYY-MM-DD 格式，过滤此日期之前的交易
+    since_datetime: YYYY-MM-DD HH:MM:SS 格式，过滤此时间戳之前的交易（精确）
+    """
     if not log_path.exists():
         return []
 
@@ -44,8 +49,16 @@ def parse_trades(log_path: Path) -> list[dict]:
         if not m:
             continue
 
+        trade_time = m.group(1)
+        # 日期过滤（宽松）
+        if since_date and trade_time[:10] < since_date:
+            continue
+        # 时间戳过滤（精确）
+        if since_datetime and trade_time < since_datetime:
+            continue
+
         t = {
-            "time": m.group(1),
+            "time": trade_time,
             "action": m.group(2),
             "price": float(m.group(3)),
         }
@@ -207,9 +220,10 @@ def get_current_state() -> dict:
     return {"cash": 1000, "total_trades": 0, "winning_trades": 0}
 
 
-def generate_review(json_mode: bool = False) -> dict:
+def generate_review(json_mode: bool = False, since_date: str | None = None,
+                    since_datetime: str | None = None) -> dict:
     """生成完整复盘报告"""
-    trades = parse_trades(LOG_FILE)
+    trades = parse_trades(LOG_FILE, since_date=since_date, since_datetime=since_datetime)
     if not trades:
         empty = {
             "date": datetime.now().strftime("%Y-%m-%d"),
@@ -319,8 +333,15 @@ def format_markdown(report: dict) -> str:
 
 if __name__ == "__main__":
     json_mode = "--json" in sys.argv
+    since_date = None
+    since_datetime = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--since" and i + 1 < len(sys.argv):
+            since_date = sys.argv[i + 1]
+        elif arg == "--since-datetime" and i + 1 < len(sys.argv):
+            since_datetime = sys.argv[i + 1]
 
-    report = generate_review()
+    report = generate_review(since_date=since_date, since_datetime=since_datetime)
 
     if json_mode:
         print(json.dumps(report, ensure_ascii=False, indent=2))

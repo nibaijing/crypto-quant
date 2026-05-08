@@ -22,6 +22,8 @@ class SignalReport:
     # === Condition Scores (0.0~1.0) ===
     long_score: float = 0.0
     short_score: float = 0.0
+    long_score_w: float = 0.0    # 加权评分 (0.0~1.0)
+    short_score_w: float = 0.0
 
     # === Condition Details ===
     conditions_long: Dict[str, bool] = field(default_factory=dict)
@@ -49,6 +51,14 @@ class SignalReport:
     lgb_opinion: str = "no_opinion"  # agree | disagree | no_opinion
     current_position: Optional[str] = None  # None | "long" | "short"
 
+    # === K线形态 ===
+    is_pinbar: bool = False              # 当前K线是否为 pin bar (冲高回落/探底回升)
+    pinbar_direction: str = "none"       # "bearish" (长上影, LONG陷阱) | "bullish" (长下影, SHORT陷阱) | "none"
+
+    # === Factor Bias ===
+    factor_bias: dict = field(default_factory=lambda: {"bias": "neutral", "confidence": 0.0, "active_factors": []})
+    # 因子偏向: 当 confidence ≥ 0.8 时强制 AI 匹配方向
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -66,7 +76,9 @@ class SignalReport:
             f"LONG={self.long_score:.0%}[{' '.join(long_parts)}] | "
             f"SHORT={self.short_score:.0%}[{' '.join(short_parts)}] | "
             f"RSI={self.rsi:.0f} ADX={self.adx:.0f} MACDh={self.macd_hist:.0f} "
-            f"regime={self.regime} cooldown={self.is_cooldown})"
+            f"regime={self.regime} cooldown={self.is_cooldown}"
+            + (f" pinbar={self.pinbar_direction}" if self.is_pinbar else "")
+            + ")"
         )
 
     def to_ai_context(self) -> str:
@@ -115,9 +127,9 @@ class SignalReport:
                 parts.append(f"{k}={v}")
             return ", ".join(parts)
 
-        lines.append(f"LONG: {long_passed}/{total} passed | Raw: {self.raw_signal}")
+        lines.append(f"LONG: {long_passed}/{total} passed (w={self.long_score_w:.2f}) | Raw: {self.raw_signal}")
         lines.append(f"  [{fmt_conditions(self.conditions_long)}]")
-        lines.append(f"SHORT: {short_passed}/{total} passed")
+        lines.append(f"SHORT: {short_passed}/{total} passed (w={self.short_score_w:.2f})")
         lines.append(f"  [{fmt_conditions(self.conditions_short)}]")
 
         if self.lgb_opinion != "no_opinion":
@@ -127,10 +139,28 @@ class SignalReport:
         lines.append("## Context")
         lines.append(f"Bars since last trade: {self.bars_since_last_trade}")
         if self.is_cooldown:
-            lines.append("⚠️ In cooldown period (recently exited a position)")
+            lines.append("\u26a0\ufe0f In cooldown period (recently exited a position)")
+
+        if self.is_pinbar:
+            if self.pinbar_direction == "bearish":
+                lines.append("\U0001f6a8 BEARISH PIN BAR detected \u2014 long upper wick, price rejected from highs. Classic bull trap. LONG entries are HIGH RISK.")
+            elif self.pinbar_direction == "bullish":
+                lines.append("\U0001f6a8 BULLISH PIN BAR detected \u2014 long lower wick, price rejected from lows. Classic bear trap. SHORT entries are HIGH RISK.")
 
         if self.exit_signal:
             lines.append(f"⚠️ Exit signal triggered: {self.exit_signal} (risk management)")
+
+        # Factor Bias 提醒
+        fb = self.factor_bias
+        if fb.get("confidence", 0) >= 0.8:
+            bias_direction = fb.get("bias", "neutral")
+            bias_label = {"long_bias": "🟢 LONG BIAS", "short_bias": "🔴 SHORT BIAS"}.get(bias_direction, "")
+            if bias_label:
+                lines.append("")
+                lines.append(f"⚠️  {bias_label} ACTIVE (confidence={fb['confidence']:.0%})")
+                lines.append(f"    → AI MUST respect this direction. Override requires extreme evidence.")
+                if fb.get("active_factors"):
+                    lines.append(f"    → Driving factors: {', '.join(fb['active_factors'][:3])}")
 
         lines.append("")
         lines.append("## Decision")

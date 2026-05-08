@@ -83,6 +83,7 @@ def _load_state() -> dict:
         "total_decisions": 0,
         "ai_decisions": 0,
         "auto_decisions": 0,
+        "fail_memory": None,  # AI 复盘写入: {"pattern": "SHORT signals blocked by RSI", "since": "..."}
     }
 
 def _save_state(state: dict):
@@ -315,6 +316,59 @@ class DecisionEngine:
             reasons.append("lgb_uncertain")
         return reasons
 
+    def _get_fail_memory_context(self) -> str:
+        """从状态中读取 AI 复盘写入的失败记忆, 注入 AI 决策上下文"""
+        fm = self.state.get("fail_memory")
+        if not fm:
+            return "(no failure patterns recorded yet)"
+        pattern = fm.get("pattern", "")
+        since = fm.get("since", "")
+        advice = fm.get("advice", "")
+        parts = [f"- Pattern: {pattern}"]
+        if since:
+            parts.append(f"- First observed: {since}")
+        if advice:
+            parts.append(f"- Suggestion: {advice}")
+        return "\n".join(parts)
+
+    def _get_factor_bias_rule(self, report: SignalReport) -> str:
+        """factor_bias 置信度 ≥ 0.8 时生成强制方向规则。
+
+        Returns
+        -------
+        str — 注入 prompt 的 Rules 文本行（可能为空字符串）
+        """
+        fb = getattr(report, 'factor_bias', {}) or {}
+        conf = fb.get("confidence", 0)
+        if conf < 0.8:
+            return ""
+
+        bias_dir = fb.get("bias", "neutral")
+        active = fb.get("active_factors", [])
+
+        if bias_dir == "short_bias":
+            line = (
+                f"- 🚨 FACTOR_BIAS_VIOLATION: Short-bias active (confidence={conf:.0%}). "
+                "STRONG preference for SHORT decisions. "
+                "Do NOT override to LONG unless you have overwhelming contrary evidence "
+                "(e.g. RSI <20 + bullish pin bar + volume surge simultaneously). "
+                "When uncertain, default to SHORT over HOLD/LONG."
+            )
+        elif bias_dir == "long_bias":
+            line = (
+                f"- 🚨 FACTOR_BIAS_VIOLATION: Long-bias active (confidence={conf:.0%}). "
+                "STRONG preference for LONG decisions. "
+                "Do NOT override to SHORT unless you have overwhelming contrary evidence "
+                "(e.g. RSI >80 + bearish pin bar + volume surge simultaneously). "
+                "When uncertain, default to LONG over HOLD/SHORT."
+            )
+        else:
+            return ""
+
+        if active:
+            line += f" (Driven by: {', '.join(active[:3])})"
+        return line
+
     # ── Prompt 构建 ──────────────────────────────────────────────────────
 
     def _build_decision_prompt(self, report: SignalReport, reasons: List[str]) -> str:
@@ -323,18 +377,23 @@ class DecisionEngine:
         核心思路: 给 AI 完整的市场快照 + 策略评估, 让它做交易员式的综合判断。
         """
         # 基础上下文
+        factor_bias_rule = self._get_factor_bias_rule(report)
         parts = [
             "You are the AI Decision Layer for a crypto quantitative trading system (BTC-USDT perpetual futures, 15-min bars).",
             "Strategy layer provides technical indicators and condition scores. You make the FINAL call.",
             "",
             report.to_ai_context(),
             "",
+            "## Failure Memory",
+            self._get_fail_memory_context(),
             "## Rules",
             "- You can OVERRIDE the strategy: if strategy says HOLD but conditions look good, you can say LONG/SHORT.",
             "- Conversely, if strategy says LONG/SHORT but market looks risky, say HOLD.",
             "- Consider RSI extremes: >75 is overbought (risky to long), <25 is oversold (risky to short).",
             "- Consider ADX: <25 means ranging/choppy (avoid trading), >35 means trending (trade with trend).",
             "- Consider price context: is this a breakout or a fakeout?",
+            "- \U0001f6a8 PIN BAR WARNING: if context shows a bearish pin bar, DO NOT go LONG (bull trap). If bullish pin bar, DO NOT go SHORT (bear trap).",
+            *( [factor_bias_rule] if factor_bias_rule else [] ),
             f"- Trigger reason: {', '.join(reasons)}",
             "",
             "Reply format (choose ONE):",
@@ -353,6 +412,23 @@ class DecisionEngine:
         """构建平仓决策提示词 — AI 确认或驳回平仓信号。"""
         exit_type = report.exit_signal or "SELL"
         exit_desc = {"SELL": "平多仓 (close long)", "COVER": "平空仓 (close short)"}.get(exit_type, exit_type)
+
+        factor_bias_rule = self._get_factor_bias_rule(report)
+        # 平仓场景下: bias 方向与平仓方向冲突时需要特殊提醒
+        fb = getattr(report, 'factor_bias', {}) or {}
+        bias_exit_conflict = ""
+        if fb.get("confidence", 0) >= 0.8:
+            bias = fb.get("bias", "")
+            if bias == "long_bias" and exit_type == "SELL":
+                bias_exit_conflict = (
+                    f"- 🚨 FACTOR_BIAS CONFLICT: Strong long-bias disagrees with SELL exit. "
+                    "Reject (HOLD) unless reversal evidence is definitive."
+                )
+            elif bias == "short_bias" and exit_type == "COVER":
+                bias_exit_conflict = (
+                    f"- 🚨 FACTOR_BIAS CONFLICT: Strong short-bias disagrees with COVER exit. "
+                    "Reject (HOLD) unless reversal evidence is definitive."
+                )
 
         parts = [
             "You are the AI Decision Layer for a crypto quantitative trading system (BTC-USDT perpetual futures, 15-min bars).",
@@ -374,6 +450,8 @@ class DecisionEngine:
             "- Consider: Is this a real reversal or a temporary pullback? Is volume confirming?",  
             "- Overriding an exit is RISKY. Default to confirming unless evidence is strong.",
             "- RSI extreme + ADX confirming trend → likely real exit. RSI mild + low ADX → possible fakeout.",
+            *( [bias_exit_conflict] if bias_exit_conflict else [] ),
+            *( [factor_bias_rule] if factor_bias_rule else [] ),
             "",  
             "Reply format (choose ONE):",  
             f"{exit_type}  (confirm exit)",

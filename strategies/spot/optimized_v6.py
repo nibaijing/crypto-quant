@@ -21,13 +21,13 @@ BEST_LONG_MULT = 1.5    # 做多仓位倍数
 BEST_SHORT_MULT = 2.5   # 做空仓位倍数 (做空信号更稀缺, 加倍)
 
 # === 风控参数 ===
-MAX_POSITION_PCT = 0.15  # 最大仓位比例 30%
-ATR_STOP_LONG = 1.2      # 做多 ATR 止损倍数
+MAX_POSITION_PCT = 0.1  # 最大仓位比例 30%
+ATR_STOP_LONG = 1.0      # 做多 ATR 止损倍数
 ATR_STOP_SHORT = 1.5     # 做空 ATR 止损倍数 (做空更激进)
 MAX_DRAWDOWN_PCT = 0.20  # 最大回撤 20% 熔断
 MAX_HOLD_BARS = 32       # 最大持仓K线数 (8小时)
 MIN_HOLD_BARS = 4        # 最小持仓K线数 (前4根K线不能RSI平仓, ATR止损除外)
-COOLDOWN_BARS = 10        # 冷却K线数 (90分钟, 避免频繁交易)
+COOLDOWN_BARS = 1         # 平仓后至少等1根K线，防AI反复开平
 
 # === 信号阈值 ===
 RSI_LONG_ENTRY = 35      # 做多: RSI < 35 (深度回调介入, 更安全)
@@ -36,11 +36,21 @@ RSI_LONG_EXIT = 75       # 做多平仓: RSI > 75 (让盈利奔跑)
 RSI_SHORT_ENTRY = 55     # 做空: RSI > 55 (等待更强反弹再介入)
 RSI_SHORT_MIN_ENTRY = 35 # 做空: RSI < 35 拒绝开仓 (拒绝追低)
 RSI_SHORT_EXIT = 40      # 做空平仓: RSI < 40 (持有到超卖区域)
-MACD_LONG_THRESHOLD = 15  # MACD_hist > 15 确认做多 (15m放宽, 从25下调)
+MACD_LONG_THRESHOLD = 20  # MACD_hist > 15 确认做多 (15m放宽, 从25下调)
 MACD_SHORT_THRESHOLD = -15 # MACD_hist < -15 确认做空 (15m放宽, 从-25上调)
+# === 信号权重 (加权评分替代硬否决) ===
+# 不再要求 6/6 全过 — 核心条件权重高, RSI/VOL 为辅助
+CONDITION_WEIGHTS = {
+    "MA":   0.20,  # 趋势方向
+    "MACD": 0.25,  # 动能确认 (核心)
+    "ADX":  0.25,  # 趋势强度 (核心)
+    "Reg":  0.10,  # 市场体制
+    "RSI":  0.10,  # 超买超卖 (辅助 — 趋势中可放宽)
+    "VOL":  0.10,  # 放量确认 (辅助)
+}
+SIGNAL_THRESHOLD = 0.65  # 加权分 > 0.65 即触发信号 (≈4/6 且核心条件过)
 ADX_THRESHOLD = 35       # ADX 须 > 35 过滤震荡 (15m需要更强趋势)
-# 方向判定: 不再用 price/MA99 偏离 (15mK线偏差2%太苛刻且与RSI互斥)
-# 改用 MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
+# 方向判定: MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
 
 
 class OptimizedStrategy:
@@ -53,7 +63,7 @@ class OptimizedStrategy:
         self.position_size = 0
         self.lgb_adapter = lgb_adapter  # LightGBM 双确认适配器 (可选)
         self._last_lgb_opinion = 'no_opinion'  # 供 AIOverride 读取
-        self.last_exit_bar = -COOLDOWN_BARS  # 上次平仓的K线索引 (初始化为足够早, 允许首笔交易)
+        self.last_exit_bar = -1      # 上次平仓的K线索引
         self.last_entry_bar = -1  # 上次开仓的K线索引
         
     def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -148,6 +158,18 @@ class OptimizedStrategy:
                 "RSI": bool(RSI_LONG_ENTRY < rsi_val < RSI_LONG_MAX_ENTRY),
                 "VOL": bool(vol_surge),
             }
+            # 加权评分 — 替代 6/6 硬否决
+            def _weighted_score(conds: dict) -> float:
+                """计算加权分: 已通过条件的权重之和"""
+                total = 0.0
+                for name, passed in conds.items():
+                    if passed:
+                        total += CONDITION_WEIGHTS.get(name, 0.0)
+                return total
+
+            short_score_w = _weighted_score(cond_short)
+            long_score_w = _weighted_score(cond_long)
+            # 保持向后兼容: 旧版 score 仍按 6 分制
             n_conditions = 6
             short_score = sum(1 for v in cond_short.values() if v) / n_conditions
             long_score = sum(1 for v in cond_long.values() if v) / n_conditions
@@ -204,6 +226,8 @@ class OptimizedStrategy:
                 exit_signal=exit_signal,
                 long_score=long_score,
                 short_score=short_score,
+                long_score_w=long_score_w,
+                short_score_w=short_score_w,
                 conditions_long=cond_long,
                 conditions_short=cond_short,
                 rsi=rsi_val,
@@ -221,6 +245,9 @@ class OptimizedStrategy:
                 bars_since_last_trade=bars_since_exit,
                 is_cooldown=is_cooldown,
                 lgb_opinion=self._last_lgb_opinion,
+                is_pinbar=is_pinbar,
+                pinbar_direction=pinbar_direction,
+                factor_bias=_factor_bias or {"bias": "neutral", "confidence": 0.0, "active_factors": []},
             )
 
         # ── 主逻辑 ──
@@ -253,6 +280,30 @@ class OptimizedStrategy:
 
         if np.isnan(rsi_val) or np.isnan(adx_val):
             return _build_report("HOLD")
+
+        # === Pin Bar 检测 ===
+        # 定义: 影线占比 > 40%, 实体占比 < 60% (放宽以捕获 shooting star 变体)
+        o = float(row.get('open', c))
+        candle_range = h - l
+        is_pinbar = False
+        pinbar_direction = "none"
+        if candle_range > 0:
+            upper_wick = h - max(o, c)
+            lower_wick = min(o, c) - l
+            body = abs(c - o)
+            upper_wick_pct = upper_wick / candle_range
+            lower_wick_pct = lower_wick / candle_range
+            body_pct = body / candle_range
+            close_position = (c - l) / candle_range  # 0=底部 1=顶部
+
+            # Bearish pin bar: 长上影(>40%), 实体不主导(<60%), 收盘偏下(<0.6) — LONG陷阱
+            if upper_wick_pct > 0.4 and body_pct < 0.6 and close_position < 0.6:
+                is_pinbar = True
+                pinbar_direction = "bearish"
+            # Bullish pin bar: 长下影(>40%), 实体不主导(<60%), 收盘偏上(>0.4) — SHORT陷阱
+            elif lower_wick_pct > 0.4 and body_pct < 0.6 and close_position > 0.4:
+                is_pinbar = True
+                pinbar_direction = "bullish"
 
         # 市场状态
         regime = "bull" if (m7 > m25 and m25 > m99) else ("bear" if (m7 < m25 and m25 < m99) else "neutral")
@@ -300,6 +351,16 @@ class OptimizedStrategy:
                     return _build_report(exit_sig, exit_sig)
 
         # === 平仓信号 ===
+
+        # 因子偏向 — 全局获取一次，供 _build_report 和阈值调整使用
+        _factor_bias = None
+        try:
+            from services.factor_analysis import get_active_factor_bias
+            _factor_bias = get_active_factor_bias()
+        except Exception:
+            _factor_bias = {"bias": "neutral", "confidence": 0.0, "active_factors": []}
+
+        # === 平仓信号 (续) ===
         if has_position:
             if pos_side == 'long':
                 if (rsi_val > RSI_LONG_EXIT and bars_held >= MIN_HOLD_BARS) or (trend_down and strong_trend):
@@ -312,18 +373,60 @@ class OptimizedStrategy:
 
         # === 开仓信号 (含 LightGBM 双确认) ===
         if not has_position:
-            bars_since_exit = idx - self.last_exit_bar
-            if bars_since_exit < COOLDOWN_BARS:
-                return _build_report("HOLD")
+            # === Pin Bar 硬过滤 ===
+            # Pin bar 时直接从策略层返回 None — 不进入 DecisionEngine，不调 AI
+            # 理由：K线形态陷阱是结构性的，不应被 AI override
+            if is_pinbar and pinbar_direction == "bearish":
+                logger.warning(
+                    f"🕯 Bearish pin bar @ ${c:,.0f} — "
+                    f"upper wick={(h-max(o,c))/max(candle_range,1)*100:.0f}% "
+                    f"of range, blocking ALL entries to avoid bull trap"
+                )
+                return None
+            if is_pinbar and pinbar_direction == "bullish":
+                logger.warning(
+                    f"🕯 Bullish pin bar @ ${c:,.0f} — "
+                    f"lower wick={(min(o,c)-l)/max(candle_range,1)*100:.0f}% "
+                    f"of range, blocking ALL entries to avoid bear trap"
+                )
+                return None
 
-            # 做空条件判定
-            short_signal = (m7 < m25 and macdh < MACD_SHORT_THRESHOLD and strong_trend and
-                           regime != "bull" and RSI_SHORT_MIN_ENTRY < rsi_val < RSI_SHORT_ENTRY + 20 and
-                           vol_surge)
-            # 做多条件判定
-            long_signal = (m7 > m25 and macdh > MACD_LONG_THRESHOLD and strong_trend and
-                           regime != "bear" and RSI_LONG_ENTRY < rsi_val < RSI_LONG_MAX_ENTRY and
-                           vol_surge)
+            # === 加权评分判定 (替代 6/6 硬否决) ===
+            local_threshold = SIGNAL_THRESHOLD
+
+            # 计算当前 K 线的条件状态（从 _build_report 提取，供信号判定使用）
+            cond_short = {
+                "MA": bool(m7 < m25),
+                "MACD": bool(macdh < MACD_SHORT_THRESHOLD),
+                "ADX": bool(strong_trend),
+                "Reg": bool(regime != "bull"),
+                "RSI": bool(RSI_SHORT_MIN_ENTRY < rsi_val < RSI_SHORT_ENTRY + 20),
+                "VOL": bool(vol_surge),
+            }
+            cond_long = {
+                "MA": bool(m7 > m25),
+                "MACD": bool(macdh > MACD_LONG_THRESHOLD),
+                "ADX": bool(strong_trend),
+                "Reg": bool(regime != "bear"),
+                "RSI": bool(RSI_LONG_ENTRY < rsi_val < RSI_LONG_MAX_ENTRY),
+                "VOL": bool(vol_surge),
+            }
+            short_score_w = sum(CONDITION_WEIGHTS.get(n, 0.0) for n, p in cond_short.items() if p)
+            long_score_w = sum(CONDITION_WEIGHTS.get(n, 0.0) for n, p in cond_long.items() if p)
+
+            # 因子 bias 动态调阈 — short_bias 时降低 SHORT 门槛, long_bias 时降低 LONG 门槛
+            bias = _factor_bias or {}
+            if bias and bias.get("confidence", 0) > 0.8:
+                    if bias["bias"] == "short_bias":
+                        local_threshold -= 0.08  # SHORT 门槛从 0.65 → 0.57
+                        logger.debug(f"🎯 short_bias(conf={bias['confidence']}): SHORT threshold→{local_threshold:.2f}")
+                    elif bias["bias"] == "long_bias":
+                        local_threshold -= 0.08
+                        logger.debug(f"🎯 long_bias(conf={bias['confidence']}): LONG threshold→{local_threshold:.2f}")
+
+            # 用加权分判定信号
+            short_signal = short_score_w >= local_threshold
+            long_signal = long_score_w >= local_threshold
 
             # LightGBM 双确认
             if self.lgb_adapter and self.lgb_adapter.is_loaded():

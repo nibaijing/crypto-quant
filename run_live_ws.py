@@ -224,6 +224,9 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
                 notify_trade("SELL", close_price, f"平多仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
                 engine = get_decision_engine()
                 engine.update_trade_result(pnl_pct)
+                # 同步策略冷却状态，防止同一根K线内AI反复开仓
+                if hasattr(strategy, 'last_exit_bar'):
+                    strategy.last_exit_bar = latest_idx
 
         elif signal == "SHORT" and (not executor.position or executor.position.size == 0):
             result = executor.short_sell(symbol, price=close_price)
@@ -238,6 +241,8 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
                 notify_trade("COVER", close_price, f"平空仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
                 engine = get_decision_engine()
                 engine.update_trade_result(pnl_pct)
+                if hasattr(strategy, 'last_exit_bar'):
+                    strategy.last_exit_bar = latest_idx
 
     # 状态日志
     status = [f"${close_price:,.0f}", f"Eq=${executor.equity:,.0f}"]

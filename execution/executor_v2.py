@@ -228,6 +228,70 @@ class FuturesExecutor:
 
     # ==================== 交易操作 ====================
 
+    def _check_risk(self, symbol: str, side: str, size: float, price: float) -> tuple[bool, str]:
+        """风控检查：单笔上限 + 总仓位上限 + 保证金 + 反向持仓拦截。
+
+        Returns (pass, reason)。
+        """
+        equity = self.equity
+        trade_value = size * price
+
+        # 1. 反向持仓拦截 (防御层)
+        if self._sim_position and self._sim_position.size > 0:
+            current_side = self._sim_position.side
+            if (current_side == "long" and side == "short") or (current_side == "short" and side == "long"):
+                return False, f"已持有{current_side}仓, 禁止开反向仓"
+
+        # 2. 单笔上限 — 单次开仓价值 ≤ equity × max_single_position_pct
+        max_single = equity * self.config.risk.max_single_position_pct
+        if trade_value > max_single:
+            return False, (
+                f"单笔仓位 ${trade_value:,.0f} 超过上限 "
+                f"${max_single:,.0f} (equity ${equity:,.0f} × {self.config.risk.max_single_position_pct:.0%})"
+            )
+
+        # 3. 总仓位上限 — 所有持仓价值 ≤ equity × max_total_position_pct
+        current_value = 0.0
+        if self._sim_position and self._sim_position.size > 0:
+            current_value = self._sim_position.size * price
+        max_total = equity * self.config.risk.max_total_position_pct
+        if current_value + trade_value > max_total:
+            return False, (
+                f"总仓位 ${current_value + trade_value:,.0f} 超过上限 "
+                f"${max_total:,.0f} (equity ${equity:,.0f} × {self.config.risk.max_total_position_pct:.0%})"
+            )
+
+        # 4. 保证金充足
+        margin = trade_value / self._sim_leverage
+        available = self._sim_cash * 0.95  # 留5%缓冲
+        if margin > available:
+            return False, f"保证金不足: 需要 ${margin:,.0f} > 可用 ${available:,.0f}"
+
+        return True, "通过"
+
+    def _get_max_allowed_size(self, price: float) -> float:
+        """基于风控上限计算单次开仓最大数量。
+
+        取 min(现金可买, 单笔上限, 总仓位剩余空间)。
+        """
+        equity = self.equity
+
+        # 现金可买
+        max_from_cash = (self._sim_cash * self._sim_leverage * 0.9) / price if price > 0 else 0
+
+        # 单笔上限
+        max_from_single = (equity * self.config.risk.max_single_position_pct) / price
+
+        # 总仓位剩余
+        current_value = 0.0
+        if self._sim_position and self._sim_position.size > 0:
+            current_value = self._sim_position.size * price
+        max_total = equity * self.config.risk.max_total_position_pct
+        remaining = max(max_total - current_value, 0)
+        max_from_total = remaining / price if price > 0 else 0
+
+        return max(0.0001, min(max_from_cash, max_from_single, max_from_total))
+
     def _close_opposite(self, symbol: str, price: float) -> bool:
         """平掉对向持仓 (如果存在), 返回是否平了"""
         if not self._sim_position or self._sim_position.size <= 0:
@@ -235,21 +299,22 @@ class FuturesExecutor:
         return False  # 不再自动平仓 —— 由信号层管理
 
     def buy(self, symbol: str, size: float = None, price: float = None) -> Optional[str]:
-        """开多 / 加多"""
+        """开多 / 加多 — 受风控上限约束"""
         if price is None:
             logger.error("buy() 需要 price")
             return None
 
         if size is None:
-            max_pos = (self._sim_cash * self._sim_leverage * 0.9) / price
-            size = max_pos
+            size = self._get_max_allowed_size(price)
+
+        # 风控检查
+        ok, reason = self._check_risk(symbol, "long", size, price)
+        if not ok:
+            logger.warning(f"❌ LONG 风控拒绝: {reason}")
+            return None
 
         cost = size * price
         margin = cost / self._sim_leverage
-
-        if margin > self._sim_cash * 1.02:
-            logger.warning(f"保证金不足: 需要 ${margin:.0f}, 可用 ${self._sim_cash:.0f}")
-            return None
 
         commission = cost * self.config.backtest.commission
         self._sim_cash -= (margin + commission)
@@ -307,21 +372,22 @@ class FuturesExecutor:
         return f"sim_sell_{int(time.time() * 1000)}"
 
     def short_sell(self, symbol: str, size: float = None, price: float = None) -> Optional[str]:
-        """开空"""
+        """开空 — 受风控上限约束"""
         if price is None:
             logger.error("short_sell() 需要 price")
             return None
 
         if size is None:
-            max_pos = (self._sim_cash * self._sim_leverage * 0.9) / price
-            size = max_pos
+            size = self._get_max_allowed_size(price)
+
+        # 风控检查
+        ok, reason = self._check_risk(symbol, "short", size, price)
+        if not ok:
+            logger.warning(f"❌ SHORT 风控拒绝: {reason}")
+            return None
 
         cost = size * price
         margin = cost / self._sim_leverage
-
-        if margin > self._sim_cash:
-            logger.warning(f"保证金不足: 需要 ${margin:.0f}, 可用 ${self._sim_cash:.0f}")
-            return None
 
         commission = cost * self.config.backtest.commission
         self._sim_cash -= (margin + commission)
