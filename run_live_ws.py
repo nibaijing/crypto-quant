@@ -211,8 +211,47 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
     if signal and signal != "HOLD":
         logger.info(f"📡 信号: {signal} | close=${close_price:,.0f}")
 
+        # ── Live Gate（以损定仓 + 集中风控）──
+        from execution.live_gate import get_live_gate
+        gate = get_live_gate()
+        pos_side = executor.position.side if executor.position else None
+        pos_size = executor.position.size if executor.position else 0
+
+        # 计算计划止损价（ATR 动态止损）
+        atr_val = float(row.get('atr', 0)) if pd.notna(row.get('atr', 0)) else 0
+        if signal in ("LONG", "SHORT"):
+            if signal == "LONG":
+                stop_loss = close_price - atr_val * strategy.ATR_STOP_LONG
+            else:
+                stop_loss = close_price + atr_val * strategy.ATR_STOP_SHORT
+        else:
+            stop_loss = 0
+
+        gate_result = None
+        if signal in ("LONG", "SHORT"):
+            gate_result = gate.check(
+                symbol=symbol,
+                side="long" if signal == "LONG" else "short",
+                price=close_price,
+                stop_loss=stop_loss,
+                equity=executor.equity,
+                cash=executor.cash,
+                leverage=executor._sim_leverage,
+                current_position_side=pos_side,
+                current_position_size=pos_size or 0,
+            )
+            if gate_result.passed:
+                logger.info(
+                    f"🚪 Gate 通过: size={gate_result.allowed_size:.6f} BTC | "
+                    f"max_loss=${gate_result.details.get('max_loss', 0):.2f} | "
+                    f"stop=${stop_loss:,.0f}"
+                )
+            else:
+                logger.warning(f"🚫 Gate 拒绝 ({signal}): {gate_result.reason}")
+
         if signal == "LONG" and (not executor.position or executor.position.size == 0):
-            result = executor.buy(symbol, price=close_price)
+            gated_size = gate_result.allowed_size if gate_result and gate_result.passed else None
+            result = executor.buy(symbol, size=gated_size, price=close_price)
             if result:
                 notify_trade("LONG", close_price, f"开多仓 {executor._sim_leverage}x")
 
@@ -229,7 +268,8 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
                     strategy.last_exit_bar = latest_idx
 
         elif signal == "SHORT" and (not executor.position or executor.position.size == 0):
-            result = executor.short_sell(symbol, price=close_price)
+            gated_size = gate_result.allowed_size if gate_result and gate_result.passed else None
+            result = executor.short_sell(symbol, size=gated_size, price=close_price)
             if result:
                 notify_trade("SHORT", close_price, f"开空仓 {executor._sim_leverage}x")
 
