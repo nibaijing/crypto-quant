@@ -384,6 +384,9 @@ class DecisionEngine:
             "",
             report.to_ai_context(),
             "",
+            "## Recent Trades",
+            self._get_recent_trades_context(),
+            "",
             "## Failure Memory",
             self._get_fail_memory_context(),
             "## Rules",
@@ -438,6 +441,9 @@ class DecisionEngine:
             "When in doubt, respect the strategy exit — safety first.",
             "",
             report.to_ai_context(),
+            "",
+            "## Recent Trades",
+            self._get_recent_trades_context(),
             "",
             "## Exit Context",  
             f"- Exit Type: {exit_desc}",
@@ -575,10 +581,33 @@ class DecisionEngine:
 
     # ── 状态管理 ────────────────────────────────────────────────────────
 
+    MAX_TRADE_HISTORY = 5  # 注入 AI prompt 的最近交易数
+
     def update_trade_result(self, pnl: float):
-        """交易结束后更新状态 (保留兼容)"""
+        """交易结束后记录盈亏，供 AI 下次决策参考。"""
+        history = self.state.setdefault("recent_trades", [])
+        history.append({
+            "pnl": round(pnl, 2),
+            "time": datetime.now().strftime("%m-%d %H:%M"),
+        })
+        # 只保留最近 N 笔
+        if len(history) > self.MAX_TRADE_HISTORY:
+            history[:] = history[-self.MAX_TRADE_HISTORY:]
         self.state["total_decisions"] = self.state.get("total_decisions", 0) + 1
         _save_state(self.state)
+
+    def _get_recent_trades_context(self) -> str:
+        """生成最近交易记录摘要，注入 AI 决策 prompt。"""
+        history = self.state.get("recent_trades", [])
+        if not history:
+            return "(no trades yet this session)"
+        wins = sum(1 for t in history if t["pnl"] > 0)
+        total = len(history)
+        lines = [f"Last {total} trades (Win rate: {wins}/{total} = {wins/max(total,1)*100:.0f}%):"]
+        for i, t in enumerate(history, 1):
+            emoji = "🟢" if t["pnl"] > 0 else "🔴"
+            lines.append(f"  {i}. {emoji} {t['pnl']:+.2f}% @ {t['time']}")
+        return "\n".join(lines)
 
     def get_stats(self) -> dict:
         return {
