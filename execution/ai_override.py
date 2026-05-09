@@ -71,20 +71,27 @@ def _log(level: str, msg: str):
         f.write(line + "\n")
 
 def _load_state() -> dict:
-    try:
-        if STATE_FILE.exists():
-            return json.loads(STATE_FILE.read_text())
-    except Exception:
-        pass
-    return {
+    DEFAULT_STATE = {
         "daily_calls": 0,
         "reset_date": datetime.now().strftime("%Y-%m-%d"),
         "cooldowns": {},
         "total_decisions": 0,
         "ai_decisions": 0,
         "auto_decisions": 0,
-        "fail_memory": None,  # AI 复盘写入: {"pattern": "SHORT signals blocked by RSI", "since": "..."}
+        "fail_memory": None,
     }
+    try:
+        if STATE_FILE.exists():
+            loaded = json.loads(STATE_FILE.read_text())
+            if not isinstance(loaded, dict):
+                return dict(DEFAULT_STATE)
+            # Merge: fill missing keys with defaults (handles partial/empty states)
+            for key, val in DEFAULT_STATE.items():
+                loaded.setdefault(key, val)
+            return loaded
+    except Exception:
+        pass
+    return dict(DEFAULT_STATE)
 
 def _save_state(state: dict):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
