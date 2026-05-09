@@ -62,6 +62,7 @@ running = True
 start_time: datetime = None
 kline_count = 0
 last_kline_close_time = 0
+last_hist_retry = 0  # 历史K线重试计时器
 PRICE_SNAPSHOT = Path(__file__).parent / "data" / "ws_price_snapshot.json"
 
 
@@ -133,7 +134,7 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
     """K线闭合时运行策略"""
     global kline_count, last_kline_close_time
 
-    if len(df) < 100:
+    if len(df) < 30:
         return
 
     # 最新闭合K线的索引
@@ -350,7 +351,7 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
 
 
 def main():
-    global market_state, ws_client, executor, strategy, alpha_factors, start_time, kline_count
+    global market_state, ws_client, executor, strategy, alpha_factors, start_time, kline_count, last_hist_retry
 
     init_config()
     start_time = datetime.now()
@@ -475,8 +476,8 @@ def main():
                     "datetime": pd.to_datetime(closed.open_time, unit="ms"),
                 }
                 df = pd.DataFrame([row_dict])
-                logger.info(f"🔧 WS 在线构建: df 从第1根K线开始累积")
-                continue  # 先攒够 100 根再跑策略
+                logger.info(f"🔧 WS 在线构建: df 从第1根K线开始累积 (需攒30根, 约7.5h)")
+                continue  # 攒够阈值前不跑策略
 
             # 追加新K线到 DataFrame（用 loc 而非 concat，保留因子列）
             if not df.empty:
@@ -534,7 +535,7 @@ def main():
                     df = df.iloc[-250:]
 
             # 策略
-            if len(df) >= 100:
+            if len(df) >= 30:
                 run_strategy_on_closed_bar(df)
 
         # 3. 心跳
@@ -542,6 +543,18 @@ def main():
             account = executor.get_account()
             logger.info(f"💓 心跳 | 运行: {get_uptime()} | 权益: ${account.total_equity:,.0f} | 交易: {account.total_trades}次 | K线: {kline_count}")
             last_heartbeat = now
+
+        # 4. 历史K线定期重试 (WS-only模式时每5分钟尝试一次, 直到攒够数据)
+        if len(df) < 30 and now - last_hist_retry > 300:
+            last_hist_retry = now
+            logger.info(f"🔄 历史K线重试 (当前 {len(df)}/30 根)...")
+            try:
+                hist_df = fetch_historical_klines()
+                if not hist_df.empty and len(hist_df) > len(df):
+                    df = hist_df
+                    logger.info(f"✅ 历史K线获取成功: {len(df)} 根")
+            except Exception as e:
+                logger.debug(f"历史K线重试失败: {e}")
 
     # 清理
     ws_client.stop()
