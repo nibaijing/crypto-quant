@@ -409,14 +409,27 @@ class OptimizedStrategy:
                 logger.info(f"💰 减仓止盈: {pos_side} | PnL={unrealized_pnl_pct:+.1f}% | 减50%锁定利润")
                 return _build_report("REDUCE")
 
-            # ADD: 浮亏 > 5% 但评分仍超阈值 → 顺势补仓摊低成本
+            # PROFIT_ADD: 浮盈 > 5% 且评分仍强 → 顺势加码 (盈利奔跑)
+            # 条件: 盈利确认方向 + 信号强 + 持仓前半段 + 未达到加仓上限
+            if unrealized_pnl_pct > 5 and pos_addition_count < max_additions:
+                if bars_held < MAX_HOLD_BARS // 2:
+                    # 盈利加仓门槛略放宽 (SIGNAL_THRESHOLD - 0.05): 市场已用盈利确认方向
+                    profit_add_threshold = SIGNAL_THRESHOLD - 0.05
+                    if pos_side == 'long' and long_score_w >= profit_add_threshold:
+                        logger.info(f"🚀 盈利加仓: LONG | PnL={unrealized_pnl_pct:+.1f}% | 评分{long_score_w:.3f} | 顺势加码")
+                        return _build_report("ADD_LONG")
+                    elif pos_side == 'short' and short_score_w >= profit_add_threshold:
+                        logger.info(f"🚀 盈利加仓: SHORT | PnL={unrealized_pnl_pct:+.1f}% | 评分{short_score_w:.3f} | 顺势加码")
+                        return _build_report("ADD_SHORT")
+
+            # LOSS_ADD: 浮亏 > 5% 但评分仍超阈值 → 顺势补仓摊低成本
             if unrealized_pnl_pct < -5 and pos_addition_count < max_additions:
                 if bars_held < MAX_HOLD_BARS // 2:  # 仅在持仓前半段加仓
                     if pos_side == 'long' and long_score_w >= SIGNAL_THRESHOLD:
-                        logger.info(f"📈 加仓信号: LONG | 浮亏{unrealized_pnl_pct:+.1f}% | 评分{long_score_w:.3f}")
+                        logger.info(f"📈 亏损补仓: LONG | 浮亏{unrealized_pnl_pct:+.1f}% | 评分{long_score_w:.3f}")
                         return _build_report("ADD_LONG")
                     elif pos_side == 'short' and short_score_w >= SIGNAL_THRESHOLD:
-                        logger.info(f"📉 加仓信号: SHORT | 浮亏{unrealized_pnl_pct:+.1f}% | 评分{short_score_w:.3f}")
+                        logger.info(f"📉 亏损补仓: SHORT | 浮亏{unrealized_pnl_pct:+.1f}% | 评分{short_score_w:.3f}")
                         return _build_report("ADD_SHORT")
 
         # === 开仓信号 (含 LightGBM 双确认) ===
