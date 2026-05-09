@@ -44,7 +44,7 @@ class BacktestConfig(BaseModel):
 
 class RiskConfig(BaseModel):
     max_total_position_pct: float = 0.5
-    max_single_position_pct: float = 0.2
+    max_single_position_pct: float = 1.0
     max_drawdown_pct: float = 0.15
     max_consecutive_losses: int = 5
     stop_loss_pct: float = 0.03

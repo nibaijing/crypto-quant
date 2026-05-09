@@ -1,0 +1,15 @@
+{
+  "reset_date": "2026-05-09",
+  "daily_calls": 3,
+  "cooldowns": {},
+  "total_decisions": 4,
+  "ai_decisions": 3,
+  "auto_decisions": 0,
+  "fail_memory": null,
+  "recent_trades": [
+    {
+      "pnl": 0.59,
+      "time": "05-09 15:30"
+    }
+  ]
+}

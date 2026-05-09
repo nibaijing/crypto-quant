@@ -57,7 +57,7 @@ class LiveGate:
     SYMBOL_WHITELIST = {"BTC-USDT", "BTC-USDT-SWAP"}
 
     # 以损定仓参数
-    MAX_LOSS_PCT = 0.02        # 单笔最大亏损 ≤ 权益 2%
+    MAX_LOSS_PCT = 1.0         # 单笔最大亏损 ≤ 权益 100%（全仓止损）
     MIN_SIZE = 0.0001          # 最小合约数量
 
     def __init__(self):

@@ -71,7 +71,7 @@ def load_strategy_params() -> dict:
         "RSI_LONG_ENTRY": 35, "RSI_LONG_MAX_ENTRY": 65, "RSI_LONG_EXIT": 75,
         "RSI_SHORT_ENTRY": 55, "RSI_SHORT_MIN_ENTRY": 35, "RSI_SHORT_EXIT": 40,
         "ADX_THRESHOLD": 35, "ATR_STOP_LONG": 1.2, "ATR_STOP_SHORT": 1.5,
-        "MAX_POSITION_PCT": 0.15,
+        "MAX_POSITION_PCT": 1.0,
         "MACD_LONG_THRESHOLD": 20, "MACD_SHORT_THRESHOLD": -20,
         "MAX_HOLD_BARS": 32, "MIN_HOLD_BARS": 4,
     }
@@ -312,7 +312,7 @@ PARAM_BOUNDS = {
     "ADX_THRESHOLD": (25, 50),
     "ATR_STOP_LONG": (1.0, 3.0),
     "ATR_STOP_SHORT": (1.2, 3.5),
-    "MAX_POSITION_PCT": (0.10, 0.35),
+    "MAX_POSITION_PCT": (0.10, 1.0),
     "MACD_LONG_THRESHOLD": (5, 35),
     "MACD_SHORT_THRESHOLD": (-35, -5),
     "MAX_HOLD_BARS": (12, 48),

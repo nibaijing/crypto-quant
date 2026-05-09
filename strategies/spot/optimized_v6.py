@@ -21,7 +21,7 @@ BEST_LONG_MULT = 1.5    # 做多仓位倍数
 BEST_SHORT_MULT = 2.5   # 做空仓位倍数 (做空信号更稀缺, 加倍)
 
 # === 风控参数 ===
-MAX_POSITION_PCT = 0.1  # 最大仓位比例 30%
+MAX_POSITION_PCT = 1.0  # 保证金占权益比例 (1.0 = 全仓)
 ATR_STOP_LONG = 1.0      # 做多 ATR 止损倍数
 ATR_STOP_SHORT = 1.5     # 做空 ATR 止损倍数 (做空更激进)
 MAX_DRAWDOWN_PCT = 0.20  # 最大回撤 20% 熔断
