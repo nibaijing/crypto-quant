@@ -77,9 +77,9 @@ class OptimizedStrategy:
         lows = df['low'].values
         
         # MA 线
-        df['ma_7'] = df['close'].rolling(7).mean()
-        df['ma_25'] = df['close'].rolling(25).mean()
-        df['ma_99'] = df['close'].rolling(99).mean()
+        df['ma_7'] = df['close'].ewm(span=7, adjust=False).mean()    # EMA, 更灵敏
+        df['ma_25'] = df['close'].ewm(span=25, adjust=False).mean()  # EMA
+        df['ma_99'] = df['close'].ewm(span=99, adjust=False).mean()  # EMA
         
         # RSI(14)
         delta = df['close'].diff()

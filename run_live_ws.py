@@ -97,9 +97,9 @@ def fetch_historical_klines() -> pd.DataFrame:
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
 
     if len(df) >= 26:
-        df["ma_7"] = df["close"].rolling(7).mean()
-        df["ma_25"] = df["close"].rolling(25).mean()
-        df["ma_99"] = df["close"].rolling(99).mean()
+        df["ma_7"] = df["close"].ewm(span=7, adjust=False).mean()
+        df["ma_25"] = df["close"].ewm(span=25, adjust=False).mean()
+        df["ma_99"] = df["close"].ewm(span=99, adjust=False).mean()
 
         delta = df["close"].diff()
         gain = delta.where(delta > 0, 0).rolling(14).mean()
@@ -496,9 +496,9 @@ def main():
 
                 # 重算基础指标 + Alpha 因子（增量）
                 if len(df) >= 26:
-                    df["ma_7"] = df["close"].rolling(7).mean()
-                    df["ma_25"] = df["close"].rolling(25).mean()
-                    df["ma_99"] = df["close"].rolling(99).mean()
+                    df["ma_7"] = df["close"].ewm(span=7, adjust=False).mean()
+                    df["ma_25"] = df["close"].ewm(span=25, adjust=False).mean()
+                    df["ma_99"] = df["close"].ewm(span=99, adjust=False).mean()
                     delta = df["close"].diff()
                     gain = delta.where(delta > 0, 0).rolling(14).mean()
                     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
