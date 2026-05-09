@@ -558,7 +558,7 @@ class FuturesExecutor:
     def get_ticker(self, symbol: str) -> Optional[Dict]:
         try:
             binance_symbol = symbol.replace("-", "")
-            url = "https://api.binance.com/api/v3/ticker/price"
+            url = "https://fapi.binance.com/fapi/v1/ticker/price"
             resp = requests.get(url, params={"symbol": binance_symbol}, timeout=5)
             data = resp.json()
             return {
@@ -573,7 +573,8 @@ class FuturesExecutor:
     def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> List[Dict]:
         try:
             binance_symbol = symbol.replace("-", "")
-            url = "https://api.binance.com/api/v3/klines"
+            # 使用期货 API (fapi.binance.com)，与 WS 数据源一致
+            url = "https://fapi.binance.com/fapi/v1/klines"
             resp = requests.get(
                 url,
                 params={"symbol": binance_symbol, "interval": interval, "limit": min(limit, 1000)},
