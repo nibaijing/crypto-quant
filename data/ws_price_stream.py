@@ -15,6 +15,7 @@ Binance WebSocket 实时行情流
 import json
 import time
 import logging
+import ssl
 import threading
 from typing import Optional, Callable, Dict
 from dataclasses import dataclass, field
@@ -283,7 +284,7 @@ class BinanceWebSocket:
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                self.ws.run_forever(ping_interval=30, ping_timeout=10)
+                self.ws.run_forever(sslopt={'context': ssl.create_default_context()}, ping_interval=30, ping_timeout=10)
             except Exception as e:
                 logger.error(f"WebSocket 异常: {e}")
 
