@@ -7,27 +7,22 @@ from pathlib import Path
 
 
 class ExchangeRestConfig(BaseModel):
-    base_url: str = "https://www.okx.com"
-    testnet_url: str = "https://www.okx.com"
+    base_url: str = "https://fapi.binance.com"
     timeout: int = 30
     max_retries: int = 3
     rate_limit: bool = True
 
 
 class ExchangeWsConfig(BaseModel):
-    public_url: str = "wss://ws.okx.com:8443/ws/v5/public"
-    private_url: str = "wss://ws.okx.com:8443/ws/v5/private"
-    testnet_public_url: str = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
-    testnet_private_url: str = "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999"
+    public_url: str = "wss://fstream.binance.com/stream"
     ping_interval: int = 20
 
 
 class ExchangeConfig(BaseModel):
-    name: str = "okx"
+    name: str = "binance"
     testnet: bool = True
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
-    passphrase: Optional[str] = None
     rest: ExchangeRestConfig = ExchangeRestConfig()
     ws: ExchangeWsConfig = ExchangeWsConfig()
 

@@ -104,6 +104,10 @@ class DecisionEngine:
     def __init__(self):
         self.state = _load_state()
         self._reset_daily_if_needed()
+        if self._is_llm_available():
+            _log("info", f"🤖 LLM 可用 ({LLM_MODEL}) — 智能化决策已启用")
+        else:
+            _log("info", "⚠️ LLM 不可用 (无 API KEY / hermes) — 使用规则回退决策")
 
     def _reset_daily_if_needed(self):
         today = datetime.now().strftime("%Y-%m-%d")
@@ -135,20 +139,23 @@ class DecisionEngine:
         """
         self._reset_daily_if_needed()
 
+        # 0. 检测 LLM 是否可用
+        llm_available = self._is_llm_available()
+
         # 1. 平仓信号 — 送 AI 二次确认 (AI 可 override 为 HOLD, 失败则执行原平仓)
         if report.exit_signal:
-            if self._should_call_llm(report):
+            if llm_available and self._should_call_llm(report):
                 return self._call_llm_decide(report, is_exit=True)
-            # 配额耗尽 → 直接执行平仓
-            _log("info", f"🚨 平仓(配额耗尽): {report.exit_signal} | price=${report.price:,.0f}")
+            # LLM 不可用 → 直接执行平仓 (安全优先)
+            _log("info", f"🚨 平仓(直接执行): {report.exit_signal} | price=${report.price:,.0f}")
             return FinalDecision(
                 action=report.exit_signal,
-                source="auto_clear",
-                reasoning=f"Daily LLM quota exhausted, executing exit: {report.exit_signal}",
+                source="risk_management",
+                reasoning=f"LLM unavailable, executing exit: {report.exit_signal}",
                 confidence=1.0,
             )
 
-        # 2. 冷却期 — 不放行 (除非 AI 判断极端行情)
+        # 2. 冷却期 — 不放行
         if report.is_cooldown:
             return FinalDecision(
                 action="HOLD",
@@ -162,11 +169,17 @@ class DecisionEngine:
         if auto:
             return auto
 
-        # 4. 信号模糊 或 HOLD + 高分 → 调 LLM
-        if self._should_call_llm(report):
+        # 4. 信号模糊 → 优先 LLM, LLM 不可用时用规则回退
+        if llm_available and self._should_call_llm(report):
             return self._call_llm_decide(report)
 
-        # 5. 信号弱 → HOLD
+        # 5. LLM 不可用时的规则回退
+        if not llm_available:
+            rule_result = self._rule_based_decide(report)
+            if rule_result:
+                return rule_result
+
+        # 6. 信号弱 → HOLD
         return FinalDecision(
             action="HOLD",
             source="auto_clear",
@@ -208,6 +221,58 @@ class DecisionEngine:
 
         return None
 
+    def _is_llm_available(self) -> bool:
+        """检测 LLM 是否可用 (API key 或 hermes CLI)。"""
+        if DRY_RUN:
+            return False
+        if LLM_API_KEY:
+            return True
+        # Check hermes CLI
+        try:
+            result = subprocess.run(["which", "hermes"], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _rule_based_decide(self, report: SignalReport) -> Optional[FinalDecision]:
+        """LLM 不可用时的规则回退决策。
+
+        覆盖 _should_call_llm 的触发条件 (borderline 信号, HOLD+高分):
+        - exit_signal → 已在外层处理 (直接执行)
+        - HOLD 但某方向高分 → 开仓
+        - 信号分数在边界 → 开仓
+        """
+        reason = None
+
+        # 已有持仓 → 不干预
+        if report.current_position:
+            return None
+
+        # HOLD 但 long_score 高分 → 开多
+        if report.raw_signal == "HOLD":
+            if report.long_score_w >= 0.50 and report.long_score_w > report.short_score_w:
+                reason = f"Rule-based: HOLD but LONG weighted {report.long_score_w:.2f} > SHORT, score OK"
+                _log("info", f"📐 {reason}")
+                return FinalDecision(action="LONG", source="auto_clear", reasoning=reason, confidence=report.long_score_w)
+            if report.short_score_w >= 0.50 and report.short_score_w > report.long_score_w:
+                reason = f"Rule-based: HOLD but SHORT weighted {report.short_score_w:.2f} > LONG, score OK"
+                _log("info", f"📐 {reason}")
+                return FinalDecision(action="SHORT", source="auto_clear", reasoning=reason, confidence=report.short_score_w)
+
+        # 非 HOLD 信号但不够 auto_clear → 按加权分决策
+        if report.long_score_w >= 0.45 and report.long_score_w > report.short_score_w:
+            reason = f"Rule-based: LONG weighted {report.long_score_w:.2f} > {report.short_score_w:.2f}"
+            _log("info", f"📐 {reason}")
+            return FinalDecision(action="LONG", source="auto_clear", reasoning=reason, confidence=report.long_score_w)
+        if report.short_score_w >= 0.45 and report.short_score_w > report.long_score_w:
+            reason = f"Rule-based: SHORT weighted {report.short_score_w:.2f} > {report.long_score_w:.2f}"
+            _log("info", f"📐 {reason}")
+            return FinalDecision(action="SHORT", source="auto_clear", reasoning=reason, confidence=report.short_score_w)
+
+        return None
+
     # ── AI 调判断 ────────────────────────────────────────────────────────
 
     def _should_call_llm(self, report: SignalReport) -> bool:
@@ -220,9 +285,6 @@ class DecisionEngine:
         - 每日限额未超
         """
         if self.state["daily_calls"] >= MAX_DAILY_LLM_CALLS:
-            return False
-
-        if DRY_RUN:
             return False
 
         # 平仓信号 → 始终调 LLM

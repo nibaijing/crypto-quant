@@ -353,19 +353,29 @@ let lastPrice = 0;
 let priceSeries = [];
 let refreshCount = 0;
 let lastRefreshTime = '';
+let pollInterval = 3000;
+let sparklineLen = 0;
+let fetchPending = false;
 
-// ── Fetch ──
-async function fetchData() {
+// ── Async poll loop (chained, waits for response) ──
+async function pollLoop() {
+  if (fetchPending) return;
+  fetchPending = true;
   try {
     const r = await fetch('/api/data?_=' + Date.now());
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
     refreshCount++;
     lastRefreshTime = new Date().toLocaleTimeString();
-    document.getElementById('refresh-info').textContent = `refresh #${refreshCount} @ ${lastRefreshTime}`;
+    document.getElementById('refresh-info').textContent = `#${refreshCount} @ ${lastRefreshTime}`;
+    pollInterval = 3000;
     render(d);
   } catch(e) {
     document.getElementById('ws-status').innerHTML = '<span style="color:var(--red)">✕</span>';
+    pollInterval = Math.min(pollInterval * 1.5, 15000);
   }
+  fetchPending = false;
+  setTimeout(pollLoop, pollInterval);
 }
 
 // ── Render ──
@@ -460,11 +470,14 @@ function render(d) {
     <tr><td class="ind-k">Volatility</td><td class="ind-v">${ind.volatility != null ? ind.volatility.toFixed(2) + '%' : '--'}</td></tr>
   `;
 
-  // Sparkline
+  // Sparkline (only redraw when new data arrives)
   if (p > 0) {
     priceSeries.push(p);
     if (priceSeries.length > 80) priceSeries = priceSeries.slice(-80);
-    drawSparkline(priceSeries);
+    if (priceSeries.length !== sparklineLen) {
+      drawSparkline(priceSeries);
+      sparklineLen = priceSeries.length;
+    }
   }
   lastPrice = p;
 
@@ -494,31 +507,22 @@ function render(d) {
     }).join('\n');
   }
 
-  // Signal log — from recent log lines (via a quick backend fetch)
-  fetchSignalLog();
-}
-
-// ── Signal log from /api/signals ──
-async function fetchSignalLog() {
-  try {
-    const r = await fetch('/api/signals?_=' + Date.now());
-    if (!r.ok) return;  // if endpoint doesn't exist yet, skip silently
-    const signals = await r.json();
-    const sl = document.getElementById('signal-log');
-    document.getElementById('sig-count').textContent = signals.length;
-    if (signals.length === 0) {
-      sl.innerHTML = '<div class="signal-line" style="color:var(--text-dim)">等待K线闭合信号...</div>';
-      document.getElementById('sig-latest').textContent = '--';
-    } else {
-      sl.innerHTML = signals.slice(-40).reverse().map(s => {
-        return '<div class="signal-line"><span class="ts">' + s.time + '</span><span class="sig-' + s.signal + '">' + s.signal + ' @ $' + s.price.toLocaleString() + '</span> <span style="color:var(--text-dim);">Eq=' + (s.equity||0).toLocaleString() + '</span></div>';
-      }).join('\n');
-      const latest = signals[signals.length - 1];
-      if (latest) {
-        document.getElementById('sig-latest').textContent = latest.signal + ' #' + latest.kline;
-      }
+  // Signal log — from /api/data (merged), no separate request needed
+  const signals = d.signals || [];
+  const sl = document.getElementById('signal-log');
+  document.getElementById('sig-count').textContent = signals.length;
+  if (signals.length === 0) {
+    sl.innerHTML = '<div class="signal-line" style="color:var(--text-dim)">等待K线闭合信号...</div>';
+    document.getElementById('sig-latest').textContent = '--';
+  } else {
+    sl.innerHTML = signals.slice(-40).reverse().map(s => {
+      return '<div class="signal-line"><span class="ts">' + s.time + '</span><span class="sig-' + s.signal + '">' + s.signal + ' @ $' + s.price.toLocaleString() + '</span> <span style="color:var(--text-dim);">Eq=' + (s.equity||0).toLocaleString() + '</span></div>';
+    }).join('\n');
+    const latest = signals[signals.length - 1];
+    if (latest) {
+      document.getElementById('sig-latest').textContent = latest.signal + ' #' + latest.kline;
     }
-  } catch(e) {}
+  }
 }
 
 // ── SVG Sparkline ──
@@ -537,7 +541,6 @@ function drawSparkline(series) {
     path += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
   });
 
-  // Gradient fill
   svg.innerHTML = `
     <defs>
       <linearGradient id="grad" x1="0" y1="0" x2="0" y2="1">
@@ -551,12 +554,11 @@ function drawSparkline(series) {
 }
 
 // ── Init ──
-fetchData();
-setInterval(fetchData, 3000);
+pollLoop();
 
-// 独立心跳：每秒更新标题，验证 JS 事件循环存活
+// Title clock (lightweight, no HTTP)
 setInterval(() => {
-  document.title = '📊 ' + new Date().toLocaleTimeString() + ' | CryptoQuant';
+  document.title = new Date().toLocaleTimeString() + ' | CryptoQuant';
 }, 1000);
 </script>
 </body>

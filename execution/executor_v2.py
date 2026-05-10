@@ -240,6 +240,7 @@ class FuturesExecutor:
         equity = self.equity
         trade_value = size * price
         margin = trade_value / self._sim_leverage
+        EPS = 1e-8  # 浮点数精度缓冲
 
         # 1. 反向持仓拦截 (防御层)
         if self._sim_position and self._sim_position.size > 0:
@@ -249,7 +250,7 @@ class FuturesExecutor:
 
         # 2. 单笔上限 — 保证金 ≤ equity × max_single_position_pct
         max_single_margin = equity * self.config.risk.max_single_position_pct
-        if margin > max_single_margin:
+        if margin > max_single_margin + EPS:
             max_trade = max_single_margin * self._sim_leverage
             return False, (
                 f"保证金 ${margin:,.0f} (仓位 ${trade_value:,.0f}) 超过单笔上限 "
@@ -264,7 +265,7 @@ class FuturesExecutor:
         current_margin = current_value / self._sim_leverage if self._sim_leverage > 0 else 0
         total_margin = current_margin + margin
         max_total_margin = equity * self.config.risk.max_total_position_pct
-        if total_margin > max_total_margin:
+        if total_margin > max_total_margin + EPS:
             max_total_trade = max_total_margin * self._sim_leverage
             return False, (
                 f"总保证金 ${total_margin:,.0f} 超过上限 "
@@ -274,7 +275,7 @@ class FuturesExecutor:
 
         # 4. 保证金充足
         available = self._sim_cash * 0.95  # 留5%缓冲
-        if margin > available:
+        if margin > available + EPS:
             return False, f"保证金不足: 需要 ${margin:,.0f} > 可用 ${available:,.0f}"
 
         return True, "通过"
@@ -320,11 +321,15 @@ class FuturesExecutor:
         if size is None:
             size = self._get_max_allowed_size(price)
 
-        # 风控检查
+        # 风控检查 — 超限则自动截断到最大允许仓位
         ok, reason = self._check_risk(symbol, "long", size, price)
         if not ok:
-            logger.warning(f"❌ LONG 风控拒绝: {reason}")
-            return None
+            capped = self._get_max_allowed_size(price)
+            if capped < 0.00005:
+                logger.warning(f"❌ LONG 风控拒绝: {reason} (截断后小于最小仓位)")
+                return None
+            logger.warning(f"⚠️ LONG 仓位截断: {size:.6f} → {capped:.6f} BTC ({reason.split('(')[0].strip()})" if '(' in reason else f"⚠️ LONG 仓位截断: {size:.6f} → {capped:.6f} BTC ({reason})")
+            size = capped
 
         cost = size * price
         margin = cost / self._sim_leverage
@@ -393,11 +398,15 @@ class FuturesExecutor:
         if size is None:
             size = self._get_max_allowed_size(price)
 
-        # 风控检查
+        # 风控检查 — 超限则自动截断到最大允许仓位
         ok, reason = self._check_risk(symbol, "short", size, price)
         if not ok:
-            logger.warning(f"❌ SHORT 风控拒绝: {reason}")
-            return None
+            capped = self._get_max_allowed_size(price)
+            if capped < 0.00005:
+                logger.warning(f"❌ SHORT 风控拒绝: {reason} (截断后小于最小仓位)")
+                return None
+            logger.warning(f"⚠️ SHORT 仓位截断: {size:.6f} → {capped:.6f} BTC ({reason.split('(')[0].strip()})" if '(' in reason else f"⚠️ SHORT 仓位截断: {size:.6f} → {capped:.6f} BTC ({reason})")
+            size = capped
 
         cost = size * price
         margin = cost / self._sim_leverage

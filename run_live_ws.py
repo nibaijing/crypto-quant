@@ -81,7 +81,7 @@ def get_uptime() -> str:
     return f"{delta.days}d {h:02d}:{m:02d}:{s:02d}"
 
 
-def fetch_historical_klines() -> pd.DataFrame:
+def fetch_historical_klines(strategy_obj=None) -> pd.DataFrame:
     """拉取历史200根K线用于策略初始化 (3次重试)"""
     klines = None
     for attempt in range(3):
@@ -97,32 +97,12 @@ def fetch_historical_klines() -> pd.DataFrame:
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
 
     if len(df) >= 26:
-        df["ma_7"] = df["close"].ewm(span=7, adjust=False).mean()
-        df["ma_25"] = df["close"].ewm(span=25, adjust=False).mean()
-        df["ma_99"] = df["close"].ewm(span=99, adjust=False).mean()
-
-        delta = df["close"].diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        df["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1)))
-
-        ema12 = df["close"].ewm(span=12, adjust=False).mean()
-        ema26 = df["close"].ewm(span=26, adjust=False).mean()
-        df["macd"] = ema12 - ema26
-        df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-        df["macd_hist"] = df["macd"] - df["macd_signal"]
-        df["volatility"] = df["close"].pct_change().rolling(20).std()
-        df["volume_ma"] = df["volume"].rolling(20).mean()
-
-        # ADX (简版)
-        tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift(1)).abs(), (df['low'] - df['close'].shift(1)).abs()], axis=1).max(axis=1)
-        atr_14 = tr.rolling(14).mean()
-        plus_dm = ((df['high'].diff() > df['low'].diff() * -1) & (df['high'].diff() > 0)).astype(float) * df['high'].diff()
-        minus_dm = ((df['low'].diff() * -1 > df['high'].diff()) & (df['low'].diff() * -1 > 0)).astype(float) * (-df['low'].diff())
-        plus_di = 100 * plus_dm.rolling(14).mean() / atr_14
-        minus_di = 100 * minus_dm.rolling(14).mean() / atr_14
-        dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1)) * 100
-        df["adx"] = dx.rolling(14).mean()
+        # 使用策略统一的 compute_indicators (单一数据源)
+        if strategy_obj and hasattr(strategy_obj, 'compute_indicators'):
+            df = strategy_obj.compute_indicators(df)
+        else:
+            from strategies.spot.optimized_v6 import OptimizedStrategy
+            df = OptimizedStrategy().compute_indicators(df)
 
         # Alpha 因子集
         df = alpha_factors.compute(df)
@@ -184,6 +164,19 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
     except Exception as e:
         logger.error(f"策略错误: {e}", exc_info=True)
 
+    # === 最大回撤熔断检查 ===
+    if executor.position and strategy.check_max_drawdown(executor.equity):
+        logger.warning(f"🛑 最大回撤超限 ({strat_mod.MAX_DRAWDOWN_PCT:.0%}), 强制平仓")
+        if executor.position.side == "long":
+            executor.sell(symbol, price=close_price)
+            notify_trade("SELL", close_price, f"熔断平多仓(回撤)")
+        elif executor.position.side == "short":
+            executor.short_cover(symbol, price=close_price)
+            notify_trade("COVER", close_price, f"熔断平空仓(回撤)")
+        # 重置峰值以允许后续重新入场
+        strategy.peak_equity = 0
+        return
+
     # === DecisionEngine 决策层 ===
     if report is not None:
         # 注入当前持仓状态, 供 DecisionEngine 感知
@@ -214,54 +207,17 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
     if signal and signal != "HOLD":
         logger.info(f"📡 信号: {signal} | close=${close_price:,.0f}")
 
-        # ── Live Gate（以损定仓 + 集中风控）──
-        from execution.live_gate import get_live_gate
-        gate = get_live_gate()
         pos_side = executor.position.side if executor.position else None
         pos_size = executor.position.size if executor.position else 0
 
         # 计算计划止损价（ATR 动态止损）
         atr_val = float(row.get('atr', 0)) if pd.notna(row.get('atr', 0)) else 0
-        if signal in ("LONG", "SHORT"):
-            if signal == "LONG":
-                stop_loss = close_price - atr_val * strat_mod.ATR_STOP_LONG
-            else:
-                stop_loss = close_price + atr_val * strat_mod.ATR_STOP_SHORT
-        else:
-            stop_loss = 0
-
-        gate_result = None
-        if signal in ("LONG", "SHORT"):
-            gate_result = gate.check(
-                symbol=symbol,
-                side="long" if signal == "LONG" else "short",
-                price=close_price,
-                stop_loss=stop_loss,
-                equity=executor.equity,
-                cash=executor.cash,
-                leverage=executor._sim_leverage,
-                current_position_side=pos_side,
-                current_position_size=pos_size or 0,
-            )
-            if gate_result.passed:
-                logger.info(
-                    f"🚪 Gate 通过: size={gate_result.allowed_size:.6f} BTC | "
-                    f"max_loss=${gate_result.details.get('max_loss', 0):.2f} | "
-                    f"stop=${stop_loss:,.0f}"
-                )
-            else:
-                logger.warning(f"🚫 Gate 拒绝 ({signal}): {gate_result.reason}")
 
         if signal == "LONG" and (not executor.position or executor.position.size == 0):
-            if gate_result and gate_result.passed:
-                gated_size = gate_result.allowed_size
-            else:
-                # Gate 未通过 → 策略层资金管理兜底 (Kelly + 固定比例)
-                gated_size = strategy.get_position_size(
-                    cash=executor.cash, price=close_price,
-                    leverage=executor._sim_leverage, atr=atr_val, side='long'
-                )
-                logger.info(f"🎯 策略兜底仓位: {gated_size:.6f} BTC (Gate未通过)")
+            gated_size = strategy.get_position_size(
+                cash=executor.cash, price=close_price,
+                leverage=executor._sim_leverage, atr=atr_val, side='long'
+            )
             result = executor.buy(symbol, size=gated_size, price=close_price)
             if result:
                 notify_trade("LONG", close_price, f"开多仓 {executor._sim_leverage}x")
@@ -279,14 +235,10 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
                     strategy.last_exit_bar = latest_idx
 
         elif signal == "SHORT" and (not executor.position or executor.position.size == 0):
-            if gate_result and gate_result.passed:
-                gated_size = gate_result.allowed_size
-            else:
-                gated_size = strategy.get_position_size(
-                    cash=executor.cash, price=close_price,
-                    leverage=executor._sim_leverage, atr=atr_val, side='short'
-                )
-                logger.info(f"🎯 策略兜底仓位: {gated_size:.6f} BTC (Gate未通过)")
+            gated_size = strategy.get_position_size(
+                cash=executor.cash, price=close_price,
+                leverage=executor._sim_leverage, atr=atr_val, side='short'
+            )
             result = executor.short_sell(symbol, size=gated_size, price=close_price)
             if result:
                 notify_trade("SHORT", close_price, f"开空仓 {executor._sim_leverage}x")
@@ -406,7 +358,7 @@ def main():
 
     # 拉历史K线初始化策略
     logger.info("预热: 拉取历史K线...")
-    df = fetch_historical_klines()
+    df = fetch_historical_klines(strategy)
     if not df.empty:
         logger.info(f"初始数据: {len(df)} 条K线 | {df['datetime'].min()} ~ {df['datetime'].max()}")
 
@@ -442,21 +394,14 @@ def main():
         live_price = market_state.get_price()
         if live_price > 0:
             executor.update_price("BTC-USDT", live_price)
-            # 无持仓时也定期保存 (供 Dashboard)
-            if not executor.position:
-                if not hasattr(executor, '_dashboard_save'):
-                    executor._dashboard_save = 0
-                if now - executor._dashboard_save > 5:
-                    executor._save_state()
-                    executor._dashboard_save = now
 
-        # 1.5 每秒保存价格快照 (供 Dashboard)
-        if now - last_snapshot > 1.0:
+        # 1.5 每5秒保存价格快照 (供 Dashboard)
+        if now - last_snapshot > 5.0:
             market_state.save_snapshot(str(PRICE_SNAPSHOT))
             last_snapshot = now
 
-        # 每分钟心跳 (证明进程存活)
-        if now - last_minute_log > 60:
+        # 每5分钟心跳 (证明进程存活)
+        if now - last_minute_log > 300:
             k = market_state.get_kline()
             kline_info = f"K:{k.close:.0f}|closed={k.is_closed}" if k else "K:waiting"
             logger.info(f"💚 存活 | ${live_price:,.0f} | {kline_info} | 等待闭合...")
@@ -476,7 +421,7 @@ def main():
                     "datetime": pd.to_datetime(closed.open_time, unit="ms"),
                 }
                 df = pd.DataFrame([row_dict])
-                logger.info(f"🔧 WS 在线构建: df 从第1根K线开始累积 (需攒30根, 约7.5h)")
+                logger.info(f"🔧 WS 在线构建: df 从第1根K线开始累积 (需攒100根, ~25h)")
                 continue  # 攒够阈值前不跑策略
 
             # 追加新K线到 DataFrame（用 loc 而非 concat，保留因子列）
@@ -494,35 +439,12 @@ def main():
                 }
                 df.loc[new_idx] = row_dict
 
-                # 重算基础指标 + Alpha 因子（增量）
+                # 用策略统一的 compute_indicators 重算指标 (单数据源, 避免重复实现)
                 if len(df) >= 26:
-                    df["ma_7"] = df["close"].ewm(span=7, adjust=False).mean()
-                    df["ma_25"] = df["close"].ewm(span=25, adjust=False).mean()
-                    df["ma_99"] = df["close"].ewm(span=99, adjust=False).mean()
-                    delta = df["close"].diff()
-                    gain = delta.where(delta > 0, 0).rolling(14).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                    df["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1)))
-                    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-                    ema26 = df["close"].ewm(span=26, adjust=False).mean()
-                    df["macd"] = ema12 - ema26
-                    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-                    df["macd_hist"] = df["macd"] - df["macd_signal"]
-                    df["volatility"] = df["close"].pct_change().rolling(20).std()
-
-                    # 成交量确认 (修复: 之前遗漏未重算)
-                    df["volume_ma"] = df["volume"].rolling(20).mean()
-                    df["volume_surge"] = df["volume"] > df["volume_ma"] * 1.5
-
-                    # ADX
-                    tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift(1)).abs(), (df['low'] - df['close'].shift(1)).abs()], axis=1).max(axis=1)
-                    atr_14 = tr.rolling(14).mean()
-                    plus_dm = ((df['high'].diff() > df['low'].diff() * -1) & (df['high'].diff() > 0)).astype(float) * df['high'].diff()
-                    minus_dm = ((df['low'].diff() * -1 > df['high'].diff()) & (df['low'].diff() * -1 > 0)).astype(float) * (-df['low'].diff())
-                    plus_di = 100 * plus_dm.rolling(14).mean() / atr_14
-                    minus_di = 100 * minus_dm.rolling(14).mean() / atr_14
-                    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1)) * 100
-                    df["adx"] = dx.rolling(14).mean()
+                    try:
+                        df = strategy.compute_indicators(df)
+                    except Exception as e:
+                        logger.warning(f"指标计算失败: {e}")
 
                     # Alpha 因子增量更新 (重算最后 ~140 行)
                     try:
@@ -534,8 +456,8 @@ def main():
                 if len(df) > 300:
                     df = df.iloc[-250:]
 
-            # 策略
-            if len(df) >= 30:
+            # 策略 (最低 100 根K线, 对应 strategy.on_bar 的硬要求)
+            if len(df) >= 100:
                 run_strategy_on_closed_bar(df)
 
         # 3. 心跳
@@ -545,7 +467,7 @@ def main():
             last_heartbeat = now
 
         # 4. 历史K线定期重试 (WS-only模式时每5分钟尝试一次, 直到攒够数据)
-        if len(df) < 30 and now - last_hist_retry > 300:
+        if len(df) < 100 and now - last_hist_retry > 300:
             last_hist_retry = now
             logger.info(f"🔄 历史K线重试 (当前 {len(df)}/30 根)...")
             try:

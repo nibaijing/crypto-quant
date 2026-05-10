@@ -43,13 +43,13 @@ MACD_SHORT_THRESHOLD = -15 # MACD_hist < -15 确认做空 (15m放宽, 从-25上�
 CONDITION_WEIGHTS = {
     "MA":   0.20,  # 趋势方向
     "MACD": 0.25,  # 动能确认 (核心)
-    "ADX":  0.25,  # 趋势强度 (核心)
+    "ADX":  0.15,  # 趋势强度 — 15m BTC ADX 通常在 15-25 之间
     "Reg":  0.10,  # 市场体制
-    "RSI":  0.10,  # 超买超卖 (辅助 — 趋势中可放宽)
-    "VOL":  0.10,  # 放量确认 (辅助)
+    "RSI":  0.15,  # 超买超卖 (15m 辅助信号权重调高)
+    "VOL":  0.15,  # 放量确认 (重要性提高)
 }
-SIGNAL_THRESHOLD = 0.65  # 加权分 > 0.65 即触发信号 (≈4/6 且核心条件过)
-ADX_THRESHOLD = 35       # ADX 须 > 35 过滤震荡 (15m需要更强趋势)
+SIGNAL_THRESHOLD = 0.60  # 加权分 > 0.60 即触发信号 (ADX权重降低后同步调低)
+ADX_THRESHOLD = 22       # 15m BTC 适用 (实盘ADX通常在16-25波动)
 # 方向判定: MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
 
 
@@ -253,12 +253,16 @@ class OptimizedStrategy:
         # ── 主逻辑 ──
 
         df = bar.get('history')
-        if df is None or len(df) < 100:
-            return _build_report("HOLD")
-
         idx = bar.get('index', -1)
-        if idx < 99:
-            return _build_report("HOLD")
+
+        # 早期退出: 数据不足 → 直接返回 HOLD (不调 _build_report, 避免闭包变量未定义)
+        if df is None or len(df) < 100 or idx < 99:
+            from execution.signals import SignalReport
+            return SignalReport(
+                timestamp=int(bar.get('timestamp', 0)),
+                price=float(bar.get('close', 0)),
+                raw_signal="HOLD",
+            )
 
         # 因子偏向 — 提前初始化 (ATR/MAX_HOLD_BARS 退出也可能引用)
         _factor_bias = None
@@ -287,7 +291,8 @@ class OptimizedStrategy:
         vol_surge = bool(row.get('volume_surge', False))
 
         if np.isnan(rsi_val) or np.isnan(adx_val):
-            return _build_report("HOLD")
+            from execution.signals import SignalReport
+            return SignalReport(price=c, raw_signal="HOLD")
 
         # === Pin Bar 检测 ===
         # 定义: 影线占比 > 50%, 实体占比 < 50% (比 40%/60% 更严格, 减少小碎针误杀)
@@ -396,7 +401,7 @@ class OptimizedStrategy:
             pos_leverage = getattr(pos, 'leverage', 10)
             pos_size = getattr(pos, 'size', 0)
             pos_addition_count = getattr(pos, 'addition_count', 0)
-            max_additions = getattr(executor, 'MAX_ADDITIONS', 2) if executor else 2
+            max_additions = getattr(account, 'MAX_ADDITIONS', 2) if account else 2
 
             # 计算未实现盈亏 (杠杆回报)
             if pos_side == 'long':
@@ -538,6 +543,11 @@ class OptimizedStrategy:
         
         # 基础仓位（保证金占比 × 购买力 × Kelly 乘数）
         base_size = (buying_power * MAX_POSITION_PCT * mult) / price
+        
+        # 硬上限: 保证金不能超过现金 × MAX_POSITION_PCT (executor风控的前提)
+        # margin = size * price / leverage <= cash * MAX_POSITION_PCT
+        max_size = (cash * MAX_POSITION_PCT * leverage) / price
+        base_size = min(base_size, max_size)
         
         # ATR 调整: 高波动降仓位
         if atr > 0 and price > 0:
