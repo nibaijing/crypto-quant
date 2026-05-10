@@ -36,8 +36,8 @@ RSI_LONG_EXIT = 75       # 做多平仓: RSI > 75 (让盈利奔跑)
 RSI_SHORT_ENTRY = 55     # 做空: RSI > 55 (等待更强反弹再介入)
 RSI_SHORT_MIN_ENTRY = 35 # 做空: RSI < 35 拒绝开仓 (拒绝追低)
 RSI_SHORT_EXIT = 40      # 做空平仓: RSI < 40 (持有到超卖区域)
-MACD_LONG_THRESHOLD = 20  # MACD_hist > 15 确认做多 (15m放宽, 从25下调)
-MACD_SHORT_THRESHOLD = -15 # MACD_hist < -15 确认做空 (15m放宽, 从-25上调)
+MACD_LONG_THRESHOLD = 12   # MACD_hist > 12 确认做多 (平衡点: 10太松20太紧)
+MACD_SHORT_THRESHOLD = -10 # MACD_hist < -10 确认做空 (平衡点: -8太松-15太紧)
 # === 信号权重 (加权评分替代硬否决) ===
 # 不再要求 6/6 全过 — 核心条件权重高, RSI/VOL 为辅助
 CONDITION_WEIGHTS = {
@@ -49,7 +49,7 @@ CONDITION_WEIGHTS = {
     "VOL":  0.15,  # 放量确认 (重要性提高)
 }
 SIGNAL_THRESHOLD = 0.60  # 加权分 > 0.60 即触发信号 (ADX权重降低后同步调低)
-ADX_THRESHOLD = 22       # 15m BTC 适用 (实盘ADX通常在16-25波动)
+ADX_THRESHOLD = 18       # 15m BTC 适用 (从22下调, 实盘ADX通常在12-22波动, 18平衡灵敏度和准确度)
 # 方向判定: MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
 
 

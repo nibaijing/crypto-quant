@@ -45,11 +45,11 @@ COOLDOWN_SECONDS = 900            # 同一决策类型15分钟冷却
 DRY_RUN = os.getenv("AI_OVERRIDE_DRY_RUN", "").lower() in ("1", "true", "yes")
 
 # 自动放行阈值 — 策略信号满足度达到此值, 不调 LLM
-AUTO_CLEAR_LONG_THRESHOLD = 0.83   # 5/6
-AUTO_CLEAR_SHORT_THRESHOLD = 0.83
+AUTO_CLEAR_LONG_THRESHOLD = 0.75   # 4.5/6 (从0.83/5/6下调, 配合策略信号阈值)
+AUTO_CLEAR_SHORT_THRESHOLD = 0.75
 
 # AI 主动介入阈值 — HOLD 时某方向达到此值, 调 LLM
-AI_INTERVENE_THRESHOLD = 0.67     # 4/6
+AI_INTERVENE_THRESHOLD = 0.60     # 与策略 SIGNAL_THRESHOLD 对齐 (从0.67下调)
 
 # LLM API
 LLM_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")

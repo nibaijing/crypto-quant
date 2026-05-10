@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from execution.executor_v2 import FuturesExecutor
 from strategies.spot.optimized_v6 import OptimizedStrategy
 import strategies.spot.optimized_v6 as strat_mod
+from execution.ai_override import DecisionEngine
 
 DATA = Path(__file__).parent / "data" / "backtest_btc_15m.csv"
 
@@ -28,27 +29,27 @@ def run_backtest():
     df = strat.compute_indicators(df)
     print("✅ 指标计算完成")
 
-    # 初始化 executor
+    # 初始化 executor + DecisionEngine (规则回退模式, dry_run=1 禁用LLM)
     executor = FuturesExecutor()
     executor.set_leverage(10)
+    os.environ["AI_OVERRIDE_DRY_RUN"] = "1"
+    engine = DecisionEngine()
 
     trades = []
     signal_log = []
     equity_curve = []
 
     n = len(df)
-    COOLDOWN = 4  # 冷却期: 1小时
+    COOLDOWN = 4
     for i in range(100, n):
         row = df.iloc[i]
         close_price = float(row["close"])
 
-        # 动态杠杆
         vol = float(row.get("volatility", 0.003))
         if not np.isnan(vol):
             lev = strat.get_dynamic_leverage(vol)
             executor.set_leverage(lev)
 
-        # 构建 bar
         bar = {
             "timestamp": int(row.get("open_time", 0)),
             "open": float(row["open"]),
@@ -77,21 +78,20 @@ def run_backtest():
                 "bars_held": pos.bars_held,
             })()
 
-        # 更新价格
         executor.update_price("BTC-USDT", close_price)
 
-        # 执行策略
+        # 策略 → DecisionEngine (规则回退) → 最终信号
         signal = None
         try:
-            raw = strat.on_bar(bar, executor)
+            report = strat.on_bar(bar, executor)
             executor.update_bars_held()
-            # on_bar() 返回 SignalReport（新）或 str（旧）
-            if raw is not None:
-                if hasattr(raw, 'raw_signal'):
-                    signal = raw.raw_signal  # SignalReport → 提取信号字符串
-                else:
-                    signal = str(raw)
-        except Exception as e:
+            if report is not None and hasattr(report, 'raw_signal'):
+                if executor.position and executor.position.size > 0:
+                    report.current_position = executor.position.side
+                    report.position_pnl_pct = executor.position.unrealized_pnl_pct
+                decision = engine.decide(report)
+                signal = decision.action
+        except Exception:
             pass
 
         symbol = "BTC-USDT"
