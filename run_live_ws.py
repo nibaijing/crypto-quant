@@ -474,6 +474,15 @@ def main():
                 hist_df = fetch_historical_klines()
                 if not hist_df.empty and len(hist_df) > len(df):
                     df = hist_df
+                    last_row = df.iloc[-1]
+                    init_indicators = {}
+                    for key in ["ma_7", "ma_25", "ma_99", "rsi", "adx", "macd_hist", "volatility"]:
+                        val = last_row.get(key)
+                        if pd.notna(val):
+                            init_indicators[key] = round(float(val), 2) if key != "adx" else round(float(val), 1)
+                    if not init_indicators.get("adx"):
+                        init_indicators["adx"] = 20.0
+                    market_state.set_indicators(init_indicators)
                     logger.info(f"✅ 历史K线获取成功: {len(df)} 根")
             except Exception as e:
                 logger.debug(f"历史K线重试失败: {e}")
