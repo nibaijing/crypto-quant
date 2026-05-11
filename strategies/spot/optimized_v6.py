@@ -431,16 +431,17 @@ class OptimizedStrategy:
 
         # === 风控检查: 持仓时 ===
         if has_position and pos_entry > 0:
-            # ATR 止损（需要有效 ATR）
+            # ATR 止损（需要有效 ATR）— 硬风控，绕过 AI 直接平
             if atr_val > 0:
                 if pos_side == 'long' and c <= pos_entry - atr_val * ATR_STOP_LONG:
                     self.last_exit_bar = idx
-                    return _build_report("SELL", "SELL")
+                    return _build_report("SELL", "EXIT_ATR")
                 elif pos_side == 'short' and c >= pos_entry + atr_val * ATR_STOP_SHORT:
                     self.last_exit_bar = idx
-                    return _build_report("COVER", "COVER")
+                    return _build_report("COVER", "EXIT_ATR")
 
             # 最大持仓时间（不依赖 ATR）
+            # 亏损时发 AI 二次确认（EXIT_TIME），盈利时直接平
             if bars_held >= MAX_HOLD_BARS:
                 if pos_side == 'long':
                     pnl_pct = (c - pos_entry) / pos_entry
@@ -451,17 +452,44 @@ class OptimizedStrategy:
                     logger.info(f"⏰ 最大持仓时间平仓 | bars={bars_held} | PnL={pnl_pct:+.2%}")
                     self.last_exit_bar = idx
                     exit_sig = "SELL" if pos_side == 'long' else "COVER"
-                    return _build_report(exit_sig, exit_sig)
+                    if pnl_pct < 0:
+                        # 亏损: 走 AI 二次确认
+                        return _build_report(exit_sig, "EXIT_TIME")
+                    else:
+                        return _build_report(exit_sig, exit_sig)
 
         # === 平仓信号 ===
         if has_position:
+            # 计算盈亏判断
             if pos_side == 'long':
-                if (rsi_val > RSI_LONG_EXIT and bars_held >= MIN_HOLD_BARS) or (trend_down and strong_trend):
+                pos_pnl = (c - pos_entry) / pos_entry
+            else:
+                pos_pnl = (pos_entry - c) / pos_entry
+            losing = pos_pnl < 0
+
+            if pos_side == 'long':
+                if rsi_val > RSI_LONG_EXIT and bars_held >= MIN_HOLD_BARS:
+                    # RSI 超买平仓
                     self.last_exit_bar = idx
+                    if losing:
+                        return _build_report("SELL", "EXIT_RSI")
+                    return _build_report("SELL", "SELL")
+                if trend_down and strong_trend:
+                    # 趋势反转平仓
+                    self.last_exit_bar = idx
+                    if losing:
+                        return _build_report("SELL", "EXIT_TREND")
                     return _build_report("SELL", "SELL")
             elif pos_side == 'short':
-                if (rsi_val < RSI_SHORT_EXIT and bars_held >= MIN_HOLD_BARS) or (trend_up and strong_trend):
+                if rsi_val < RSI_SHORT_EXIT and bars_held >= MIN_HOLD_BARS:
                     self.last_exit_bar = idx
+                    if losing:
+                        return _build_report("COVER", "EXIT_RSI")
+                    return _build_report("COVER", "COVER")
+                if trend_up and strong_trend:
+                    self.last_exit_bar = idx
+                    if losing:
+                        return _build_report("COVER", "EXIT_TREND")
                     return _build_report("COVER", "COVER")
 
         # === 仓位缩放: 持仓中 (加仓/减仓) ===

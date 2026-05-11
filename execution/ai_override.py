@@ -144,14 +144,36 @@ class DecisionEngine:
         # 0. 检测 LLM 是否可用
         llm_available = self._is_llm_available()
 
-        # 1. 平仓信号 — 送 AI 二次确认 (AI 可 override 为 HOLD, 失败则执行原平仓)
+        # 1. 平仓信号 — 分类型处理
         if report.exit_signal:
-            if llm_available and self._should_call_llm(report):
+            # EXIT_ATR: ATR 止损硬风控，不送 AI，直接执行
+            if report.exit_signal == "EXIT_ATR":
+                exit_action = "SELL" if report.raw_signal == "SELL" else "COVER"
+                _log("info", f"🚨 ATR止损(直接执行): {exit_action} | price=${report.price:,.0f}")
+                return FinalDecision(
+                    action=exit_action,
+                    source="risk_management",
+                    reasoning=f"ATR stop loss triggered",
+                    confidence=1.0,
+                )
+
+            # EXIT_TIME/EXIT_RSI/EXIT_TREND: 亏损时走 AI 二次确认
+            # 不受每日限额限制 — 平仓决策优先
+            if llm_available:
+                # 把 exit_signal 转成可执行的动作
+                exit_map = {"EXIT_TIME": "time", "EXIT_RSI": "rsi", "EXIT_TREND": "trend"}
+                _log("info",
+                     f"🤖 平仓AI审核: {report.exit_signal}({exit_map.get(report.exit_signal,'?')}) "
+                     f"| ${report.price:,.0f} | 日调={self.state['daily_calls']}/{MAX_DAILY_LLM_CALLS}")
                 return self._call_llm_decide(report, is_exit=True)
+
             # LLM 不可用 → 直接执行平仓 (安全优先)
-            _log("info", f"🚨 平仓(直接执行): {report.exit_signal} | price=${report.price:,.0f}")
+            exit_action = report.exit_signal
+            if exit_action in ("EXIT_TIME", "EXIT_RSI", "EXIT_TREND"):
+                exit_action = "SELL" if report.raw_signal == "SELL" else "COVER"
+            _log("info", f"🚨 平仓(直接执行): {exit_action} | price=${report.price:,.0f}")
             return FinalDecision(
-                action=report.exit_signal,
+                action=exit_action,
                 source="risk_management",
                 reasoning=f"LLM unavailable, executing exit: {report.exit_signal}",
                 confidence=1.0,
@@ -551,8 +573,30 @@ class DecisionEngine:
 
     def _build_exit_prompt(self, report: SignalReport, reasons: List[str]) -> str:
         """构建平仓决策提示词 — AI 确认或驳回平仓信号。"""
-        exit_type = report.exit_signal or "SELL"
-        exit_desc = {"SELL": "平多仓 (close long)", "COVER": "平空仓 (close short)"}.get(exit_type, exit_type)
+        raw_exit = report.exit_signal or "SELL"
+        # 映射 EXIT_ 类型到人类可读描述
+        exit_type_map = {
+            "EXIT_TIME": "SELL", "EXIT_RSI": "SELL", "EXIT_TREND": "SELL",
+        }
+        exit_action = exit_type_map.get(raw_exit, raw_exit)
+        # 如果是空头仓位，exit_action 从 raw_signal 判断
+        if raw_exit in ("EXIT_TIME", "EXIT_RSI", "EXIT_TREND"):
+            exit_action = "SELL" if report.raw_signal == "SELL" else "COVER"
+
+        exit_reason_map = {
+            "EXIT_TIME": "⏰ 最大持仓时间到达",
+            "EXIT_RSI": "📊 RSI 超买/超卖信号",
+            "EXIT_TREND": "↘️ 趋势反转 (MA交叉+强ADX)",
+            "SELL": "📊 策略信号",
+            "COVER": "📊 策略信号",
+        }
+        exit_desc = {
+            "SELL": "平多仓 (close long)",
+            "COVER": "平空仓 (close short)",
+        }.get(exit_action, exit_action)
+
+        exit_reason_text = exit_reason_map.get(raw_exit, "策略信号")
+        is_losing = report.position_pnl_pct is not None and report.position_pnl_pct < 0
 
         factor_bias_rule = self._get_factor_bias_rule(report)
         # 平仓场景下: bias 方向与平仓方向冲突时需要特殊提醒
@@ -574,6 +618,8 @@ class DecisionEngine:
         parts = [
             "You are the AI Decision Layer for a crypto quantitative trading system (BTC-USDT perpetual futures, 15-min bars).",
             f"⚠️ EXIT SCENARIO: Strategy layer wants to {exit_desc}.",
+            f"   Reason: {exit_reason_text}",
+            f"   Position PnL: {report.position_pnl_pct:+.1f}%" if report.position_pnl_pct is not None else "   Position PnL: unknown",
             "Your job: confirm the exit or override it (keep the position).",
             "Only override if you have HIGH conviction the position will recover/improve.",
             "When in doubt, respect the strategy exit — safety first.",
@@ -607,11 +653,11 @@ class DecisionEngine:
             *( [factor_bias_rule] if factor_bias_rule else [] ),
             "",  
             "Reply format (choose ONE):",  
-            f"{exit_type}  (confirm exit)",
+f"{exit_action}  (confirm exit)",
             "HOLD    (reject exit, keep position)",  
             "",  
             "One-line reasoning after the decision.",  
-            f"Example: {exit_type} | RSI overbought at 78 with ADX 38 confirming trend exhaustion",  
+f"Example: {exit_action} | RSI overbought at 78 with ADX 38 confirming trend exhaustion",
             "",  
             "Decision:",
         ]
@@ -708,6 +754,10 @@ class DecisionEngine:
             action = "LONG"
         elif re.search(r'\bSHORT\b', first_line):
             action = "SHORT"
+        elif re.search(r'\bSELL\b', first_line):
+            action = "SELL"
+        elif re.search(r'\bCOVER\b', first_line):
+            action = "COVER"
 
         # 提取推理 (第一行中 | 后面的部分)
         reasoning = ""
