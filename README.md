@@ -1,11 +1,11 @@
 # CryptoQuant
 
-> 加密货币合约量化交易系统 — 从回测到实盘，从规则到自进化
+> 加密货币合约量化交易系统 — 对标 Hermes Agent 的七项进化升级
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-CryptoQuant 是一个模块化的加密货币量化交易系统，支持**回测 → 模拟盘 → 实盘**的完整链路。核心策略基于多指标共振（MA + RSI + MACD + ADX），配备 AI 决策覆盖层和策略自进化引擎，让系统越跑越聪明。
+CryptoQuant 是一个模块化的加密货币量化交易系统，支持 **回测 → 模拟盘 → 实盘** 完整链路。核心策略基于多指标共振（MA + RSI + MACD + ADX），配备 AI 决策覆盖层、多源情绪聚合、Polymarket 预测市场管道、长期交易记忆和策略自进化引擎。
 
 ---
 
@@ -30,11 +30,12 @@ CryptoQuant 是一个模块化的加密货币量化交易系统，支持**回测
   │   ┌─────────────────────────▼─────────────────────────┐                    │
   │   │              OptimizedV6 策略引擎                    │                    │
   │   │    MA(7/25/99) + RSI + MACD + ADX + ATR          │                    │
-  │   │    凯利资金管理 + 动态杠杆 (5-15x)                   │                    │
+  │   │    因子偏向 + Pin Bar 过滤 + 加减仓决策              │                    │
   │   └─────────────────────────┬─────────────────────────┘                    │
   │                             │                                               │
   │   ┌─────────────────────────▼─────────────────────────┐                    │
   │   │        DecisionEngine 决策层 (AI + 风控)              │                    │
+  │   │    5源情绪聚合 + Polymarket 预测市场 + 长期记忆        │                    │
   │   │    Factor Bias + Fail Memory + 4 层风控检查          │                    │
   │   └─────────────────────────┬─────────────────────────┘                    │
   │                             │                                               │
@@ -48,17 +49,22 @@ CryptoQuant 是一个模块化的加密货币量化交易系统，支持**回测
          ┌───────────────────────────────┼───────────────────────────────┐
          │                               │                               │
   ┌──────▼──────┐  ┌──────────────┐  ┌──▼──────────┐  ┌─────────────────┐
-  │ 策略自进化    │  │  每日复盘     │  │ AI 自学习     │  │  因子分析       │
-  │ (Evolver)   │  │ (Daily       │  │ (Learning)   │  │  (Factor)      │
-  │ 自动调参     │  │  Review)     │  │ 经验积累     │  │  市场情绪集成    │
-  └─────────────┘  └──────────────┘  └─────────────┘  └─────────────────┘
+  │ 策略自进化    │  │  每日复盘     │  │ 长期记忆      │  │  多源情绪聚合    │
+  │ 三模式切换    │  │ 行为诊断      │  │ TradingMemory│  │ OKX/推特/新闻   │
+  │ 五层防漂移    │  │ 因子分析      │  │ 方向级归因    │  │ Surf/KOL        │
+  └─────────────┘  └──────────────┘  └──────┬───────┘  └────────┬────────┘
+                                           │                    │
+                                  ┌────────▼────────┐  ┌────────▼────────┐
+                                  │ Polymarket 预测   │  │  经验库         │
+                                  │ 三层匹配+自学习   │  │  自学习系统      │
+                                  └─────────────────┘  └─────────────────┘
 ```
 
 ---
 
 ## 核心特性
 
-### 策略引擎 — OptimizedV6
+### 1. 策略引擎 — OptimizedV6
 
 | 组件 | 角色 |
 |------|------|
@@ -69,58 +75,93 @@ CryptoQuant 是一个模块化的加密货币量化交易系统，支持**回测
 | **ATR(14)** | 动态止损止盈，自适应波动 |
 | **凯利公式** | 仓位管理，根据胜率动态调整 |
 | **动态杠杆 (5-15x)** | 高波动降低杠杆，低波动放大 |
+| **Pin Bar 检测** | 冲高回落/探底回升陷阱识别 |
+| **盈利加仓/亏损补仓** | 三层仓位缩放：REDUCE / PROFIT_ADD / LOSS_ADD |
+| **因子偏向** | 44-因子 Alpha 集强制方向匹配 (conf≥0.8) |
 
-### AI 决策覆盖层
+### 2. 多源情绪聚合 (对标推文④)
 
-规则信号触发但处于**模糊边界**时，调用 LLM 进行二次判断：
+打通 5 个低成本情绪来源，聚合为统一情绪分数 (-1.0 ~ +1.0)：
 
-| 触发条件 | 说明 |
-|----------|------|
-| LGB 无意见 | ML 模型不确定但规则有信号 |
-| 连亏后首信号 | 连续亏损 2 次后的第一次信号 |
-| ADX 边缘 (20-25) | 震荡转趋势的模糊区 |
-| 每日前 2 笔 | 开盘阶段谨慎判断 |
-| RSI 近阈值 | 平仓时 RSI 接近但未触及 |
+| 源 | 权重 | 说明 |
+|----|------|------|
+| **OKX Fear & Greed** | 30% | 恐惧贪婪指数 (fallback→alternative.me) |
+| **推特/社交扫描** | 20% | GDELT + GoogleNews 关键词情绪 |
+| **新闻情绪** | 25% | CryptoPanic RSS + Google News |
+| **Surf 社交数据** | 15% | CoinGecko 社区投票 + Reddit 活跃度 |
+| **KOL 记录** | 10% | 本地 JSON 持久化，自动/手动录入 |
 
-- 日限制 ≤ 12 次 LLM 调用
-- 单类型 15 分钟冷却
-- 超时 10 秒降级到原规则
+情绪明细直接注入 AI 决策 prompt，让 LLM 感知市场整体氛围而非只看技术指标。
 
-### 自学习系统
+### 3. Polymarket 预测市场管道 (对标推文②)
 
+三层处理将 Polymarket 变为高权重决策因子：
+
+**Layer 1 — 多维度匹配**
+- ticker 精确匹配 → 内置别名 → `polymarket_aliases.json` → 标题/描述/slug 关键词
+
+**Layer 2 — 分数转换**
 ```
-交易决策 → 决策快照 → 24h 回访验证 → AI 复盘失败案例 → 经验库
-                                                    ↓
-                                            下次决策时检索相关经验
+概率 → 方向判定(问题方向 + 0.5偏移) → 成交量加权 → 截断[-0.6, +0.6]
+→ score≥0.08 = bullish, score≤-0.08 = bearish
 ```
 
-- **决策快照**: 完整记录每次交易的上下文（指标、情绪、资金方向）
-- **回访验证**: 事后验证决策正确性
-- **AI 复盘**: LLM 分析失败原因，提取教训
-- **经验库**: 按 RSI/ADX/宏观环境索引，越跑越丰富
+**Layer 3 — 自学习别名**
+- 匹配成功 → 从 slug 提取项目名 → 自动写回 `polymarket_aliases.json`
 
-### 策略自进化
+### 4. 长期记忆系统 (对标推文⑦)
 
-从每日复盘自动调整策略参数，具备**五层安全防护**防止 AI 路径依赖漂移：
+交易结束后自动记录方向级归因，反向作用后续开仓：
 
-| 层 | 防护机制 | 作用 |
-|---|---|---|
-| **PARAM_BOUNDS** | 硬边界 | 参数永远在安全范围内 (如 ADX 25-50) |
-| **SMOOTH_LIMITS** | 单日跳变限制 | 每天最多 ±3-5，不会剧烈震荡 |
-| **DRIFT_LOCK** | 漂移锁定 | 同一参数连续 3 天同向 → 锁定 1 天 |
-| **DAILY_CAP** | 每日上限 | 每天最多调整 3 个参数 |
-| **AI PROMPT** | 反路径依赖警告 | AI 被明确要求收敛而非单向推进 |
+| 记忆维度 | 内容 | 反向作用 |
+|----------|------|----------|
+| **拖累标的** | 近 7 天亏最多的币 | 仓位 × 0.75 |
+| **弱侧方向** | long/short 哪个更差 | 自动降频 (30/70) |
+| **失败类型** | stop_loss / take_profit / signal | AI prompt 风险提醒 |
+| **进化趋势** | improving / declining / stable | 模式切换依据 |
+| **回撤幅度** | 近 7 天总亏损 | 降权系数 |
 
-- 胜率 < 40% → 收紧信号条件 (不是放松！)
-- 单笔亏损过大 → 降低杠杆 / 收紧止损
-- 多空不对称 → 调整方向偏好权重
-- 外部因子偏置 (conf ≥ 0.8) → 强制 AI 决策匹配偏向方向
+### 5. 三模式策略自进化 (对标推文⑥)
 
-### 每日复盘 + 行为诊断
+| 模式 | 触发条件 | 参数调整 |
+|------|----------|----------|
+| 🛡️ **保守** | 胜率 < 35% 或连亏 ≥ 3 或回撤 > 10% | ADX+5, 缩仓, 收紧止损, 延长冷却 |
+| ⚖️ **均衡** | 正常状态 | 保持当前参数 |
+| ⚔️ **进攻** | 胜率 > 60% 且无连亏, 或 improving | ADX-3, 扩仓, 放宽止损, 缩短冷却 |
 
-- 解析交易日志，配对开平仓
-- 计算胜率、总盈亏、最大回撤
-- 四项行为诊断：处置效应、过度交易、追涨、锚定
+配合五层防漂移：
+1. `PARAM_BOUNDS` — 硬边界 (ADX 25-50)
+2. `SMOOTH_LIMITS` — 单日跳变限制
+3. `DRIFT_LOCK` — 3 天同向锁定
+4. `DAILY_CAP` — 每日最多调整 3 个参数
+5. AI prompt 反路径依赖提醒
+
+### 6. AI 决策覆盖层
+
+规则信号边界模糊时，调用 LLM 进行二次判断，prompt 注入：
+
+- 完整技术指标快照 (RSI/ADX/MACD/MA 排列)
+- 多源情绪聚合 (OKX/推特/新闻/Surf/KOL)
+- Polymarket 预测市场分数
+- 长期记忆 (拖累标的/弱侧/失败类型)
+- Factor bias 强制方向
+- 近期交易记录
+- 历史失败模式
+
+| 参数 | 值 |
+|------|-----|
+| 每日 LLM 调用上限 | 12 次 |
+| 单类型冷却 | 15 分钟 |
+| 超时降级 | 10 秒 → 规则回退 |
+| 自动放行阈值 | ≥75% 条件通过 (long/short) |
+| AI 主动介入阈值 | HOLD 但某方向 ≥60% |
+
+### 7. 回测与验证
+
+- 向量化 15m K 线回测
+- 44-因子 Alpha 集 IC/IR 检验
+- 分层回测 (5-group quantile)
+- LightGBM 方向预测双确认
 
 ---
 
@@ -129,71 +170,48 @@ CryptoQuant 是一个模块化的加密货币量化交易系统，支持**回测
 ```
 crypto_quant/
 ├── main.py                      # CLI 入口：fetch / backtest / list
-├── run_live_ws.py               # 高性能实盘引擎 (WebSocket + SharedState)
+├── run_live_ws.py               # ★ 高性能实盘引擎 (WebSocket + DecisionEngine)
 ├── run_live_okx.py              # OKX 实盘引擎 (REST轮询)
 ├── run_live.py                  # 基础实盘 (兼容旧版)
 │
-├── strategies/                  # 策略层
-│   └── spot/
-│       ├── optimized_v6.py      # ★ 主力策略 (多空双杀 + 动态杠杆)
-│       ├── dual_v5.py           # 双策略长/短分离
-│       ├── ma_rsi_macd.py       # 基础 MA 趋势
-│       └── ma_rsi_v2.py         # MA+RSI 改进版
+├── strategies/spot/
+│   ├── optimized_v6.py          # ★ 主力策略 (多空双杀 + 加减仓 + Pin Bar)
+│   ├── dual_v5.py / bear_v4.py  # 旧版策略
+│   └── ...
 │
-├── execution/                   # 执行层
+├── execution/
 │   ├── executor_v2.py           # 模拟盘执行器 (FuturesExecutor)
 │   ├── okx_executor.py          # OKX 实盘执行器
-│   ├── ai_override.py           # ★ AIOverride 模糊边界决策层
-│   └── signals.py               # 信号处理器
+│   ├── ai_override.py           # ★ DecisionEngine (AI + 情绪 + PM + 风控)
+│   └── signals.py               # SignalReport + FinalDecision 数据模型
 │
-├── core/                        # 基础设施
-│   ├── config.py                # 配置加载 (YAML + 环境变量)
-│   ├── exchange_adapter.py      # OKX API 适配器
-│   └── binance_adapter.py       # Binance API 适配器
+├── data/
+│   ├── ws_price_stream.py       # WebSocket 实时行情 (Binance)
+│   ├── alpha_factors.py         # 44-因子 Alpha 集
+│   ├── sentiment.py             # 市场情绪 (旧版)
+│   ├── sentiment_enhanced.py    # ★ 5源情绪聚合器 (新版)
+│   └── polymarket_scanner.py    # ★ Polymarket 三层扫描
 │
-├── data/                        # 数据层
-│   ├── pipeline.py              # 数据管线 (拉取/存储)
-│   ├── ws_price_stream.py       # WebSocket 实时行情
-│   ├── alpha_factors.py         # 44 因子 Alpha 集
-│   ├── sentiment.py             # 市场情绪数据
-│   └── klines/                  # K线数据存储
+├── learning/
+│   ├── trading_memory.py        # ★ 长期记忆系统 (方向级归因)
+│   ├── decision_snapshot.py     # 决策快照 (旧)
+│   └── self_learning_system.py  # 自学习集成 (旧)
 │
-├── learning/                    # ★ AI 自学习系统
-│   ├── decision_snapshot.py     # 决策快照
-│   ├── verification.py          # 回访验证
-│   ├── ai_reviewer.py           # AI 复盘
-│   ├── experience_db.py         # 经验库
-│   └── self_learning_system.py  # 集成调度
+├── services/
+│   ├── factor_analysis.py       # 因子 IC/IR 检验 + 偏向检测
+│   ├── behavior_diagnosis.py    # 行为诊断
+│   └── ...
 │
-├── services/                    # 服务层
-│   ├── factor_analysis.py       # 因子 IC/IR 检验
-│   └── behavior_diagnosis.py    # 行为诊断 (Disposition/Overtrading等)
-│
-├── ml/                          # 机器学习
+├── ml/
 │   └── lgb_predictor.py         # LightGBM 价格方向预测
 │
-├── monitor/                     # 监控 & 看板
-│   ├── dashboard.py             # 基础看板
-│   ├── dashboard_enhanced.py    # 增强版看板 (HTML)
-│   └── dashboard_server.py      # Web 服务器 (:8899)
+├── monitor/
+│   └── dashboard_server.py      # Web 看板 (:8899)
 │
-├── backtest/                    # 回测引擎
-│   ├── engine.py                # 回测核心
-│   └── reporter.py              # 报告生成
-│
-├── config/
-│   └── settings.yaml            # 全局配置
-│
-├── scripts/                     # 工具脚本
-│   ├── fetch_historical.py      # 历史数据拉取
-│   ├── extract_15m_data.py      # 15m K线提取
-│   └── retrain_lgb.py           # LightGBM 重训练
-│
-├── daily_review.py              # 每日复盘
-├── strategy_evolver.py          # 策略自进化
+├── daily_review.py              # ★ 每日复盘 (含行为诊断 + 因子)
+├── strategy_evolver.py          # ★ 三模式自进化 + 五层防漂移
 ├── notifier.py                  # Telegram 通知
-├── cryptoquant.service          # systemd 服务文件
-└── dashboard_server.py          # 看板服务器入口
+└── cryptoquant.service          # systemd 服务文件
 ```
 
 ---
@@ -214,122 +232,59 @@ cd crypto-quant
 # 安装依赖
 pip install pandas numpy pyyaml requests websocket-client
 
-# 可选：LightGBM 模型
-pip install lightgbm  # 需要 libomp，macOS: brew install libomp
+# 可选：LightGBM 方向预测
+pip install lightgbm
 ```
 
-### 回测
-
-```bash
-# 拉取历史数据
-python main.py fetch --symbols BTC-USDT --timeframe 1H --days 180
-
-# 运行回测
-python main.py backtest --strategy spot --data BTC_USDT_1H.parquet --capital 10000
-```
-
-### 模拟盘 (WebSocket 高性能引擎)
+### 模拟盘运行
 
 ```bash
 # 启动引擎 (Binance WebSocket + 模拟执行)
 python run_live_ws.py
 
-# 另一个终端启动 Dashboard
+# 启动 Dashboard
 python dashboard_server.py
 # 访问 http://localhost:8899
 ```
 
-### systemd 服务 (生产部署)
+### systemd 部署
 
 ```bash
-# 安装服务
-sudo cp cryptoquant.service ~/.config/systemd/user/
+cp cryptoquant.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now crypto-quant.service
-
-# 查看状态
 systemctl --user status crypto-quant.service
-
-# 查看日志
 journalctl --user -u crypto-quant.service -f
 ```
-
----
-
-## 配置
-
-编辑 `config/settings.yaml`：
-
-```yaml
-exchange:
-  name: "okx"
-  testnet: true          # true=模拟盘, false=实盘
-  api_key: ""            # 或设置环境变量 CQ_EXCHANGE__API_KEY
-  api_secret: ""
-  passphrase: ""
-
-backtest:
-  initial_capital: 1000
-  commission: 0.0005
-
-risk:
-  max_position_pct: 0.5
-  max_drawdown_pct: 0.15
-  stop_loss_pct: 0.03
-  max_consecutive_losses: 5
-
-futures:
-  default_leverage: 3
-  max_leverage: 10
-  margin_mode: "isolated"
-```
-
-> API Key 建议使用环境变量，避免提交到 Git。
-
----
-
-## 策略迭代历史
-
-| 版本 | 演进 |
-|------|------|
-| **V1** | 基础 MA 趋势 (MA7/25 金叉死叉) |
-| **V2** | 加入 RSI 超买超卖过滤 |
-| **V3** | 自适应参数 + ATR 动态止损 |
-| **V4** | 网格搜索最优参数 |
-| **V5** | 多空分离策略 (DualV5) |
-| **V6** | ★ 当前主力：MACD双确认 + ADX过滤 + 凯利资金管理 + 动态杠杆 |
 
 ---
 
 ## 风控体系
 
 ### 策略级
-
 - 最大回撤 20% 熔断
-- 连续亏损 5 次暂停
-- 最大持仓 48 根 K 线 (12h)
+- 最大持仓 32 根 K 线 (8h)
 - ADX < 23 震荡市过滤
 - Pin Bar 三级过滤 (LONG/SHORT 陷阱检测)
 - Factor Bias 强制方向匹配 (conf ≥ 0.8)
 
-### 执行级 (模拟盘)
+### 执行级
+- 单笔仓位上限 (保证金 × 购买力)
+- 单标的总仓位上限
+- 余额不足自动缩小仓位重试
+- 反向持仓拦截
 
-- 单笔 ≤ 总权益 20%
-- 总仓位 ≤ 总权益 50%
-- 保证金使用率 ≤ 95% 现金 (留 5% 缓冲)
-- 反向持仓拦截 (持 long 禁开 short et vice versa)
+### 记忆级 (Phase 3)
+- 拖累标的自动降权 (×0.75)
+- 弱侧方向自动降频 (30/70)
+- 连续亏损 → 保守模式
 
-### 账户级 (OKX 实盘)
-
-- 单笔 ≤ 总资金 15%
-- 总仓位 ≤ 50%
-- 保证金使用率 ≤ 80%
-- 强平距离 ≥ 20% 缓冲
-
-### 进化级 (策略自优化)
-
-- 参数硬边界 + 跳变限制 + 漂移锁定 + 每日上限 + AI 反路径依赖提醒
-- 五层防护防止「一条道走到黑」的参数漂移
+### 进化级
+- PARAM_BOUNDS 硬边界
+- SMOOTH_LIMITS 单日跳变
+- DRIFT_LOCK 漂移锁定
+- DAILY_CAP 每日上限
+- AI 反路径依赖提醒
 
 ---
 
@@ -337,19 +292,8 @@ futures:
 
 - API Key 不入库 (`.gitignore` 已配置)
 - 使用环境变量存储敏感信息
-- 实盘前务必模拟盘充分测试
-- 建议 OKX API 设置 IP 白名单
-- **免责声明**: 本系统仅供学习研究，不构成投资建议。量化交易存在亏损风险。
-
----
-
-## 待办
-
-- [ ] OKX 实盘接入（等胜率 80%+）
-- [ ] WebSocket 引擎直连 OKX
-- [ ] 多币种支持
-- [ ] 策略热切换
-- [ ] 移动端看板
+- OKX API 设置 IP 白名单
+- **免责声明**: 本系统仅供学习研究，不构成投资建议
 
 ---
 
