@@ -122,6 +122,116 @@ SMOOTH_LIMITS = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 三模式配置 (推文⑥: 保守 / 均衡 / 进攻)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class EvolverMode:
+    """自进化模式 — 根据长期记忆 & 复盘结果自动选择"""
+    CONSERVATIVE = "conservative"  # 回撤中 / 连续亏损 → 收紧一切
+    BALANCED = "balanced"          # 正常状态 → 当前行为
+    AGGRESSIVE = "aggressive"      # 连续盈利 / 趋势明确 → 放宽适当收紧
+
+    @staticmethod
+    def detect(review: dict, memory_state: dict = None) -> str:
+        """根据复盘数据和长期记忆检测当前应使用的模式
+
+        Parameters
+        ----------
+        review : dict
+            每日复盘报告
+        memory_state : dict or None
+            TradingMemory.get_state() 的结果 (可选)
+
+        Returns
+        -------
+        "conservative" | "balanced" | "aggressive"
+        """
+        s = review.get("summary", {})
+        l = review.get("loss_analysis", {})
+        win_rate = s.get("win_rate", 50)
+        total_trades = s.get("total_trades", 0)
+        consecutive = l.get("consecutive_losses", 0)
+        max_loss = abs(l.get("max_loss", 0))
+
+        # 使用长期记忆
+        if memory_state:
+            evo_trend = memory_state.get("evo_trend", "stable")
+            drawdown = memory_state.get("recent_drawdown", 0)
+            weak_side = memory_state.get("weak_side", "neutral")
+        else:
+            evo_trend = "stable"
+            drawdown = 0.0
+            weak_side = "neutral"
+
+        # 保守条件:
+        # - 胜率 < 35%
+        # - 连续亏损 >= 3
+        # - 单笔亏损 > 80%
+        # - memory 显示 declining + drawdown > 10
+        # - memory weak_side 明确且连续亏损
+        conservative_conditions = [
+            total_trades >= 5 and win_rate < 35,
+            consecutive >= 3,
+            max_loss > 80,
+            evo_trend == "declining" and drawdown > 10,
+        ]
+        if sum(conservative_conditions) >= 2:
+            return EvolverMode.CONSERVATIVE
+
+        # 进攻条件:
+        # - 胜率 > 60% + 至少5笔交易
+        # - 无连续亏损 (consecutive < 2)
+        # - memory 显示 improving
+        # - 无大额亏损
+        aggressive_conditions = [
+            total_trades >= 5 and win_rate > 60 and consecutive < 2,
+            evo_trend == "improving" and drawdown < 5,
+        ]
+        if sum(aggressive_conditions) >= 1:
+            return EvolverMode.AGGRESSIVE
+
+        return EvolverMode.BALANCED
+
+
+# 各模式的参数调整幅度
+MODE_ADJUSTMENTS = {
+    EvolverMode.CONSERVATIVE: {
+        "adx_delta": 5,           # 提高ADX(更严格)
+        "macd_long_delta": 5,     # 提高MACD多阈(更严格)
+        "macd_short_delta": -5,   # 降低MACD空阈(更严格)
+        "atr_long_delta": -0.3,   # 收紧ATR止损多
+        "atr_short_delta": -0.3,  # 收紧ATR止损空
+        "position_delta": -0.1,   # 缩小仓位
+        "rsi_long_delta": 3,      # RSI多入口提高(更难触发)
+        "rsi_short_delta": -3,    # RSI空入口降低(更难触发)
+        "cooling_mult": 1.5,      # 冷却期延长
+    },
+    EvolverMode.BALANCED: {
+        "adx_delta": 0,
+        "macd_long_delta": 0,
+        "macd_short_delta": 0,
+        "atr_long_delta": 0,
+        "atr_short_delta": 0,
+        "position_delta": 0,
+        "rsi_long_delta": 0,
+        "rsi_short_delta": 0,
+        "cooling_mult": 1.0,
+    },
+    EvolverMode.AGGRESSIVE: {
+        "adx_delta": -3,          # 降低ADX(更敏感)
+        "macd_long_delta": -3,    # 降低MACD多阈(更容易触发多)
+        "macd_short_delta": 3,    # 提高MACD空阈(更容易触发空)
+        "atr_long_delta": 0.2,    # 放宽ATR止损多
+        "atr_short_delta": 0.2,   # 放宽ATR止损空
+        "position_delta": 0.1,    # 扩大仓位
+        "rsi_long_delta": -2,     # RSI多入口降低(更容易多)
+        "rsi_short_delta": 2,     # RSI空入口提高(更容易空)
+        "cooling_mult": 0.7,      # 缩短冷却期
+    },
+}
+
+
 def compute_evolved_params(review: dict, current: dict) -> dict:
     """根据复盘报告计算优化后的参数"""
     evolved = dict(current)
@@ -136,7 +246,49 @@ def compute_evolved_params(review: dict, current: dict) -> dict:
 
     changes = []
 
-    # Rule 1: 胜率太低 → 提高 ADX (更严格的趋势过滤)
+    # ═══════ 模式检测 (推文⑥) ═══════
+    # 加载长期记忆状态 (如果有)
+    memory_state = None
+    try:
+        from learning.trading_memory import TradingMemory
+        tm = TradingMemory()
+        ms = tm.get_memory_state()
+        memory_state = {
+            "evo_trend": ms.evo_trend,
+            "recent_drawdown": ms.recent_drawdown,
+            "weak_side": ms.weak_side,
+        }
+    except Exception:
+        pass
+
+    # 检测当前模式
+    current_mode = EvolverMode.detect(review, memory_state)
+    adjustments = MODE_ADJUSTMENTS.get(current_mode, MODE_ADJUSTMENTS[EvolverMode.BALANCED])
+
+    # 应用模式基准调参
+    evolved["ADX_THRESHOLD"] = max(25, min(50,
+        evolved.get("ADX_THRESHOLD", 35) + adjustments["adx_delta"]))
+    evolved["MACD_LONG_THRESHOLD"] = max(5, min(40,
+        evolved.get("MACD_LONG_THRESHOLD", 15) + adjustments["macd_long_delta"]))
+    evolved["MACD_SHORT_THRESHOLD"] = max(-40, min(-5,
+        evolved.get("MACD_SHORT_THRESHOLD", -15) + adjustments["macd_short_delta"]))
+    evolved["ATR_STOP_LONG"] = max(0.8, min(3.0,
+        evolved.get("ATR_STOP_LONG", 1.5) + adjustments["atr_long_delta"]))
+    evolved["ATR_STOP_SHORT"] = max(1.0, min(3.5,
+        evolved.get("ATR_STOP_SHORT", 2.0) + adjustments["atr_short_delta"]))
+    evolved["MAX_POSITION_PCT"] = max(0.10, min(0.50,
+        evolved.get("MAX_POSITION_PCT", 0.25) + adjustments["position_delta"]))
+    evolved["RSI_LONG_ENTRY"] = max(20, min(45,
+        evolved.get("RSI_LONG_ENTRY", 35) + adjustments["rsi_long_delta"]))
+    evolved["RSI_SHORT_ENTRY"] = max(40, min(65,
+        evolved.get("RSI_SHORT_ENTRY", 55) + adjustments["rsi_short_delta"]))
+
+    mode_labels = {"conservative": "🛡️保守", "balanced": "⚖️均衡", "aggressive": "⚔️进攻"}
+    changes.append(f"模式: {mode_labels.get(current_mode, current_mode)} | "
+                   f"ADX{'±' if adjustments['adx_delta']==0 else ('+' if adjustments['adx_delta']>0 else '')}{adjustments['adx_delta']} "
+                   f"POS{'±' if adjustments['position_delta']==0 else ('+' if adjustments['position_delta']>0 else '')}{adjustments['position_delta']:.0%}")
+
+    # ═══════ 现有规则 (基于模式基准进一步微调) ═══════
     if total_trades >= 5 and win_rate < 40:
         evolved["ADX_THRESHOLD"] = min(evolved.get("ADX_THRESHOLD", 35) + 5, 45)
         changes.append(f"ADX+5 → {evolved['ADX_THRESHOLD']} (提高趋势门槛)")

@@ -60,6 +60,18 @@ class SignalReport:
     factor_bias: dict = field(default_factory=lambda: {"bias": "neutral", "confidence": 0.0, "active_factors": []})
     # 因子偏向: 当 confidence ≥ 0.8 时强制 AI 匹配方向
 
+    # === Sentiment (多源情绪聚合, Phase 1) ===
+    sentiment_score: float = 0.0       # -1.0 ~ +1.0 (多源聚合)
+    sentiment_label: str = "neutral"    # strong_bearish | bearish | neutral | bullish | strong_bullish
+    sentiment_confidence: float = 0.0   # 0.0~1.0
+    sentiment_details: str = ""         # TG展示用 多行文本
+
+    # === Polymarket (预测市场, Phase 2) ===
+    polymarket_score: float = 0.0       # -0.6 ~ +0.6 (聚合后)
+    polymarket_label: str = "neutral"    # bullish | bearish | neutral
+    polymarket_confidence: float = 0.0   # 0.0~1.0
+    polymarket_details: str = ""         # 匹配的市场明细
+
     def to_dict(self) -> dict:
         return asdict(self)
 

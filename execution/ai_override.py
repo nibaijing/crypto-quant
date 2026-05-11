@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from execution.signals import SignalReport, FinalDecision
+from learning.trading_memory import TradingMemory
 
 logger = logging.getLogger("CryptoQuant.DecisionEngine")
 
@@ -104,6 +105,7 @@ class DecisionEngine:
     def __init__(self):
         self.state = _load_state()
         self._reset_daily_if_needed()
+        self._memory = TradingMemory()
         if self._is_llm_available():
             _log("info", f"🤖 LLM 可用 ({LLM_MODEL}) — 智能化决策已启用")
         else:
@@ -438,6 +440,64 @@ class DecisionEngine:
             line += f" (Driven by: {', '.join(active[:3])})"
         return line
 
+    def _get_sentiment_context(self, report: SignalReport) -> str:
+        """构建多源情绪上下文，注入 AI 决策 prompt"""
+        score = getattr(report, 'sentiment_score', 0.0)
+        label = getattr(report, 'sentiment_label', 'neutral')
+        conf = getattr(report, 'sentiment_confidence', 0.0)
+        details = getattr(report, 'sentiment_details', '')
+
+        if conf < 0.01:
+            return "(sentiment data not available, treating as neutral)"
+
+        emoji = "🟢" if score > 0.1 else ("🔴" if score < -0.1 else "⚪")
+        lines = [
+            f"{emoji} Sentiment: {score:+.2f} ({label}, confidence={conf:.0%})",
+        ]
+        # 从 sentiment_details 中提取各来源明细
+        if details:
+            for line in details.split("\n"):
+                line = line.strip()
+                if line and not line.startswith("⚪") and "情绪=" not in line:
+                    lines.append(f"  {line}")
+
+        # 情绪与策略方向的冲突检测
+        if conf > 0.5:
+            fb = getattr(report, 'factor_bias', {}) or {}
+            factor_bias = fb.get("bias", "neutral")
+            if score > 0.3 and factor_bias == "short_bias":
+                lines.append("  ⚠️ CONFLICT: Bullish sentiment vs short-bias factor — proceed with caution")
+            elif score < -0.3 and factor_bias == "long_bias":
+                lines.append("  ⚠️ CONFLICT: Bearish sentiment vs long-bias factor — proceed with caution")
+
+        return "\n".join(lines)
+
+    def _get_polymarket_context(self, report: SignalReport) -> str:
+        """构建 Polymarket 预测市场上下文"""
+        pm_score = getattr(report, 'polymarket_score', 0.0)
+        pm_label = getattr(report, 'polymarket_label', 'neutral')
+        pm_conf = getattr(report, 'polymarket_confidence', 0.0)
+        pm_details = getattr(report, 'polymarket_details', '')
+
+        if pm_conf < 0.01:
+            return "(Polymarket prediction data not available)"
+
+        emoji = "🟢" if pm_score > 0.05 else ("🔴" if pm_score < -0.05 else "⚪")
+        lines = [
+            f"{emoji} Polymarket: {pm_score:+.3f} ({pm_label}, conf={pm_conf:.0%})",
+        ]
+        if pm_details:
+            lines.append(f"  Markets: {pm_details[:150]}")
+
+        # PM 与策略方向的冲突提醒
+        if pm_conf > 0.3 and abs(pm_score) > 0.08:
+            if pm_score > 0:
+                lines.append("  → Polymarket predicts UP: consider favoring LONG, avoiding going against it for SHORT")
+            else:
+                lines.append("  → Polymarket predicts DOWN: consider favoring SHORT, avoiding going against it for LONG")
+
+        return "\n".join(lines)
+
     # ── Prompt 构建 ──────────────────────────────────────────────────────
 
     def _build_decision_prompt(self, report: SignalReport, reasons: List[str]) -> str:
@@ -453,8 +513,17 @@ class DecisionEngine:
             "",
             report.to_ai_context(),
             "",
+            "## Sentiment & Market Context",
+            self._get_sentiment_context(report),
+            "",
+            "## Polymarket Prediction",
+            self._get_polymarket_context(report),
+            "",
             "## Recent Trades",
             self._get_recent_trades_context(),
+            "",
+            "## Long-term Memory",
+            self._memory.get_state_for_ai(),
             "",
             "## Failure Memory",
             self._get_fail_memory_context(),
@@ -511,8 +580,17 @@ class DecisionEngine:
             "",
             report.to_ai_context(),
             "",
+            "## Sentiment & Market Context",
+            self._get_sentiment_context(report),
+            "",
+            "## Polymarket Prediction",
+            self._get_polymarket_context(report),
+            "",
             "## Recent Trades",
             self._get_recent_trades_context(),
+            "",
+            "## Long-term Memory",
+            self._memory.get_state_for_ai(),
             "",
             "## Exit Context",  
             f"- Exit Type: {exit_desc}",
@@ -652,17 +730,34 @@ class DecisionEngine:
 
     MAX_TRADE_HISTORY = 5  # 注入 AI prompt 的最近交易数
 
-    def update_trade_result(self, pnl: float):
-        """交易结束后记录盈亏，供 AI 下次决策参考。"""
+    def update_trade_result(self, pnl: float, symbol: str = "BTC-USDT",
+                                side: str = "long", exit_reason: str = "signal",
+                                leverage: int = 10):
+        """交易结束后记录盈亏，供 AI 下次决策参考。
+
+        同时写入 TradingMemory (长期记忆, 方向归因)
+        """
+        # 短期记忆 (已有)
         history = self.state.setdefault("recent_trades", [])
         history.append({
             "pnl": round(pnl, 2),
             "time": datetime.now().strftime("%m-%d %H:%M"),
+            "symbol": symbol,
+            "side": side,
         })
-        # 只保留最近 N 笔
         if len(history) > self.MAX_TRADE_HISTORY:
             history[:] = history[-self.MAX_TRADE_HISTORY:]
         self.state["total_decisions"] = self.state.get("total_decisions", 0) + 1
+
+        # 长期记忆 (TradingMemory)
+        self._memory.record_trade(
+            symbol=symbol,
+            side=side,
+            pnl_pct=pnl,
+            exit_reason=exit_reason,
+            leverage=leverage,
+        )
+
         _save_state(self.state)
 
     def _get_recent_trades_context(self) -> str:

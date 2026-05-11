@@ -12,6 +12,7 @@ OptimizedV6 — 自动优化交易策略
 import numpy as np
 import pandas as pd
 import logging
+import time
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,7 @@ BEST_SHORT_MULT = 2.5   # 做空仓位倍数 (做空信号更稀缺, 加倍)
 
 # === 风控参数 ===
 MAX_POSITION_PCT = 1.0  # 保证金占权益比例 (1.0 = 全仓)
-ATR_STOP_LONG = 1.0      # 做多 ATR 止损倍数
+ATR_STOP_LONG = 1.4      # 做多 ATR 止损倍数
 ATR_STOP_SHORT = 1.5     # 做空 ATR 止损倍数 (做空更激进)
 MAX_DRAWDOWN_PCT = 0.20  # 最大回撤 20% 熔断
 MAX_HOLD_BARS = 32       # 最大持仓K线数 (8小时)
@@ -33,7 +34,7 @@ COOLDOWN_BARS = 1         # 平仓后至少等1根K线，防AI反复开平
 RSI_LONG_ENTRY = 35      # 做多: RSI < 35 (深度回调介入, 更安全)
 RSI_LONG_MAX_ENTRY = 65  # 做多: RSI > 65 拒绝开仓 (拒绝追高)
 RSI_LONG_EXIT = 75       # 做多平仓: RSI > 75 (让盈利奔跑)
-RSI_SHORT_ENTRY = 55     # 做空: RSI > 55 (等待更强反弹再介入)
+RSI_SHORT_ENTRY = 52     # 做空: RSI > 55 (等待更强反弹再介入)
 RSI_SHORT_MIN_ENTRY = 35 # 做空: RSI < 35 拒绝开仓 (拒绝追低)
 RSI_SHORT_EXIT = 40      # 做空平仓: RSI < 40 (持有到超卖区域)
 MACD_LONG_THRESHOLD = 12   # MACD_hist > 12 确认做多 (平衡点: 10太松20太紧)
@@ -49,7 +50,7 @@ CONDITION_WEIGHTS = {
     "VOL":  0.15,  # 放量确认 (重要性提高)
 }
 SIGNAL_THRESHOLD = 0.60  # 加权分 > 0.60 即触发信号 (ADX权重降低后同步调低)
-ADX_THRESHOLD = 18       # 15m BTC 适用 (从22下调, 实盘ADX通常在12-22波动, 18平衡灵敏度和准确度)
+ADX_THRESHOLD = 23       # 15m BTC 适用 (从22下调, 实盘ADX通常在12-22波动, 18平衡灵敏度和准确度)
 # 方向判定: MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
 
 
@@ -219,6 +220,20 @@ class OptimizedStrategy:
             else:
                 adx_trend = "flat"
 
+            # ── 情绪聚合 (Phase 1) ──
+            sentiment_data = _sentiment_aggregated if _sentiment_aggregated else {}
+            sentiment_score = sentiment_data.get("sentiment_score", 0.0)
+            sentiment_label = sentiment_data.get("sentiment_label", "neutral")
+            sentiment_confidence = sentiment_data.get("sentiment_confidence", 0.0)
+            sentiment_details = sentiment_data.get("sentiment_details", "")
+
+            # ── Polymarket (Phase 2) ──
+            pm_data = _polymarket_agg if _polymarket_agg else {}
+            pm_score = pm_data.get("pm_score", 0.0)
+            pm_label = pm_data.get("pm_label", "neutral")
+            pm_confidence = pm_data.get("pm_confidence", 0.0)
+            pm_details = pm_data.get("pm_details", "")
+
             return SignalReport(
                 timestamp=int(row.get('timestamp', 0)),
                 price=c,
@@ -248,6 +263,16 @@ class OptimizedStrategy:
                 is_pinbar=is_pinbar,
                 pinbar_direction=pinbar_direction,
                 factor_bias=_factor_bias or {"bias": "neutral", "confidence": 0.0, "active_factors": []},
+                # Phase 1: 情绪
+                sentiment_score=sentiment_score,
+                sentiment_label=sentiment_label,
+                sentiment_confidence=sentiment_confidence,
+                sentiment_details=sentiment_details,
+                # Phase 2: Polymarket
+                polymarket_score=pm_score,
+                polymarket_label=pm_label,
+                polymarket_confidence=pm_confidence,
+                polymarket_details=pm_details,
             )
 
         # ── 主逻辑 ──
@@ -271,6 +296,49 @@ class OptimizedStrategy:
             _factor_bias = get_active_factor_bias()
         except Exception:
             _factor_bias = {"bias": "neutral", "confidence": 0.0, "active_factors": []}
+
+        # ── 情绪聚合 (Phase 1) — 5分钟缓存, 不阻塞K线主循环 ──
+        _sentiment_aggregated = None
+        try:
+            if not hasattr(self, '_sentiment_cache_age'):
+                self._sentiment_cache_age = 0
+            # 每5分钟重新聚合一次
+            if time.time() - self._sentiment_cache_age > 300:
+                from data.sentiment_enhanced import EnhancedSentimentAggregator
+                agg = EnhancedSentimentAggregator()
+                _sentiment_aggregated = agg.to_trading_signal()
+                self._sentiment_cache_age = time.time()
+                logger.info(f"情感更新: {_sentiment_aggregated.get('sentiment_score', 0.0):+.3f}")
+            else:
+                # 用缓存 — 从全局变量或上次结果读取 (简化: 直接用上次的)
+                _sentiment_aggregated = getattr(self, '_cached_sentiment', None)
+        except Exception as exc:
+            logger.debug(f"情感聚合跳过: {exc}")
+            _sentiment_aggregated = getattr(self, '_cached_sentiment', None)
+
+        if _sentiment_aggregated:
+            self._cached_sentiment = _sentiment_aggregated
+
+        # ── Polymarket 聚合 (Phase 2) — 10分钟缓存 ──
+        _polymarket_agg = None
+        try:
+            if not hasattr(self, '_pm_cache_age'):
+                self._pm_cache_age = 0
+            if time.time() - self._pm_cache_age > 600:
+                from data.polymarket_scanner import PolymarketScanner
+                scanner = PolymarketScanner(symbol="BTC")
+                _polymarket_agg = scanner.aggregate_for_trading()
+                self._pm_cache_age = time.time()
+                self._cached_pm = _polymarket_agg
+                logger.info(f"PM更新: score={_polymarket_agg.get('pm_score', 0.0):+.3f}")
+            else:
+                _polymarket_agg = getattr(self, '_cached_pm', None)
+        except Exception as exc:
+            logger.debug(f"PM聚合跳过: {exc}")
+            _polymarket_agg = getattr(self, '_cached_pm', None)
+
+        if _polymarket_agg:
+            self._cached_pm = _polymarket_agg
 
         # 计算指标 (如果还没算)
         if 'rsi' not in df.columns or 'adx' not in df.columns:
