@@ -41,7 +41,7 @@ STATE_FILE = PROJECT / "data" / "decision_engine_state.json"
 
 # ── 配置 ────────────────────────────────────────────────────────────────
 LLM_TIMEOUT_SECONDS = 12
-MAX_DAILY_LLM_CALLS = 12
+MAX_DAILY_LLM_CALLS = 9999   # 无限制 (原12, 用户要求日内不限配额)
 COOLDOWN_SECONDS = 900            # 同一决策类型15分钟冷却
 DRY_RUN = os.getenv("AI_OVERRIDE_DRY_RUN", "").lower() in ("1", "true", "yes")
 
@@ -357,10 +357,11 @@ class DecisionEngine:
 
         if result is None:
             if is_exit:
-                _log("warn", f"LLM 调用失败, 执行原平仓: {report.exit_signal}")
-                return FinalDecision(action=report.exit_signal or "SELL",
+                fallback_action = self._map_exit_to_action(report)
+                _log("warn", f"LLM 调用失败, 执行平仓: {fallback_action}")
+                return FinalDecision(action=fallback_action,
                                      source="auto_clear",
-                                     reasoning=f"LLM failed, fallback to exit: {report.exit_signal}",
+                                     reasoning=f"LLM failed, fallback to exit: {fallback_action}",
                                      confidence=1.0)
             _log("warn", "LLM 调用失败, fallback HOLD")
             return FinalDecision(action="HOLD", source="auto_clear",
@@ -379,10 +380,35 @@ class DecisionEngine:
         # 平仓场景: AI 可输出 SELL/COVER(确认平仓) 或 HOLD(驳回), 不允许 LONG/SHORT
         if is_exit:
             if action not in ("SELL", "COVER", "HOLD"):
-                action = report.exit_signal or "SELL"
+                action = self._map_exit_to_action(report)
         else:
             if action not in ("LONG", "SHORT", "HOLD"):
                 action = "HOLD"
+
+        # ── code-level hard constraints ──
+        # factor_bias: 置信度 ≥ 0.8 时强制绑定方向
+        fb = getattr(report, 'factor_bias', {}) or {}
+        if fb.get("confidence", 0) >= 0.8 and not is_exit:
+            bias = fb.get("bias", "")
+            if bias == "short_bias" and action == "LONG":
+                _log("warn", f"🔒 force override: AI said LONG but short-bias active (conf={fb['confidence']:.0%}), forcing SHORT")
+                action = "SHORT"
+                reasoning = "Overridden by short-bias hard constraint: " + reasoning[:130]
+            elif bias == "long_bias" and action == "SHORT":
+                _log("warn", f"🔒 force override: AI said SHORT but long-bias active (conf={fb['confidence']:.0%}), forcing LONG")
+                action = "LONG"
+                reasoning = "Overridden by long-bias hard constraint: " + reasoning[:130]
+
+        # pinbar 方向阻断: bearish pinbar → 禁止 LONG; bullish pinbar → 禁止 SHORT
+        if hasattr(report, 'is_pinbar') and report.is_pinbar:
+            if report.pinbar_direction == "bearish" and action == "LONG":
+                _log("warn", f"🔒 force override: AI said LONG but bearish pin bar active, forcing HOLD")
+                action = "HOLD"
+                reasoning = "Overridden by bearish pin bar hard constraint: " + reasoning[:130]
+            elif report.pinbar_direction == "bullish" and action == "SHORT":
+                _log("warn", f"🔒 force override: AI said SHORT but bullish pin bar active, forcing HOLD")
+                action = "HOLD"
+                reasoning = "Overridden by bullish pin bar hard constraint: " + reasoning[:130]
 
         emoji = "🚨" if is_exit and action != "HOLD" else ("✅" if action != "HOLD" else "⏸️")
         _log("info", f"{emoji} AI决策: {action} | "
@@ -604,12 +630,12 @@ class DecisionEngine:
         bias_exit_conflict = ""
         if fb.get("confidence", 0) >= 0.8:
             bias = fb.get("bias", "")
-            if bias == "long_bias" and exit_type == "SELL":
+            if bias == "long_bias" and exit_action == "SELL":
                 bias_exit_conflict = (
                     f"- 🚨 FACTOR_BIAS CONFLICT: Strong long-bias disagrees with SELL exit. "
                     "Reject (HOLD) unless reversal evidence is definitive."
                 )
-            elif bias == "short_bias" and exit_type == "COVER":
+            elif bias == "short_bias" and exit_action == "COVER":
                 bias_exit_conflict = (
                     f"- 🚨 FACTOR_BIAS CONFLICT: Strong short-bias disagrees with COVER exit. "
                     "Reject (HOLD) unless reversal evidence is definitive."
@@ -621,8 +647,9 @@ class DecisionEngine:
             f"   Reason: {exit_reason_text}",
             f"   Position PnL: {report.position_pnl_pct:+.1f}%" if report.position_pnl_pct is not None else "   Position PnL: unknown",
             "Your job: confirm the exit or override it (keep the position).",
-            "Only override if you have HIGH conviction the position will recover/improve.",
-            "When in doubt, respect the strategy exit — safety first.",
+            "Only confirm the exit if you have clear reversal evidence (volume confirmation, decisive technical breakdown).",
+            "Default to rejecting (HOLD) — exits without strong confirmation tend to be premature in this market.",
+            "The strategy exit signal is a suggestion, not a command. You are the final judge.",
             "",
             report.to_ai_context(),
             "",
@@ -645,9 +672,9 @@ class DecisionEngine:
             "",
             "## Rules",  
             "- Say SELL (for long exit) or COVER (for short exit) to confirm the strategy exit.",
-            "- Say HOLD to REJECT the exit — only if you are highly confident the position will be profitable.",
+            "- Say HOLD to REJECT the exit — you are the final judge and should not let a marginal exit signal close a good position.",
             "- Consider: Is this a real reversal or a temporary pullback? Is volume confirming?",  
-            "- Overriding an exit is RISKY. Default to confirming unless evidence is strong.",
+            "- Overriding an exit takes no special confidence — simply judge if this exit is convincing or not. Reject unconvincing exits.",
             "- RSI extreme + ADX confirming trend → likely real exit. RSI mild + low ADX → possible fakeout.",
             *( [bias_exit_conflict] if bias_exit_conflict else [] ),
             *( [factor_bias_rule] if factor_bias_rule else [] ),
@@ -662,6 +689,16 @@ f"Example: {exit_action} | RSI overbought at 78 with ADX 38 confirming trend exh
             "Decision:",
         ]
         return "\n".join(parts)
+
+    def _map_exit_to_action(self, report: SignalReport) -> str:
+        """把 exit_signal 映射到可执行动作 (SELL/COVER)。"""
+        raw = report.exit_signal or "SELL"
+        mapping = {"EXIT_TIME": "SELL", "EXIT_RSI": "SELL", "EXIT_TREND": "SELL"}
+        action = mapping.get(raw, raw)
+        if raw in ("EXIT_TIME", "EXIT_RSI", "EXIT_TREND"):
+            action = "SELL" if report.raw_signal == "SELL" else "COVER"
+        return action
+
 
     # ── LLM 调用 ────────────────────────────────────────────────────────
 
@@ -687,11 +724,16 @@ f"Example: {exit_action} | RSI overbought at 78 with ADX 38 confirming trend exh
         return None
 
     def _call_openai_api(self, prompt: str) -> Optional[dict]:
+        # System message 强制 LLM 只输出一个词（推理模型不输出思考过程）
+        system_msg = {
+            "role": "system",
+            "content": "You are a trading bot. Output ONLY one word: LONG, SHORT, HOLD, SELL, or COVER. No explanations, no punctuation, no thinking. Never output anything else."
+        }
         payload = json.dumps({
             "model": LLM_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 200,
-            "temperature": 0.2,
+            "messages": [system_msg, {"role": "user", "content": prompt}],
+            "max_tokens": 50,
+            "temperature": 0.1,
         })
 
         try:
@@ -743,36 +785,48 @@ f"Example: {exit_action} | RSI overbought at 78 with ADX 38 confirming trend exh
         return None
 
     def _parse_decision(self, text: str) -> Optional[dict]:
-        """从 LLM 输出中提取决策。"""
-        text_clean = text.strip()
+        """从 LLM 输出中提取决策。
 
-        # 提取第一行
-        first_line = text_clean.split("\n")[0].strip().upper()
+        由于 system message 强制只输出一个词，text 大概率只有 "LONG/SHORT/HOLD/SELL/COVER"。
+        但推理模型可能无视 system msg 输出整段思考，做全文搜索兜底。
+        confidence 正则做了边界校验，防止 10000% 这种异常值。
+        """
+        text_clean = text.strip().upper()
 
-        action = "HOLD"
-        if re.search(r'\bLONG\b', first_line):
-            action = "LONG"
-        elif re.search(r'\bSHORT\b', first_line):
-            action = "SHORT"
-        elif re.search(r'\bSELL\b', first_line):
-            action = "SELL"
-        elif re.search(r'\bCOVER\b', first_line):
-            action = "COVER"
+        # 全文搜索所有关键词，按优先级取第一个匹配
+        # 优先级：LONG/SHORT > SELL/COVER > HOLD
+        for kw, action in [("SELL", "SELL"), ("COVER", "COVER"),
+                           ("LONG", "LONG"), ("SHORT", "SHORT"),
+                           ("HOLD", "HOLD")]:
+            if re.search(rf'\b{kw}\b', text_clean):
+                action = kw
+                break
+        else:
+            action = "HOLD"
 
-        # 提取推理 (第一行中 | 后面的部分)
+        # 提取推理（取第一个 | 后面的内容，或第二行）
         reasoning = ""
-        if "|" in text_clean.split("\n")[0]:
-            reasoning = text_clean.split("\n")[0].split("|", 1)[1].strip()
-        elif len(text_clean.split("\n")) > 1:
-            reasoning = text_clean.split("\n")[1].strip()[:150]
+        lines = text_clean.split("\n")
+        first_line = lines[0].strip()
+        if "|" in first_line:
+            reasoning = first_line.split("|", 1)[1].strip()
+        elif len(lines) > 1:
+            reasoning = lines[1].strip()[:150]
         else:
             reasoning = "No reasoning provided"
 
-        # 置信度 (如果有)
+        # 置信度 — 加边界校验，[0.0, 1.0] 区间
         confidence = 0.7
         conf_match = re.search(r'confidence[=:]\s*([\d.]+)', text_clean, re.IGNORECASE)
         if conf_match:
-            confidence = float(conf_match.group(1))
+            try:
+                val = float(conf_match.group(1))
+                if 0.0 <= val <= 1.0:
+                    confidence = val
+                else:
+                    _log("debug", f"confidence value {val} out of range [0,1], using default 0.7")
+            except ValueError:
+                pass
 
         return {"action": action, "reasoning": reasoning[:200], "confidence": confidence}
 

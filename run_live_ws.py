@@ -287,6 +287,12 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
     status.append(f"K#{kline_count}")
 
     logger.info(f"📊 {' | '.join(status)}")
+
+    # 策略决策日志 (for daily_log.py parsing)
+    # 记录决策来源: risk/auto/ai/HOLD
+    if decision is not None and decision.source:
+        logger.info(f"📋 DECISION: action={decision.action} source={decision.source} "
+                    f"confidence={decision.confidence:.2f} price=${close_price:,.0f}")
     last_kline_close_time = time.time()
 
     # 更新 Dashboard 指标

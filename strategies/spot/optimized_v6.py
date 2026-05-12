@@ -49,8 +49,10 @@ CONDITION_WEIGHTS = {
     "RSI":  0.15,  # 超买超卖 (15m 辅助信号权重调高)
     "VOL":  0.15,  # 放量确认 (重要性提高)
 }
-SIGNAL_THRESHOLD = 0.60  # 加权分 > 0.60 即触发信号 (ADX权重降低后同步调低)
+SIGNAL_THRESHOLD = 0.65  # 加权分 > 0.65 即触发信号 (上调: 减少震荡期假信号)
 ADX_THRESHOLD = 23       # 15m BTC 适用 (从22下调, 实盘ADX通常在12-22波动, 18平衡灵敏度和准确度)
+# 震荡过滤: ADX < 此值时不开新仓 (仅对开仓生效, 持仓中仍可平仓/加减)
+ADX_NO_TRADE = 15        # ADX < 15 为强震荡市, 不开新仓
 # 方向判定: MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
 
 
@@ -460,6 +462,8 @@ class OptimizedStrategy:
 
         # === 平仓信号 ===
         if has_position:
+            # 震荡市: ADX<25 时抬升最小持仓K线数, 减少过早平仓
+            chop_hold_bars = 8 if adx_val < 25 else MIN_HOLD_BARS
             # 计算盈亏判断
             if pos_side == 'long':
                 pos_pnl = (c - pos_entry) / pos_entry
@@ -468,7 +472,7 @@ class OptimizedStrategy:
             losing = pos_pnl < 0
 
             if pos_side == 'long':
-                if rsi_val > RSI_LONG_EXIT and bars_held >= MIN_HOLD_BARS:
+                if rsi_val > RSI_LONG_EXIT and bars_held >= chop_hold_bars:
                     # RSI 超买平仓
                     self.last_exit_bar = idx
                     if losing:
@@ -481,7 +485,7 @@ class OptimizedStrategy:
                         return _build_report("SELL", "EXIT_TREND")
                     return _build_report("SELL", "SELL")
             elif pos_side == 'short':
-                if rsi_val < RSI_SHORT_EXIT and bars_held >= MIN_HOLD_BARS:
+                if rsi_val < RSI_SHORT_EXIT and bars_held >= chop_hold_bars:
                     self.last_exit_bar = idx
                     if losing:
                         return _build_report("COVER", "EXIT_RSI")
@@ -569,9 +573,17 @@ class OptimizedStrategy:
                         local_threshold -= 0.08
                         logger.debug(f"🎯 long_bias(conf={bias['confidence']}): LONG threshold→{local_threshold:.2f}")
 
-            # 用加权分判定信号
-            short_signal = short_score_w >= local_threshold
-            long_signal = long_score_w >= local_threshold
+            # 震荡过滤: ADX < ADX_NO_TRADE 且 regime=neutral 时不开新仓
+            # ADX 低 = 没有趋势, regime neutral = 方向不明确 → 交易就是送手续费
+            is_choppy = adx_val < ADX_NO_TRADE and regime == "neutral"
+            if is_choppy:
+                logger.info(f"⏸️ ADX={adx_val:.0f}<{ADX_NO_TRADE} + neutral regime → 震荡市不开新仓")
+                short_signal = False
+                long_signal = False
+            else:
+                # 用加权分判定信号
+                short_signal = short_score_w >= local_threshold
+                long_signal = long_score_w >= local_threshold
 
             # Pin bar 方向阻断: 冲突方信号降级
             if pinbar_block_long:
