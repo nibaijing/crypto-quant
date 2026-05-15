@@ -22,13 +22,13 @@ BEST_LONG_MULT = 1.5    # 做多仓位倍数
 BEST_SHORT_MULT = 2.5   # 做空仓位倍数 (做空信号更稀缺, 加倍)
 
 # === 风控参数 ===
-MAX_POSITION_PCT = 1.0  # 保证金占权益比例 (1.0 = 全仓)
-ATR_STOP_LONG = 1.4      # 做多 ATR 止损倍数
+MAX_POSITION_PCT = 0.95  # 保证金占权益比例 (1.0 = 全仓)
+ATR_STOP_LONG = 1.8      # 做多 ATR 止损倍数
 ATR_STOP_SHORT = 1.5     # 做空 ATR 止损倍数 (做空更激进)
 MAX_DRAWDOWN_PCT = 0.20  # 最大回撤 20% 熔断
 MAX_HOLD_BARS = 32       # 最大持仓K线数 (8小时)
 MIN_HOLD_BARS = 4        # 最小持仓K线数 (前4根K线不能RSI平仓, ATR止损除外)
-COOLDOWN_BARS = 1         # 平仓后至少等1根K线，防AI反复开平
+COOLDOWN_BARS = 8         # 平仓后至少等2小时，防反复开平止损
 
 # === 信号阈值 ===
 RSI_LONG_ENTRY = 35      # 做多: RSI < 35 (深度回调介入, 更安全)
@@ -50,7 +50,7 @@ CONDITION_WEIGHTS = {
     "VOL":  0.15,  # 放量确认 (重要性提高)
 }
 SIGNAL_THRESHOLD = 0.65  # 加权分 > 0.65 即触发信号 (上调: 减少震荡期假信号)
-ADX_THRESHOLD = 23       # 15m BTC 适用 (从22下调, 实盘ADX通常在12-22波动, 18平衡灵敏度和准确度)
+ADX_THRESHOLD = 30       # 15m BTC 适用 (从22下调, 实盘ADX通常在12-22波动, 18平衡灵敏度和准确度)
 # 震荡过滤: ADX < 此值时不开新仓 (仅对开仓生效, 持仓中仍可平仓/加减)
 ADX_NO_TRADE = 15        # ADX < 15 为强震荡市, 不开新仓
 # 方向判定: MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
@@ -478,8 +478,8 @@ class OptimizedStrategy:
                     if losing:
                         return _build_report("SELL", "EXIT_RSI")
                     return _build_report("SELL", "SELL")
-                if trend_down and strong_trend:
-                    # 趋势反转平仓
+                if trend_down and strong_trend and adx_val > 45 and bars_held >= 4:
+                    # 趋势反转平仓 — ADX>45 且持仓≥4根K线才触发，防止短K被晃下车
                     self.last_exit_bar = idx
                     if losing:
                         return _build_report("SELL", "EXIT_TREND")
@@ -490,7 +490,7 @@ class OptimizedStrategy:
                     if losing:
                         return _build_report("COVER", "EXIT_RSI")
                     return _build_report("COVER", "COVER")
-                if trend_up and strong_trend:
+                if trend_up and strong_trend and adx_val > 45 and bars_held >= 4:
                     self.last_exit_bar = idx
                     if losing:
                         return _build_report("COVER", "EXIT_TREND")
@@ -581,9 +581,19 @@ class OptimizedStrategy:
                 short_signal = False
                 long_signal = False
             else:
-                # 用加权分判定信号
-                short_signal = short_score_w >= local_threshold
-                long_signal = long_score_w >= local_threshold
+                # RSI 强否决: RSI 超买时禁止 LONG, 超卖时禁止 SHORT
+                rsi_blocks_long = rsi_val > RSI_LONG_MAX_ENTRY   # RSI>65 禁止做多
+                rsi_blocks_short = rsi_val < RSI_SHORT_MIN_ENTRY  # RSI<35 禁止做空
+                if rsi_blocks_long:
+                    logger.info(f"⛔ RSI={rsi_val:.0f}>{RSI_LONG_MAX_ENTRY} → 超买区禁止做多")
+                    long_signal = False
+                else:
+                    long_signal = long_score_w >= local_threshold
+                if rsi_blocks_short:
+                    logger.info(f"⛔ RSI={rsi_val:.0f}<{RSI_SHORT_MIN_ENTRY} → 超卖区禁止做空")
+                    short_signal = False
+                else:
+                    short_signal = short_score_w >= local_threshold
 
             # Pin bar 方向阻断: 冲突方信号降级
             if pinbar_block_long:

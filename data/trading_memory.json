@@ -1,0 +1,244 @@
+{
+  "trades": [
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -1.52,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778544911.4883215
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -2.44,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778549414.6623974
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "short",
+      "pnl_pct": -0.43,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778555713.9631896
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": 2.61,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778560213.0036254
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -0.45,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778564713.549757
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "short",
+      "pnl_pct": 5.03,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778573714.4683366
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "short",
+      "pnl_pct": -0.6,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778579115.0212195
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -0.93,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778581811.640242
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": 1.18,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778586313.398871
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": 0.41,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778589917.4253972
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "short",
+      "pnl_pct": 6.05,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778599828.469808
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": 0.6,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778602518.3984594
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -3.14,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778605215.536036
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": 2.67,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778607013.6665523
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": 0.16,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778608814.7219625
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": 2.0,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778611511.3999488
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": 0.07,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778617811.8011842
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -2.44,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778629513.1066551
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "short",
+      "pnl_pct": -3.79,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778634912.1254494
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -0.02,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778641214.8721378
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -1.11,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778657410.1709778
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -3.35,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778668211.538994
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -4.69,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778730310.1383078
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": 1.12,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778743817.2798715
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -2.62,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778755512.4699452
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": 13.69,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778770812.6096907
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -2.68,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778781613.142751
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": -3.99,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778803209.8826756
+    },
+    {
+      "symbol": "BTC-USDT",
+      "side": "long",
+      "pnl_pct": 0.03,
+      "exit_reason": "signal",
+      "leverage": 10,
+      "timestamp": 1778832011.841803
+    }
+  ],
+  "state": {
+    "top_drag_symbol": "BTC-USDT",
+    "weak_side": "neutral",
+    "common_failure": "signal",
+    "evo_trend": "improving",
+    "last_updated": 1778832011.8422983,
+    "recent_drawdown": 0.0
+  }
+}

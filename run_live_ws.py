@@ -29,8 +29,7 @@ import numpy as np
 
 from core.config import init_config
 from execution.executor_v2 import FuturesExecutor, LiveAccount, LivePosition, LiveOrder
-from execution.ai_override import get_decision_engine
-from execution.signals import SignalReport, FinalDecision
+from execution.signals import SignalReport
 from strategies.spot.optimized_v6 import OptimizedStrategy
 import strategies.spot.optimized_v6 as strat_mod
 from data.ws_price_stream import SharedMarketState, BinanceWebSocket, create_price_stream
@@ -177,29 +176,9 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
         strategy.peak_equity = 0
         return
 
-    # === DecisionEngine 决策层 ===
+    # === 决策: 直接使用策略信号 ===
     if report is not None:
-        # 注入当前持仓状态, 供 DecisionEngine 感知
-        if executor.position and executor.position.size > 0:
-            report.current_position = executor.position.side
-            report.position_pnl_pct = executor.position.unrealized_pnl_pct
-        engine = get_decision_engine()
-        decision = engine.decide(report)
-
-        # 最终决策
-        final_action = decision.action
-        if decision.source == "risk_management":
-            logger.info(f"🚨 风控平仓: {final_action} | reason={decision.reasoning[:60]}")
-        elif decision.source == "auto_clear":
-            if final_action != "HOLD":
-                logger.info(f"⚡ 自动放行: {final_action} | confidence={decision.confidence:.0%} | {decision.reasoning[:60]}")
-            else:
-                logger.debug(f"⏸️ 决策引擎: HOLD | {decision.reasoning[:60]}")
-        elif decision.source == "ai_decision":
-            logger.info(f"{'✅' if final_action != 'HOLD' else '⏸️'} AI决策: {final_action} | "
-                       f"confidence={decision.confidence:.0%} | {decision.reasoning[:80]}")
-    else:
-        final_action = "HOLD"
+        final_action = report.raw_signal or "HOLD"
 
     # 执行信号
     signal = final_action  # 保持变量名兼容
@@ -228,9 +207,6 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
             result = executor.sell(symbol, price=close_price)
             if result:
                 notify_trade("SELL", close_price, f"平多仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
-                engine = get_decision_engine()
-                engine.update_trade_result(pnl_pct, symbol=symbol, side="long", exit_reason="signal", leverage=lev)
-                # 同步策略冷却状态，防止同一根K线内AI反复开仓
                 if hasattr(strategy, 'last_exit_bar'):
                     strategy.last_exit_bar = latest_idx
 
@@ -249,8 +225,6 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
             result = executor.short_cover(symbol, price=close_price)
             if result:
                 notify_trade("COVER", close_price, f"平空仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
-                engine = get_decision_engine()
-                engine.update_trade_result(pnl_pct, symbol=symbol, side="short", exit_reason="signal", leverage=lev)
                 if hasattr(strategy, 'last_exit_bar'):
                     strategy.last_exit_bar = latest_idx
 

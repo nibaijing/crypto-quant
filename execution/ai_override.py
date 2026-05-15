@@ -100,114 +100,79 @@ def _save_state(state: dict):
 
 
 class DecisionEngine:
-    """AI 决策层 — 从策略信号到最终执行决策"""
+    """独立决策引擎 — 接收 SignalReport → 输出 FinalDecision。
 
-    def __init__(self):
+    流程:
+      1. 风控平仓 (exit_signal) → 直接放行
+      2. 冷却期 → 不放行
+      3. auto_clear → 策略信号直通 (raw_signal)
+      4. 自动放行 (极强信号) → 不调 LLM
+      5. LLM 调用 → 模糊信号/高分 HOLD
+      6. 规则回退 → LLM 不可用时
+    """
+
+    def __init__(self, llm_api_key: str = ""):
+        self._state_path = STATE_FILE
         self.state = _load_state()
-        self._reset_daily_if_needed()
-        self._memory = TradingMemory()
-        if self._is_llm_available():
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.llm_api_key = llm_api_key or LLM_API_KEY or ""
+        self._memory = TradingMemory(self.state.get("fail_memory"))
+
+        # 是否启用了轻量模式 (无 AI 配额限制)
+        self.llm_available = self._is_llm_available()
+        if self.llm_available:
             _log("info", f"🤖 LLM 可用 ({LLM_MODEL}) — 智能化决策已启用")
         else:
-            _log("info", "⚠️ LLM 不可用 (无 API KEY / hermes) — 使用规则回退决策")
+            _log("warn", "⚠️ LLM 不可用 — 仅规则自动放行")
 
-    def _reset_daily_if_needed(self):
-        today = datetime.now().strftime("%Y-%m-%d")
-        if not self.state.get("reset_date"):
-            self.state["reset_date"] = today
-            _save_state(self.state)
-            return
-        if self.state.get("reset_date") != today:
-            self.state["daily_calls"] = 0
-            self.state["reset_date"] = today
-            self.state["cooldowns"] = {}
-            _save_state(self.state)
-            _log("info", "每日决策状态重置")
-
-    # ── 主入口 ──────────────────────────────────────────────────────────
+    # ── 主入口 ────────────────────────────────────────────────────────────
 
     def decide(self, report: SignalReport) -> FinalDecision:
-        """
-        主决策入口。
+        """主决策入口 — if/else chain 代替 switch (Python 3.10- 兼容)。"""
 
-        Parameters
-        ----------
-        report : SignalReport
-            策略层输出的结构化信号报告
-
-        Returns
-        -------
-        FinalDecision
-        """
-        self._reset_daily_if_needed()
-
-        # 0. 检测 LLM 是否可用
-        llm_available = self._is_llm_available()
-
-        # 1. 平仓信号 — 分类型处理
-        if report.exit_signal:
-            # EXIT_ATR: ATR 止损硬风控，不送 AI，直接执行
-            if report.exit_signal == "EXIT_ATR":
-                exit_action = "SELL" if report.raw_signal == "SELL" else "COVER"
-                _log("info", f"🚨 ATR止损(直接执行): {exit_action} | price=${report.price:,.0f}")
-                return FinalDecision(
-                    action=exit_action,
-                    source="risk_management",
-                    reasoning=f"ATR stop loss triggered",
-                    confidence=1.0,
-                )
-
-            # EXIT_TIME/EXIT_RSI/EXIT_TREND: 亏损时走 AI 二次确认
-            # 不受每日限额限制 — 平仓决策优先
-            if llm_available:
-                # 把 exit_signal 转成可执行的动作
-                exit_map = {"EXIT_TIME": "time", "EXIT_RSI": "rsi", "EXIT_TREND": "trend"}
-                _log("info",
-                     f"🤖 平仓AI审核: {report.exit_signal}({exit_map.get(report.exit_signal,'?')}) "
-                     f"| ${report.price:,.0f} | 日调={self.state['daily_calls']}/{MAX_DAILY_LLM_CALLS}")
-                return self._call_llm_decide(report, is_exit=True)
-
-            # LLM 不可用 → 直接执行平仓 (安全优先)
-            exit_action = report.exit_signal
-            if exit_action in ("EXIT_TIME", "EXIT_RSI", "EXIT_TREND"):
-                exit_action = "SELL" if report.raw_signal == "SELL" else "COVER"
-            _log("info", f"🚨 平仓(直接执行): {exit_action} | price=${report.price:,.0f}")
+        # 0. 风控平仓直接放行 (EXIT_ATR / EXIT_TIME)
+        if report.exit_signal in ("EXIT_ATR", "EXIT_TIME"):
+            action = "SELL" if report.exit_signal == "EXIT_ATR" or report.raw_signal in ("SELL", "SHORT") else "COVER"
+            if report.raw_signal in ("SELL", "COVER"):
+                action = report.raw_signal
+            elif report.exit_signal == "EXIT_TIME":
+                action = "SELL" if report.raw_signal in ("SELL", "SHORT") else "COVER"
+            _log("info", f"🚨 风控平仓(直通): {action} | {report.exit_signal} | price=${report.price:,.0f}")
             return FinalDecision(
-                action=exit_action,
+                action=action,
                 source="risk_management",
-                reasoning=f"LLM unavailable, executing exit: {report.exit_signal}",
+                reasoning=f"Strategy exit: {report.exit_signal} (AI disabled)",
                 confidence=1.0,
             )
 
-        # 2. 冷却期 — 不放行
+        # 1. 冷却期 — 不放行
         if report.is_cooldown:
             return FinalDecision(
-                action="HOLD",
-                source="auto_clear",
-                reasoning="Cooldown period active",
-                confidence=1.0,
+                action="HOLD", source="auto_clear",
+                reasoning="Cooldown period active", confidence=1.0,
             )
 
-        # 3. 信号极清晰 → 自动放行
-        auto = self._auto_clear(report)
-        if auto:
-            return auto
+        # 2. 开仓信号直通策略层
+        if report.raw_signal == "LONG":
+            _log("info", f"⚡ 策略开多(直通): score={report.long_score:.0%} | ${report.price:,.0f}")
+            return FinalDecision(
+                action="LONG", source="auto_clear",
+                reasoning=f"Strategy LONG signal (AI disabled, {report.long_score:.0%}/{report.short_score:.0%})",
+                confidence=report.long_score,
+            )
+        if report.raw_signal == "SHORT":
+            _log("info", f"⚡ 策略开空(直通): score={report.short_score:.0%} | ${report.price:,.0f}")
+            return FinalDecision(
+                action="SHORT", source="auto_clear",
+                reasoning=f"Strategy SHORT signal (AI disabled, {report.short_score:.0%}/{report.long_score:.0%})",
+                confidence=report.short_score,
+            )
 
-        # 4. 信号模糊 → 优先 LLM, LLM 不可用时用规则回退
-        if llm_available and self._should_call_llm(report):
-            return self._call_llm_decide(report)
-
-        # 5. LLM 不可用时的规则回退
-        if not llm_available:
-            rule_result = self._rule_based_decide(report)
-            if rule_result:
-                return rule_result
-
-        # 6. 信号弱 → HOLD
+        # 3. HOLD → HOLD
         return FinalDecision(
-            action="HOLD",
-            source="auto_clear",
-            reasoning="Strategy conditions insufficient, no AI intervention threshold met",
+            action="HOLD", source="auto_clear",
+            reasoning=f"Strategy HOLD (AI disabled, {report.long_score:.0%}/{report.short_score:.0%})",
             confidence=0.9,
         )
 
@@ -306,6 +271,7 @@ class DecisionEngine:
         - 平仓信号 (exit_signal) 始终触发 (受配额限制)
         - raw_signal 为非 HOLD 且 long_score/short_score 在 3~5/6 之间
         - raw_signal 为 HOLD 但某方向 ≥ 4/6
+        - 方向明确: LONG 和 SHORT 加权分差 > 0.25 (否则跳过避免 AI 猜方向)
         - 每日限额未超
         """
         if self.state["daily_calls"] >= MAX_DAILY_LLM_CALLS:
@@ -317,6 +283,12 @@ class DecisionEngine:
 
         # 已有持仓且无平仓信号 → 跳过 LLM (避免浪费配额)
         if report.current_position:
+            return False
+
+        # 方向分歧过滤: LONG/SHORT 加权分差 < 0.25 时方向不明确, 跳过 AI 猜方向
+        score_diff = abs(report.long_score_w - report.short_score_w)
+        if score_diff < 0.25 and not report.exit_signal:
+            _log("info", f"⏸️ 方向分歧,跳过AI: LONG={report.long_score:.0%} SHORT={report.short_score:.0%} diff={score_diff:.2f}")
             return False
 
         # 非 HOLD 信号: 分数不够自动放行 → 调 LLM
@@ -385,520 +357,256 @@ class DecisionEngine:
             if action not in ("LONG", "SHORT", "HOLD"):
                 action = "HOLD"
 
-        # ── code-level hard constraints ──
-        # factor_bias: 置信度 ≥ 0.8 时强制绑定方向
-        fb = getattr(report, 'factor_bias', {}) or {}
-        if fb.get("confidence", 0) >= 0.8 and not is_exit:
-            bias = fb.get("bias", "")
-            if bias == "short_bias" and action == "LONG":
-                _log("warn", f"🔒 force override: AI said LONG but short-bias active (conf={fb['confidence']:.0%}), forcing SHORT")
-                action = "SHORT"
-                reasoning = "Overridden by short-bias hard constraint: " + reasoning[:130]
-            elif bias == "long_bias" and action == "SHORT":
-                _log("warn", f"🔒 force override: AI said SHORT but long-bias active (conf={fb['confidence']:.0%}), forcing LONG")
-                action = "LONG"
-                reasoning = "Overridden by long-bias hard constraint: " + reasoning[:130]
+        if reasoning in (None, "", "No reasoning provided", "No reasoning provided "):
+            reasoning = f"AI decision: {action}"
 
-        # pinbar 方向阻断: bearish pinbar → 禁止 LONG; bullish pinbar → 禁止 SHORT
-        if hasattr(report, 'is_pinbar') and report.is_pinbar:
-            if report.pinbar_direction == "bearish" and action == "LONG":
-                _log("warn", f"🔒 force override: AI said LONG but bearish pin bar active, forcing HOLD")
-                action = "HOLD"
-                reasoning = "Overridden by bearish pin bar hard constraint: " + reasoning[:130]
-            elif report.pinbar_direction == "bullish" and action == "SHORT":
-                _log("warn", f"🔒 force override: AI said SHORT but bullish pin bar active, forcing HOLD")
-                action = "HOLD"
-                reasoning = "Overridden by bullish pin bar hard constraint: " + reasoning[:130]
-
-        emoji = "🚨" if is_exit and action != "HOLD" else ("✅" if action != "HOLD" else "⏸️")
-        _log("info", f"{emoji} AI决策: {action} | "
-              f"confidence={confidence:.0%} | {reasoning[:80]}")
-
-        return FinalDecision(
-            action=action,
-            source="ai_decision",
-            reasoning=reasoning,
-            confidence=confidence,
-        )
+        _log("info", f"{'✅' if action != 'HOLD' else '⏸️'} AI决策: {action} | confidence={confidence:0.0%} | {reasoning[:80]}")
+        return FinalDecision(action=action, source="ai_decision",
+                            reasoning=reasoning, confidence=confidence)
 
     def _get_trigger_reasons(self, report: SignalReport) -> List[str]:
+        """生成触发 AI 决策的原因列表。"""
         reasons = []
         if report.raw_signal in ("LONG", "SHORT"):
-            score = report.long_score if report.raw_signal == "LONG" else report.short_score
-            reasons.append(f"borderline_{report.raw_signal.lower()}({score:.0%})")
-        if report.raw_signal == "HOLD":
-            if report.long_score >= AI_INTERVENE_THRESHOLD:
-                reasons.append(f"hold_but_long_viable({report.long_score:.0%})")
-            if report.short_score >= AI_INTERVENE_THRESHOLD:
-                reasons.append(f"hold_but_short_viable({report.short_score:.0%})")
-        if report.lgb_opinion == "no_opinion":
-            reasons.append("lgb_uncertain")
-        return reasons
-
-    def _get_fail_memory_context(self) -> str:
-        """从状态中读取 AI 复盘写入的失败记忆, 注入 AI 决策上下文"""
-        fm = self.state.get("fail_memory")
-        if not fm:
-            return "(no failure patterns recorded yet)"
-        pattern = fm.get("pattern", "")
-        since = fm.get("since", "")
-        advice = fm.get("advice", "")
-        parts = [f"- Pattern: {pattern}"]
-        if since:
-            parts.append(f"- First observed: {since}")
-        if advice:
-            parts.append(f"- Suggestion: {advice}")
-        return "\n".join(parts)
-
-    def _get_factor_bias_rule(self, report: SignalReport) -> str:
-        """factor_bias 置信度 ≥ 0.8 时生成强制方向规则。
-
-        Returns
-        -------
-        str — 注入 prompt 的 Rules 文本行（可能为空字符串）
-        """
-        fb = getattr(report, 'factor_bias', {}) or {}
-        conf = fb.get("confidence", 0)
-        if conf < 0.8:
-            return ""
-
-        bias_dir = fb.get("bias", "neutral")
-        active = fb.get("active_factors", [])
-
-        if bias_dir == "short_bias":
-            line = (
-                f"- 🚨 FACTOR_BIAS_VIOLATION: Short-bias active (confidence={conf:.0%}). "
-                "STRONG preference for SHORT decisions. "
-                "Do NOT override to LONG unless you have overwhelming contrary evidence "
-                "(e.g. RSI <20 + bullish pin bar + volume surge simultaneously). "
-                "When uncertain, default to SHORT over HOLD/LONG."
-            )
-        elif bias_dir == "long_bias":
-            line = (
-                f"- 🚨 FACTOR_BIAS_VIOLATION: Long-bias active (confidence={conf:.0%}). "
-                "STRONG preference for LONG decisions. "
-                "Do NOT override to SHORT unless you have overwhelming contrary evidence "
-                "(e.g. RSI >80 + bearish pin bar + volume surge simultaneously). "
-                "When uncertain, default to LONG over HOLD/SHORT."
-            )
-        else:
-            return ""
-
-        if active:
-            line += f" (Driven by: {', '.join(active[:3])})"
-        return line
-
-    def _get_sentiment_context(self, report: SignalReport) -> str:
-        """构建多源情绪上下文，注入 AI 决策 prompt"""
-        score = getattr(report, 'sentiment_score', 0.0)
-        label = getattr(report, 'sentiment_label', 'neutral')
-        conf = getattr(report, 'sentiment_confidence', 0.0)
-        details = getattr(report, 'sentiment_details', '')
-
-        if conf < 0.01:
-            return "(sentiment data not available, treating as neutral)"
-
-        emoji = "🟢" if score > 0.1 else ("🔴" if score < -0.1 else "⚪")
-        lines = [
-            f"{emoji} Sentiment: {score:+.2f} ({label}, confidence={conf:.0%})",
-        ]
-        # 从 sentiment_details 中提取各来源明细
-        if details:
-            for line in details.split("\n"):
-                line = line.strip()
-                if line and not line.startswith("⚪") and "情绪=" not in line:
-                    lines.append(f"  {line}")
-
-        # 情绪与策略方向的冲突检测
-        if conf > 0.5:
-            fb = getattr(report, 'factor_bias', {}) or {}
-            factor_bias = fb.get("bias", "neutral")
-            if score > 0.3 and factor_bias == "short_bias":
-                lines.append("  ⚠️ CONFLICT: Bullish sentiment vs short-bias factor — proceed with caution")
-            elif score < -0.3 and factor_bias == "long_bias":
-                lines.append("  ⚠️ CONFLICT: Bearish sentiment vs long-bias factor — proceed with caution")
-
-        return "\n".join(lines)
-
-    def _get_polymarket_context(self, report: SignalReport) -> str:
-        """构建 Polymarket 预测市场上下文"""
-        pm_score = getattr(report, 'polymarket_score', 0.0)
-        pm_label = getattr(report, 'polymarket_label', 'neutral')
-        pm_conf = getattr(report, 'polymarket_confidence', 0.0)
-        pm_details = getattr(report, 'polymarket_details', '')
-
-        if pm_conf < 0.01:
-            return "(Polymarket prediction data not available)"
-
-        emoji = "🟢" if pm_score > 0.05 else ("🔴" if pm_score < -0.05 else "⚪")
-        lines = [
-            f"{emoji} Polymarket: {pm_score:+.3f} ({pm_label}, conf={pm_conf:.0%})",
-        ]
-        if pm_details:
-            lines.append(f"  Markets: {pm_details[:150]}")
-
-        # PM 与策略方向的冲突提醒
-        if pm_conf > 0.3 and abs(pm_score) > 0.08:
-            if pm_score > 0:
-                lines.append("  → Polymarket predicts UP: consider favoring LONG, avoiding going against it for SHORT")
-            else:
-                lines.append("  → Polymarket predicts DOWN: consider favoring SHORT, avoiding going against it for LONG")
-
-        return "\n".join(lines)
-
-    # ── Prompt 构建 ──────────────────────────────────────────────────────
-
-    def _build_decision_prompt(self, report: SignalReport, reasons: List[str]) -> str:
-        """构建 AI 决策提示词。
-
-        核心思路: 给 AI 完整的市场快照 + 策略评估, 让它做交易员式的综合判断。
-        """
-        # 基础上下文
-        factor_bias_rule = self._get_factor_bias_rule(report)
-        parts = [
-            "You are the AI Decision Layer for a crypto quantitative trading system (BTC-USDT perpetual futures, 15-min bars).",
-            "Strategy layer provides technical indicators and condition scores. You make the FINAL call.",
-            "",
-            report.to_ai_context(),
-            "",
-            "## Sentiment & Market Context",
-            self._get_sentiment_context(report),
-            "",
-            "## Polymarket Prediction",
-            self._get_polymarket_context(report),
-            "",
-            "## Recent Trades",
-            self._get_recent_trades_context(),
-            "",
-            "## Long-term Memory",
-            self._memory.get_state_for_ai(),
-            "",
-            "## Failure Memory",
-            self._get_fail_memory_context(),
-            "## Rules",
-            "- You can OVERRIDE the strategy: if strategy says HOLD but conditions look good, you can say LONG/SHORT.",
-            "- Conversely, if strategy says LONG/SHORT but market looks risky, say HOLD.",
-            "- Consider RSI extremes: >75 is overbought (risky to long), <25 is oversold (risky to short).",
-            "- Consider ADX: <25 means ranging/choppy (avoid trading), >35 means trending (trade with trend).",
-            "- Consider price context: is this a breakout or a fakeout?",
-            "- \U0001f6a8 PIN BAR WARNING: if context shows a bearish pin bar, DO NOT go LONG (bull trap). If bullish pin bar, DO NOT go SHORT (bear trap).",
-            *( [factor_bias_rule] if factor_bias_rule else [] ),
-            f"- Trigger reason: {', '.join(reasons)}",
-            "",
-            "Reply format (choose ONE):",
-            "LONG",
-            "SHORT",
-            "HOLD",
-            "",
-            "You may append a one-line reasoning after the decision word.",
-            "Example: LONG | Strong bullish alignment with volume confirmation, RSI cooling from peak",
-            "",
-            "Decision:",
-        ]
-        return "\n".join(parts)
-
-    def _build_exit_prompt(self, report: SignalReport, reasons: List[str]) -> str:
-        """构建平仓决策提示词 — AI 确认或驳回平仓信号。"""
-        raw_exit = report.exit_signal or "SELL"
-        # 映射 EXIT_ 类型到人类可读描述
-        exit_type_map = {
-            "EXIT_TIME": "SELL", "EXIT_RSI": "SELL", "EXIT_TREND": "SELL",
-        }
-        exit_action = exit_type_map.get(raw_exit, raw_exit)
-        # 如果是空头仓位，exit_action 从 raw_signal 判断
-        if raw_exit in ("EXIT_TIME", "EXIT_RSI", "EXIT_TREND"):
-            exit_action = "SELL" if report.raw_signal == "SELL" else "COVER"
-
-        exit_reason_map = {
-            "EXIT_TIME": "⏰ 最大持仓时间到达",
-            "EXIT_RSI": "📊 RSI 超买/超卖信号",
-            "EXIT_TREND": "↘️ 趋势反转 (MA交叉+强ADX)",
-            "SELL": "📊 策略信号",
-            "COVER": "📊 策略信号",
-        }
-        exit_desc = {
-            "SELL": "平多仓 (close long)",
-            "COVER": "平空仓 (close short)",
-        }.get(exit_action, exit_action)
-
-        exit_reason_text = exit_reason_map.get(raw_exit, "策略信号")
-        is_losing = report.position_pnl_pct is not None and report.position_pnl_pct < 0
-
-        factor_bias_rule = self._get_factor_bias_rule(report)
-        # 平仓场景下: bias 方向与平仓方向冲突时需要特殊提醒
-        fb = getattr(report, 'factor_bias', {}) or {}
-        bias_exit_conflict = ""
-        if fb.get("confidence", 0) >= 0.8:
-            bias = fb.get("bias", "")
-            if bias == "long_bias" and exit_action == "SELL":
-                bias_exit_conflict = (
-                    f"- 🚨 FACTOR_BIAS CONFLICT: Strong long-bias disagrees with SELL exit. "
-                    "Reject (HOLD) unless reversal evidence is definitive."
-                )
-            elif bias == "short_bias" and exit_action == "COVER":
-                bias_exit_conflict = (
-                    f"- 🚨 FACTOR_BIAS CONFLICT: Strong short-bias disagrees with COVER exit. "
-                    "Reject (HOLD) unless reversal evidence is definitive."
-                )
-
-        parts = [
-            "You are the AI Decision Layer for a crypto quantitative trading system (BTC-USDT perpetual futures, 15-min bars).",
-            f"⚠️ EXIT SCENARIO: Strategy layer wants to {exit_desc}.",
-            f"   Reason: {exit_reason_text}",
-            f"   Position PnL: {report.position_pnl_pct:+.1f}%" if report.position_pnl_pct is not None else "   Position PnL: unknown",
-            "Your job: confirm the exit or override it (keep the position).",
-            "Only confirm the exit if you have clear reversal evidence (volume confirmation, decisive technical breakdown).",
-            "Default to rejecting (HOLD) — exits without strong confirmation tend to be premature in this market.",
-            "The strategy exit signal is a suggestion, not a command. You are the final judge.",
-            "",
-            report.to_ai_context(),
-            "",
-            "## Sentiment & Market Context",
-            self._get_sentiment_context(report),
-            "",
-            "## Polymarket Prediction",
-            self._get_polymarket_context(report),
-            "",
-            "## Recent Trades",
-            self._get_recent_trades_context(),
-            "",
-            "## Long-term Memory",
-            self._memory.get_state_for_ai(),
-            "",
-            "## Exit Context",  
-            f"- Exit Type: {exit_desc}",
-            f"- Trigger: {', '.join(reasons)}",
-            f"- LONG Score: {report.long_score:.0%} | SHORT Score: {report.short_score:.0%}",
-            "",
-            "## Rules",  
-            "- Say SELL (for long exit) or COVER (for short exit) to confirm the strategy exit.",
-            "- Say HOLD to REJECT the exit — you are the final judge and should not let a marginal exit signal close a good position.",
-            "- Consider: Is this a real reversal or a temporary pullback? Is volume confirming?",  
-            "- Overriding an exit takes no special confidence — simply judge if this exit is convincing or not. Reject unconvincing exits.",
-            "- RSI extreme + ADX confirming trend → likely real exit. RSI mild + low ADX → possible fakeout.",
-            *( [bias_exit_conflict] if bias_exit_conflict else [] ),
-            *( [factor_bias_rule] if factor_bias_rule else [] ),
-            "",  
-            "Reply format (choose ONE):",  
-f"{exit_action}  (confirm exit)",
-            "HOLD    (reject exit, keep position)",  
-            "",  
-            "One-line reasoning after the decision.",  
-f"Example: {exit_action} | RSI overbought at 78 with ADX 38 confirming trend exhaustion",
-            "",  
-            "Decision:",
-        ]
-        return "\n".join(parts)
+            reasons.append(f"{report.raw_signal}_signal({report.long_score:.0%}/{report.short_score:.0%})")
+        if report.long_score >= AI_INTERVENE_THRESHOLD:
+            reasons.append(f"hold_but_long_viable({report.long_score:.0%})")
+        if report.short_score >= AI_INTERVENE_THRESHOLD:
+            reasons.append(f"hold_but_short_viable({report.short_score:.0%})")
+        # LGB
+        if report.lgb_opinion and report.lgb_opinion.get("score", 0) > 0.5:
+            reasons.append(f"lgb_{report.lgb_opinion.get('action', 'uncertain')}")
+        return reasons if reasons else ["borderline_signal"]
 
     def _map_exit_to_action(self, report: SignalReport) -> str:
-        """把 exit_signal 映射到可执行动作 (SELL/COVER)。"""
-        raw = report.exit_signal or "SELL"
-        mapping = {"EXIT_TIME": "SELL", "EXIT_RSI": "SELL", "EXIT_TREND": "SELL"}
-        action = mapping.get(raw, raw)
-        if raw in ("EXIT_TIME", "EXIT_RSI", "EXIT_TREND"):
-            action = "SELL" if report.raw_signal == "SELL" else "COVER"
-        return action
-
-
-    # ── LLM 调用 ────────────────────────────────────────────────────────
-
-    def _invoke_llm(self, prompt: str) -> Optional[dict]:
-        """调 LLM API, 返回解析后的决策 dict。
-
-        Returns
-        -------
-        dict or None
-            {"action": "LONG", "reasoning": "...", "confidence": 0.8}
-        """
-        # 策略1: OpenAI-compatible API
-        if LLM_API_KEY:
-            result = self._call_openai_api(prompt)
-            if result:
-                return result
-
-        # 策略2: hermes CLI (备选)
-        result = self._call_hermes_cli(prompt)
-        if result:
-            return result
-
-        return None
-
-    def _call_openai_api(self, prompt: str) -> Optional[dict]:
-        # System message 强制 LLM 只输出一个词（推理模型不输出思考过程）
-        system_msg = {
-            "role": "system",
-            "content": "You are a trading bot. Output ONLY one word: LONG, SHORT, HOLD, SELL, or COVER. No explanations, no punctuation, no thinking. Never output anything else."
+        """将 exit_signal 映射为交易动作。"""
+        action_map = {
+            "EXIT_RSI": "SELL" if report.raw_signal in ("SELL", None) else "COVER",
+            "EXIT_TREND": "SELL" if report.raw_signal in ("SELL", None) else "COVER",
+            "EXIT_TIME": "SELL" if report.raw_signal in ("SELL", None) else "COVER",
+            "exit": "SELL" if report.raw_signal in ("SELL", None) else "COVER",
         }
-        payload = json.dumps({
-            "model": LLM_MODEL,
-            "messages": [system_msg, {"role": "user", "content": prompt}],
-            "max_tokens": 50,
-            "temperature": 0.1,
-        })
+        if report.raw_signal == "SELL":
+            return "SELL"
+        if report.raw_signal == "COVER":
+            return "COVER"
+        if report.exit_signal and report.exit_signal in action_map:
+            return action_map[report.exit_signal]
+        return "HOLD"
 
-        try:
-            proc = subprocess.run(
-                ["curl", "-s", "--max-time", str(LLM_TIMEOUT_SECONDS),
-                 f"{LLM_API_BASE}/chat/completions",
-                 "-H", f"Authorization: Bearer {LLM_API_KEY}",
-                 "-H", "Content-Type: application/json",
-                 "-d", payload],
-                capture_output=True, text=True,
-                timeout=LLM_TIMEOUT_SECONDS + 3,
+    def _build_decision_prompt(self, report: SignalReport, reasons: List[str]) -> str:
+        """构建 LLM 开仓决策 prompt。"""
+        bias_raw = report.factor_bias or {}
+        bias_label = bias_raw.get("bias", "neutral")
+        bias_conf = bias_raw.get("confidence", 0.0)
+
+        position_ctx = ""
+        if report.current_position:
+            pos = report.current_position
+            position_ctx = (
+                f"Current position: {pos.get('side', '?')} | "
+                f"Entry=${pos.get('entry_price', 0):,.0f} | "
+                f"Size={pos.get('size', 0):.4f} BTC | "
+                f"PnL={pos.get('unrealized_pnl', 0):+.2%}"
             )
-            if proc.returncode != 0:
-                _log("warn", f"curl failed: rc={proc.returncode}")
-                return None
 
-            data = json.loads(proc.stdout)
-            msg = data.get("choices", [{}])[0].get("message", {})
-            content = msg.get("content", "").strip()
-            # 推理模型 (v4-flash/v4-pro) 可能把输出放 reasoning_content
-            if not content:
-                content = msg.get("reasoning_content", "").strip()
-            _log("debug", f"LLM raw response: {content[:200]}")
-            return self._parse_decision(content)
+        details = {
+            "Price": f"${report.price:,.0f}",
+            "Regime": report.regime,
+            "Price_Trend_5bars": report.price_trend_5bars,
+            "RSI": f"{report.rsi:.0f}({report.rsi_trend})",
+            "ADX": f"{report.adx:.0f}({report.adx_trend})",
+            "MACD_hist": f"{report.macd_hist:.0f}",
+            "MA7": f"${report.ma7:,.0f}",
+            "MA25": f"${report.ma25:,.0f}",
+            "MA99": f"${report.ma99:,.0f}",
+            "Volume_surge": report.volume_surge,
+            "Factor_bias": f"{bias_label}(conf={bias_conf:.0%})",
+        }
+        if report.sentiment_score is not None:
+            details["Sentiment"] = f"{report.sentiment_score:.3f}({report.sentiment_label}, conf={report.sentiment_confidence:.0%})"
+        if report.polymarket_score is not None:
+            details["Polymarket"] = f"{report.polymarket_score:.3f}({report.polymarket_label}, conf={report.polymarket_confidence:.0%})"
 
-        except subprocess.TimeoutExpired:
-            _log("warn", f"API timeout ({LLM_TIMEOUT_SECONDS}s)")
-        except json.JSONDecodeError as e:
-            _log("warn", f"API response not valid JSON: {e}")
-        except Exception as e:
-            _log("error", f"API exception: {e}")
-
-        return None
-
-    def _call_hermes_cli(self, prompt: str) -> Optional[dict]:
-        try:
-            result = subprocess.run(
-                ["hermes", "chat", "-q", prompt, "-Q"],
-                capture_output=True, text=True,
-                timeout=LLM_TIMEOUT_SECONDS + 5,
-                env={**os.environ, "HERMES_MAX_TURNS": "1"},
-                cwd=str(PROJECT),
-            )
-            if result.returncode != 0:
-                return None
-            return self._parse_decision(result.stdout.strip())
-        except Exception as e:
-            _log("warn", f"hermes CLI failed: {e}")
-        return None
-
-    def _parse_decision(self, text: str) -> Optional[dict]:
-        """从 LLM 输出中提取决策。
-
-        由于 system message 强制只输出一个词，text 大概率只有 "LONG/SHORT/HOLD/SELL/COVER"。
-        但推理模型可能无视 system msg 输出整段思考，做全文搜索兜底。
-        confidence 正则做了边界校验，防止 10000% 这种异常值。
-        """
-        text_clean = text.strip().upper()
-
-        # 全文搜索所有关键词，按优先级取第一个匹配
-        # 优先级：LONG/SHORT > SELL/COVER > HOLD
-        for kw, action in [("SELL", "SELL"), ("COVER", "COVER"),
-                           ("LONG", "LONG"), ("SHORT", "SHORT"),
-                           ("HOLD", "HOLD")]:
-            if re.search(rf'\b{kw}\b', text_clean):
-                action = kw
-                break
-        else:
-            action = "HOLD"
-
-        # 提取推理（取第一个 | 后面的内容，或第二行）
-        reasoning = ""
-        lines = text_clean.split("\n")
-        first_line = lines[0].strip()
-        if "|" in first_line:
-            reasoning = first_line.split("|", 1)[1].strip()
-        elif len(lines) > 1:
-            reasoning = lines[1].strip()[:150]
-        else:
-            reasoning = "No reasoning provided"
-
-        # 置信度 — 加边界校验，[0.0, 1.0] 区间
-        confidence = 0.7
-        conf_match = re.search(r'confidence[=:]\s*([\d.]+)', text_clean, re.IGNORECASE)
-        if conf_match:
-            try:
-                val = float(conf_match.group(1))
-                if 0.0 <= val <= 1.0:
-                    confidence = val
-                else:
-                    _log("debug", f"confidence value {val} out of range [0,1], using default 0.7")
-            except ValueError:
-                pass
-
-        return {"action": action, "reasoning": reasoning[:200], "confidence": confidence}
-
-    # ── 状态管理 ────────────────────────────────────────────────────────
-
-    MAX_TRADE_HISTORY = 5  # 注入 AI prompt 的最近交易数
-
-    def update_trade_result(self, pnl: float, symbol: str = "BTC-USDT",
-                                side: str = "long", exit_reason: str = "signal",
-                                leverage: int = 10):
-        """交易结束后记录盈亏，供 AI 下次决策参考。
-
-        同时写入 TradingMemory (长期记忆, 方向归因)
-        """
-        # 短期记忆 (已有)
-        history = self.state.setdefault("recent_trades", [])
-        history.append({
-            "pnl": round(pnl, 2),
-            "time": datetime.now().strftime("%m-%d %H:%M"),
-            "symbol": symbol,
-            "side": side,
-        })
-        if len(history) > self.MAX_TRADE_HISTORY:
-            history[:] = history[-self.MAX_TRADE_HISTORY:]
-        self.state["total_decisions"] = self.state.get("total_decisions", 0) + 1
-
-        # 长期记忆 (TradingMemory)
-        self._memory.record_trade(
-            symbol=symbol,
-            side=side,
-            pnl_pct=pnl,
-            exit_reason=exit_reason,
-            leverage=leverage,
+        long_conditions = " ".join(f"{k}={'✅' if v else '❌'}" for k, v in report.conditions_long.items() if k != 'VOL') + f" VOL={'✅' if report.conditions_long.get('VOL', False) else '❌'}"
+        short_conditions = " ".join(f"{k}={'✅' if v else '❌'}" for k, v in report.conditions_short.items() if k != 'VOL') + f" VOL={'✅' if report.conditions_short.get('VOL', False) else '❌'}"
+        cond_section = (
+            f"BUY: score={report.long_score:.0%} weighted={report.long_score_w:.2f} | {long_conditions}\n"
+            f"SELL: score={report.short_score:.0%} weighted={report.short_score_w:.2f} | {short_conditions}"
         )
 
-        _save_state(self.state)
+        detail_lines = "\n".join(f"  {k}: {v}" for k, v in details.items())
 
-    def _get_recent_trades_context(self) -> str:
-        """生成最近交易记录摘要，注入 AI 决策 prompt。"""
-        history = self.state.get("recent_trades", [])
-        if not history:
-            return "(no trades yet this session)"
-        wins = sum(1 for t in history if t["pnl"] > 0)
-        total = len(history)
-        lines = [f"Last {total} trades (Win rate: {wins}/{total} = {wins/max(total,1)*100:.0f}%):"]
-        for i, t in enumerate(history, 1):
-            emoji = "🟢" if t["pnl"] > 0 else "🔴"
-            lines.append(f"  {i}. {emoji} {t['pnl']:+.2f}% @ {t['time']}")
-        return "\n".join(lines)
+        return f"""You are a crypto futures trading AI. Analyze this BTC-USDT 15m bar and decide.
 
-    def get_stats(self) -> dict:
-        return {
-            "daily_calls": self.state.get("daily_calls", 0),
-            "max_daily_calls": MAX_DAILY_LLM_CALLS,
-            "ai_decisions": self.state.get("ai_decisions", 0),
-            "auto_decisions": self.state.get("auto_decisions", 0),
-            "total_decisions": self.state.get("total_decisions", 0),
+{position_ctx}
+
+SignalReport:
+{cond_section}
+
+Indicators:
+{detail_lines}
+
+Trigger reasons: {', '.join(reasons)}
+
+Rules:
+1. Output JSON: {{"action": "LONG"|"SHORT"|"HOLD", "reasoning": "why", "confidence": 0.0-1.0}}
+2. LONG if strong uptrend + clear conditions
+3. SHORT if clear downtrend + clear conditions
+4. HOLD if mixed, choppy, or unsure — DO NOT force a direction
+5. You may act on HOLD+high-score if the signal is clear enough
+6. Factor bias at conf>0.8 is strong directional signal — respect it
+7. CONSERVATIVE is better than wrong. When in doubt: HOLD."""
+
+    def _build_exit_prompt(self, report: SignalReport, reasons: List[str]) -> str:
+        """构建 LLM 平仓决策 prompt。
+
+        平仓场景: AI 决定是否执行策略发出的平仓信号。
+        亏损时 AI 可驳回 (HOLD), 盈利时默认执行。
+        """
+        pos = report.current_position or {}
+        pos_entry = pos.get("entry_price", 0)
+        pos_side = pos.get("side", "?")
+        pos_bars = pos.get("bars_held", 0)
+        pnl_pct = ((report.price - pos_entry) / pos_entry * 100) if pos_side == "long" else ((pos_entry - report.price) / pos_entry * 100)
+        pnl_pct = round(pnl_pct, 2)
+
+        bias_raw = report.factor_bias or {}
+        bias_label = bias_raw.get("bias", "neutral")
+        bias_conf = bias_raw.get("confidence", 0.0)
+
+        details = {
+            "Exit_signal": report.exit_signal,
+            "Position": f"{pos_side} @ ${pos_entry:,.0f}, held {pos_bars} bars",
+            "PnL": f"{pnl_pct:+.2f}%",
+            "Price": f"${report.price:,.0f}",
+            "RSI": f"{report.rsi:.0f}({report.rsi_trend})",
+            "ADX": f"{report.adx:.0f}({report.adx_trend})",
+            "MACD_hist": f"{report.macd_hist:.0f}",
+            "Regime": report.regime,
+            "Price_Trend": report.price_trend_5bars,
+            "Factor_bias": f"{bias_label}(conf={bias_conf:.0%})",
         }
+        if report.sentiment_score is not None:
+            details["Sentiment"] = f"{report.sentiment_score:.3f}({report.sentiment_label})"
+        if report.polymarket_score is not None:
+            details["Polymarket"] = f"{report.polymarket_score:.3f}({report.polymarket_label})"
+
+        long_conditions = " ".join(f"{k}={'✅' if v else '❌'}" for k, v in report.conditions_long.items())
+        short_conditions = " ".join(f"{k}={'✅' if v else '❌'}" for k, v in report.conditions_short.items())
+
+        detail_lines = "\n".join(f"  {k}: {v}" for k, v in details.items())
+
+        return f"""You are a crypto futures exit advisor. Review this exit signal and decide.
+
+Position: {pos_side} @ ${pos_entry:,.0f}, PnL={pnl_pct:+.2f}%
+Exit signal: {report.exit_signal} (reason from strategy)
+
+BUY conditions: {report.long_score:.0%} | {long_conditions}
+SELL conditions: {report.short_score:.0%} | {short_conditions}
+
+{detail_lines}
+
+Trigger: {', '.join(reasons)}
+
+Rules:
+1. Output JSON: {{"action": "SELL"|"COVER"|"HOLD", "reasoning": "why", "confidence": 0.0-1.0}}
+2. Default: EXIT (SELL for long, COVER for short)
+3. HOLD to reject the exit only if markets clearly reversed back in position's favor
+4. When losing: you may reject (HOLD) if the exit signal seems premature and indicators support holding
+5. When winning (>3%): strongly lean toward profit-taking
+6. CONSERVATIVE: if in doubt, exit. Protecting capital > catching last penny.
+7. Be pragmatic — small repeated losses are better than one big loss."""
+
+    def _invoke_llm(self, prompt: str) -> Optional[Dict[str, Any]]:
+        """调 LLM API 返回 JSON 决策。"""
+        if not self.llm_available:
+            _log("warn", "LLM 不可用，跳过 LLM 调用")
+            return None
+
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 300,
+        }
+        headers = {
+            "Authorization": f"Bearer {LLM_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        import urllib.request
+        import ssl
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        data = json.dumps(payload).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                f"{LLM_API_BASE}/chat/completions",
+                data=data, headers=headers, method="POST",
+            )
+            with urllib.request.urlopen(req, context=ctx, timeout=LLM_TIMEOUT_SECONDS) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            content = body["choices"][0]["message"]["content"]
+            _log("debug", f"LLM raw: {content[:200]}")
+            return self._parse_llm_output(content)
+        except Exception as e:
+            _log("warn", f"LLM 调用异常: {e}")
+            return None
+
+    def _parse_llm_output(self, content: str) -> Optional[Dict[str, Any]]:
+        """从 LLM 输出解析 JSON。"""
+        # 尝试从 ```json ... ``` 中提取
+        match = re.search(r'```(?:json)?\s*({.*?})\s*```', content, re.DOTALL)
+        if match:
+            content = match.group(1)
+        # 或直接找第一个 { }
+        for brace in re.finditer(r'\{[^}]*\}', content):
+            try:
+                parsed = json.loads(brace.group())
+                if isinstance(parsed, dict) and "action" in parsed:
+                    parsed["action"] = parsed["action"].upper()
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    # ── 记忆 ──────────────────────────────────────────────────────────────
+
+    def update_memory(self, decision, result):
+        """更新交易记忆。"""
+        if self._memory:
+            try:
+                self._memory.record(decision, result)
+                self.state["fail_memory"] = self._memory.summary()
+            except Exception:
+                pass
+
+    def summarize(self) -> str:
+        """返回运行摘要。"""
+        total = self.state.get("total_decisions", 0)
+        ai_dec = self.state.get("ai_decisions", 0)
+        auto_dec = self.state.get("auto_decisions", 0)
+        calls = self.state.get("daily_calls", 0)
+        return (
+            f"DecisionEngine: {total} total | {ai_dec} AI | {auto_dec} auto | "
+            f"{calls} LLM calls today"
+        )
 
 
-# ── 全局单例 ────────────────────────────────────────────────────────────
-
-_global_engine: Optional[DecisionEngine] = None
-
+# ── 快捷函数 ──────────────────────────────────────────────────────────────
 
 def get_decision_engine() -> DecisionEngine:
-    global _global_engine
-    if _global_engine is None:
-        _global_engine = DecisionEngine()
-    return _global_engine
+    """获取全局 DecisionEngine 单例。"""
+    if not hasattr(get_decision_engine, '_instance'):
+        get_decision_engine._instance = DecisionEngine()
+    return get_decision_engine._instance
 
 
-# 保留旧接口兼容
-def get_ai_override():
-    return get_decision_engine()
+def make_decision(report: SignalReport, engine: Optional[DecisionEngine] = None) -> FinalDecision:
+    """便捷入口 — 快速决策。"""
+    if engine is None:
+        engine = DecisionEngine()
+    return engine.decide(report)

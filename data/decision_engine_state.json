@@ -1,0 +1,41 @@
+{
+  "daily_calls": 0,
+  "reset_date": "2026-05-15",
+  "cooldowns": {},
+  "total_decisions": 89,
+  "ai_decisions": 60,
+  "auto_decisions": 0,
+  "fail_memory": null,
+  "recent_trades": [
+    {
+      "pnl": -2.62,
+      "time": "05-14 18:45",
+      "symbol": "BTC-USDT",
+      "side": "long"
+    },
+    {
+      "pnl": 13.69,
+      "time": "05-14 23:00",
+      "symbol": "BTC-USDT",
+      "side": "long"
+    },
+    {
+      "pnl": -2.68,
+      "time": "05-15 02:00",
+      "symbol": "BTC-USDT",
+      "side": "long"
+    },
+    {
+      "pnl": -3.99,
+      "time": "05-15 08:00",
+      "symbol": "BTC-USDT",
+      "side": "long"
+    },
+    {
+      "pnl": 0.03,
+      "time": "05-15 16:00",
+      "symbol": "BTC-USDT",
+      "side": "long"
+    }
+  ]
+}
