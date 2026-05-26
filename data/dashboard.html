@@ -2,22 +2,13 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CryptoQuant · Terminal</title>
+<title>CryptoQuant · Live</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{
-  --bg:#0a0e14;--bg-panel:#0f1419;--border:#1a2332;
-  --text:#bfbdb6;--text-dim:#5c6773;--text-bright:#e6e1cf;
-  --green:#7fd962;--red:#f26d78;--blue:#59c2ff;
-  --yellow:#ffb454;--cyan:#95e6cb;--pink:#d2a6ff;--orange:#ff8f40;
-  --mono:'Fira Code','Cascadia Mono','JetBrains Mono','Consolas',monospace;
-}
-body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:13px;line-height:1.6;padding:12px;min-height:100vh}
-.container{max-width:960px;margin:0 auto}
-
-/* HEADER */
+:root{--bg:#0a0e14;--bg-panel:#0f1419;--border:#1a2332;--text:#bfbdb6;--text-dim:#5c6773;--text-bright:#e6e1cf;--green:#7fd962;--red:#f26d78;--blue:#59c2ff;--yellow:#ffb454;--cyan:#95e6cb;--pink:#d2a6ff;--orange:#ff8f40;--mono:'Fira Code','Cascadia Mono','JetBrains Mono','Consolas',monospace}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:13px;line-height:1.6;padding:0;min-height:100vh}
+.container{max-width:960px;margin:0 auto;padding:12px}
 .header{border-bottom:1px solid var(--border);padding:10px 0 14px;margin-bottom:12px}
 .header-top{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:6px}
 .title{color:var(--cyan);font-size:16px;font-weight:700;letter-spacing:1px}
@@ -27,374 +18,233 @@ body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:13
 .badge-live{background:rgba(127,217,98,0.12);color:var(--green)}
 .badge-sim{background:rgba(255,180,84,0.12);color:var(--yellow)}
 .badge-off{background:rgba(242,109,120,0.12);color:var(--red)}
-.dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}
-.dot-green{background:var(--green);animation:blink 1.5s infinite}
-.dot-yellow{background:var(--yellow)}
-.dot-red{background:var(--red)}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;animation:blink 1.5s infinite}
+.dot-green{background:var(--green)}.dot-yellow{background:var(--yellow)}.dot-red{background:var(--red)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0.2}}
-
-/* TICKER */
 .ticker{display:flex;align-items:baseline;gap:12px;margin:6px 0;flex-wrap:wrap}
 .ticker .price{font-size:32px;font-weight:700;color:var(--text-bright);letter-spacing:-1px}
 .ticker .change{font-size:16px;font-weight:600}
 .ticker .meta{font-size:11px;color:var(--text-dim)}
-
-/* GRID */
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
 .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px}
-.grid-4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:10px}
-
-/* PANEL */
+.grid-4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:12px}
 .panel{background:var(--bg-panel);border:1px solid var(--border);border-radius:6px;padding:12px 14px}
 .panel-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border)}
 .panel-hdr .label{color:var(--text-dim);font-size:10px;text-transform:uppercase;letter-spacing:1.5px}
-.panel-hdr .val{color:var(--text);font-size:11px}
-
-.kv{display:flex;justify-content:space-between;align-items:center;padding:2px 0}
-.kv .k{color:var(--text-dim);font-size:11px}
-.kv .v{color:var(--text-bright);font-size:13px;font-weight:500}
-
-/* POSITION */
-.pos-row{display:grid;grid-template-columns:36px 1fr 1fr 1fr 1fr;gap:6px;padding:5px 0;border-bottom:1px solid rgba(26,35,50,0.5);align-items:center;font-size:11px}
-.pos-row:last-child{border-bottom:none}
-.pos-side{font-weight:700}
-.long{color:var(--green)}
-.short{color:var(--red)}
-.pnl-pos{color:var(--green)}
-.pnl-neg{color:var(--red)}
-.pos-empty{text-align:center;color:var(--text-dim);padding:12px;font-size:11px}
-
-/* TABLE */
-.ta{width:100%;border-collapse:collapse;font-size:11px}
-.ta td{padding:2px 6px}
-.ta .ik{color:var(--text-dim);width:50%}
-.ta .iv{color:var(--text);text-align:right;font-weight:500}
-
-/* SIG/TRADE LOGS */
-.log-box{max-height:160px;overflow-y:auto;font-size:11px;line-height:1.7}
-.log-box::-webkit-scrollbar{width:4px}
-.log-box::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.log-line{padding:1px 4px;border-radius:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.log-line:hover{background:rgba(255,255,255,0.03)}
-.log-line .ts{color:var(--text-dim);margin-right:6px}
-.sig-HOLD{color:var(--text-dim)}
-.sig-LONG{color:var(--green);font-weight:600}
-.sig-SHORT{color:var(--red);font-weight:600}
-.sig-SELL{color:var(--orange)}
-.sig-COVER{color:var(--cyan)}
-.act-open{color:var(--yellow);font-weight:600}
-.act-close{color:var(--text)}
-
-/* SPARKLINE */
-.sparkline-container{margin-top:6px;height:40px}
-
-/* RISK METER */
-.risk-bar{height:4px;border-radius:2px;background:var(--border);margin-top:4px;overflow:hidden}
-.risk-fill{height:100%;border-radius:2px;transition:width .3s,background .3s}
-
-/* FOOTER */
-.footer{text-align:center;color:var(--text-dim);font-size:10px;padding:12px 0 6px;border-top:1px solid var(--border);margin-top:12px}
-.footer .rf{cursor:pointer}
-
-/* Mobile */
-@media(max-width:700px){
-  .grid-2,.grid-3,.grid-4{grid-template-columns:1fr}
-  .ticker .price{font-size:24px}
-  body{padding:8px;font-size:12px}
-}
+.stat{text-align:center;padding:6px 0}
+.stat .val{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+.stat .sub{font-size:10px;color:var(--text-dim);margin-top:2px}
+.stat .hint{font-size:10px;color:var(--text-dim)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--text-dim);font-size:10px;text-transform:uppercase;letter-spacing:1px;padding:4px 6px;border-bottom:1px solid var(--border)}
+td{padding:6px;border-bottom:1px solid rgba(30,41,59,0.4);font-variant-numeric:tabular-nums}
+tr:hover td{background:rgba(89,194,255,0.03)}
+.green{color:var(--green)}.red{color:var(--red)}.blue{color:var(--blue)}.cyan{color:var(--cyan)}.yellow{color:var(--yellow)}.dim{color:var(--text-dim)}
+.sig{display:flex;flex-wrap:wrap;gap:4px;font-size:11px;max-height:100px;overflow-y:auto}
+.sig span{background:rgba(255,255,255,0.03);padding:2px 6px;border-radius:3px;font-size:10px;white-space:nowrap}
+.sig-buy{color:var(--green)}.sig-sell{color:var(--red)}.sig-hold{color:var(--text-dim)}
+.empty{text-align:center;padding:20px;color:var(--text-dim);font-size:12px}
+.indicators{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:11px;margin-top:6px}
+.indicators span{white-space:nowrap}
+.bar{display:inline-block;width:2px;border-radius:1px;margin-right:1px;min-height:20px;transition:height 0.3s}
 </style>
 </head>
 <body>
 <div class="container">
-
-<!-- HEADER -->
 <div class="header">
   <div class="header-top">
-    <div class="title">CryptoQuant<span class="dim">·Terminal</span></div>
-    <div><span class="badge badge-sim" id="mode-badge"><span class="dot dot-yellow"></span>SIM</span></div>
+    <div><span class="title">CryptoQuant · Live</span><span class="dim" style="margin-left:8px;font-size:11px">BTC-USDT</span></div>
+    <div><span class="badge badge-live" id="modeBadge">LIVE</span><span class="dim" style="margin-left:8px;font-size:10px" id="updateTime">--</span></div>
   </div>
-  <div class="ticker">
-    <span class="price" id="price">---</span>
-    <span class="change" id="change"></span>
-    <span class="meta">H:<span id="high">--</span> L:<span id="low">--</span></span>
-  </div>
-  <div class="status-line">
-    <span>⏱ <span id="kline-countdown">--</span></span>
-    &nbsp;·&nbsp;
-    <span>📡 <span id="ws-indicator" style="color:var(--green)">●</span></span>
-    &nbsp;·&nbsp;
-    <span id="updated">--</span>
-  </div>
+  <div class="status-line"><span class="dot dot-green" id="statusDot"></span><span id="statusText">connecting...</span> · <span id="uptimeText">--</span> · <span id="klineCount">K#--</span></div>
+  <div class="ticker"><span class="price" id="priceVal">--</span><span class="change" id="changeVal">--</span><span class="meta" id="meta24h">H:-- L:--</span></div>
 </div>
 
-<!-- EQUITY + STATS + RISK (4-up) -->
-<div class="grid-4">
-  <div class="panel">
-    <div class="panel-hdr"><span class="label">权益</span><span class="val" id="init-cap-label">$1,000</span></div>
-    <div class="kv"><span class="k">Equity</span><span class="v" id="equity">--</span></div>
-    <div class="kv"><span class="k">余额</span><span class="v" id="cash">--</span></div>
-  </div>
-  <div class="panel">
-    <div class="panel-hdr"><span class="label">总收益</span><span class="val">已实现+浮动</span></div>
-    <div class="kv"><span class="k">return</span><span class="v" id="total-return">--</span></div>
-    <div class="risk-bar"><div class="risk-fill" id="risk-meter" style="width:0%"></div></div>
-  </div>
-  <div class="panel">
-    <div class="panel-hdr"><span class="label">交易</span><span class="val" id="stats-hdr">--</span></div>
-    <div class="kv"><span class="k">总交易</span><span class="v" id="total-trades">0</span></div>
-    <div class="kv"><span class="k">胜率</span><span class="v" id="win-rate">--</span></div>
-  </div>
-  <div class="panel">
-    <div class="panel-hdr"><span class="label">持仓</span><span class="val" id="pos-hdr">FLAT</span></div>
-    <div class="kv"><span class="k">方向</span><span class="v" id="pos-side">--</span></div>
-    <div class="kv"><span class="k">P&L</span><span class="v" id="pos-pnl">--</span></div>
-  </div>
+<div class="grid-4" id="metricsGrid">
+  <div class="panel"><div class="stat"><div class="val" id="equityVal">--</div><div class="sub">权益</div><div class="hint" id="returnVal">--</div></div></div>
+  <div class="panel"><div class="stat"><div class="val" id="cashVal">--</div><div class="sub">可用余额</div></div></div>
+  <div class="panel"><div class="stat"><div class="val" id="pnlVal">--</div><div class="sub">浮动盈亏</div></div></div>
+  <div class="panel"><div class="stat"><div class="val" id="tradesVal">--</div><div class="sub">交易次数</div><div class="hint" id="winrateVal">--</div></div></div>
 </div>
 
-<!-- POSITION DETAIL + INDICATORS -->
 <div class="grid-2">
   <div class="panel">
-    <div class="panel-hdr"><span class="label">POSITION DETAIL</span><span class="val" id="pos-det-hdr">--</span></div>
-    <div id="position-area"></div>
+    <div class="panel-hdr"><span class="label">📌 持仓</span><span class="dim" style="font-size:10px" id="posCount">--</span></div>
+    <div id="positionPanel"><div class="empty">加载中...</div></div>
   </div>
   <div class="panel">
-    <div class="panel-hdr"><span class="label">INDICATORS</span><span class="val" id="sig-latest">--</span></div>
-    <table class="ta" id="ind-body"></table>
-    <div class="sparkline-container">
-      <svg id="sparkline" width="100%" height="40" viewBox="0 0 300 40" preserveAspectRatio="none"></svg>
-    </div>
+    <div class="panel-hdr"><span class="label">🕐 最近交易</span><span class="dim" style="font-size:10px" id="tradeCount">--</span></div>
+    <div id="tradesPanel"><div class="empty">加载中...</div></div>
   </div>
 </div>
 
-<!-- SIGNAL LOG + TRADE LOG -->
-<div class="grid-2">
-  <div class="panel">
-    <div class="panel-hdr"><span class="label">SIGNAL LOG</span><span class="val" id="sig-count">0</span></div>
-    <div class="log-box" id="signal-log">
-      <div class="log-line" style="color:var(--text-dim)">等待信号...</div>
-    </div>
-  </div>
-  <div class="panel">
-    <div class="panel-hdr"><span class="label">TRADE LOG</span><span class="val" id="trade-count">0</span></div>
-    <div class="log-box" id="trade-log">
-      <div class="log-line" style="color:var(--text-dim)">暂无记录</div>
-    </div>
-  </div>
+<div class="panel" style="margin-bottom:10px">
+  <div class="panel-hdr"><span class="label">⚙️ 指标</span></div>
+  <div id="indicatorsPanel"><div class="empty">--</div></div>
 </div>
 
-<div class="footer">
-  CryptoQuant v0.3 · Hermes · <span class="rf" onclick="fetchData()">↻ refresh</span>
-  · <span id="refresh-info">waiting...</span>
+<div class="panel" style="margin-bottom:10px">
+  <div class="panel-hdr"><span class="label">📡 信号</span><span class="dim" style="font-size:10px" id="signalCount">--</span></div>
+  <div id="signalsPanel"><div class="empty">等待信号...</div></div>
 </div>
 
+<div class="panel" style="margin-bottom:10px">
+  <div class="panel-hdr"><span class="label">📊 K线 & 价格</span></div>
+  <div style="display:flex;align-items:flex-end;height:60px;gap:1px;margin-top:6px" id="klineBar"></div>
+</div>
+
+<div class="footer" style="text-align:center;color:var(--text-dim);font-size:10px;padding:12px 0;border-top:1px solid var(--border);margin-top:12px">
+  CryptoQuant v7.2 · <span id="footerTime">--</span>
+</div>
 </div>
 
 <script>
-let priceSeries = [];
-let refreshCount = 0;
-let pollInterval = 3000;
-let fetchPending = false;
+const API = '/api/data';
+let lastData = null;
 
-async function pollLoop() {
-  if (fetchPending) return;
-  fetchPending = true;
-  try {
-    const r = await fetch('/api/data?_=' + Date.now());
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const d = await r.json();
-    refreshCount++;
-    document.getElementById('refresh-info').textContent = '#' + refreshCount + ' @ ' + new Date().toLocaleTimeString();
-    pollInterval = 3000;
-    render(d);
-  } catch(e) {
-    document.getElementById('ws-indicator').innerHTML = '<span style="color:var(--red)">&#10005;</span>';
-    pollInterval = Math.min(pollInterval * 1.5, 15000);
+async function fetchData(){
+  const t = Date.now();
+  try{
+    const r = await fetch(API+`?_=${t}`);
+    if(!r.ok) throw new Error(r.status+'');
+    lastData = await r.json();
+    render(lastData);
+  }catch(e){
+    document.getElementById('updateTime').textContent='ERR: '+e.message;
+    if(!lastData) document.querySelectorAll('.val').forEach(el=>el.textContent='ERR');
   }
-  fetchPending = false;
-  setTimeout(pollLoop, pollInterval);
 }
 
-function render(d) {
-  const p = d.current_price || 0;
+function render(d){
+  // Header
+  const upEl = document.getElementById('updateTime');
+  upEl.textContent = d.updated_at||'--';
+  document.getElementById('statusText').textContent = d.mode||'--';
+  document.getElementById('klineCount').textContent = 'K# '+(d.kline?.is_closed?'closed':'open');
+  document.getElementById('uptimeText').textContent = '运行 '+calcUptime(d.updated_at);
 
-  /* Mode badge */
-  const mb = document.getElementById('mode-badge');
-  if (d.mode === 'LIVE') {
-    mb.className = 'badge badge-live';
-    mb.innerHTML = '<span class="dot dot-green"></span>LIVE';
-  } else {
-    mb.className = 'badge badge-sim';
-    mb.innerHTML = '<span class="dot dot-yellow"></span>SIM';
-  }
+  const p = d.current_price||0;
+  const cp = d.change_pct||0;
+  document.getElementById('priceVal').textContent = p>0?'$'+fmt(p):'--';
+  const chEl = document.getElementById('changeVal');
+  chEl.textContent = (cp>=0?'+':'')+cp.toFixed(2)+'%';
+  chEl.className = 'change '+(cp>=0?'green':'red');
+  document.getElementById('meta24h').textContent = '24H H:'+fmt(d.high_24h||0)+' L:'+fmt(d.low_24h||0);
 
-  /* Ticker */
-  document.getElementById('price').textContent = p > 0 ? '$' + p.toLocaleString() : '---';
-  const cp = d.change_pct || 0;
-  const ch = document.getElementById('change');
-  ch.textContent = cp !== 0 ? (cp > 0 ? '+' : '') + cp.toFixed(2) + '%' : '';
-  ch.style.color = cp > 0 ? 'var(--green)' : cp < 0 ? 'var(--red)' : 'var(--text-dim)';
-  document.getElementById('high').textContent = d.high_24h > 0 ? '$' + d.high_24h.toFixed(0) : '--';
-  document.getElementById('low').textContent  = d.low_24h  > 0 ? '$' + d.low_24h.toFixed(0)  : '--';
+  // Badge
+  const mb = document.getElementById('modeBadge');
+  mb.textContent = d.mode||'SIMULATION';
+  mb.className = 'badge '+(d.mode==='LIVE'?'badge-live':'badge-sim');
 
-  /* WS indicator */
-  if (p > 0) document.getElementById('ws-indicator').innerHTML = '<span style="color:var(--green)">&#9679;</span>';
-  document.getElementById('updated').textContent = d.updated_at || '';
+  // Metrics
+  const eq = d.equity||0;
+  const eqEl = document.getElementById('equityVal');
+  eqEl.textContent = '$'+eq.toFixed(2);
+  eqEl.style.color = d.total_return_pct>=0?'var(--green)':'var(--red)';
+  const rtEl = document.getElementById('returnVal');
+  rtEl.textContent = (d.total_return_pct>=0?'+':'')+d.total_return_pct.toFixed(2)+'%';
+  rtEl.style.color = d.total_return_pct>=0?'var(--green)':'var(--red)';
 
-  /* Kline countdown */
-  if (d.kline && d.kline.close_time) {
-    const now = Date.now();
-    const remaining = Math.max(0, Math.ceil((d.kline.close_time - now) / 1000));
-    const min = Math.floor(remaining / 60);
-    const sec = remaining % 60;
-    document.getElementById('kline-countdown').textContent = min + ':' + String(sec).padStart(2,'0') + ' to close';
-  } else {
-    document.getElementById('kline-countdown').textContent = '--';
-  }
+  document.getElementById('cashVal').textContent = '$'+(d.cash||0).toFixed(2);
 
-  /* Equity & Cash (stable — no more jumps) */
-  document.getElementById('equity').textContent = '$' + (d.equity || 0).toLocaleString(undefined, {minFractionDigits:2,maxFractionDigits:2});
-  document.getElementById('cash').textContent   = '$' + (d.cash || 0).toLocaleString(undefined, {minFractionDigits:2,maxFractionDigits:2});
-  document.getElementById('init-cap-label').textContent = '$' + (d.initial_capital || 1000).toLocaleString();
+  const uPnl = d.position?.pnl||0;
+  const pnlEl = document.getElementById('pnlVal');
+  pnlEl.textContent = (uPnl>=0?'+':'')+'$'+uPnl.toFixed(2);
+  pnlEl.style.color = uPnl>=0?'var(--green)':'var(--red)';
+  if(d.position) document.getElementById('pnlVal').textContent += ' ('+(d.position.pnl_pct>=0?'+':'')+d.position.pnl_pct.toFixed(2)+'%)';
 
-  /* Total return */
-  const trEl = document.getElementById('total-return');
-  const tr = d.total_return_pct || 0;
-  trEl.textContent = (tr >= 0 ? '+' : '') + tr.toFixed(2) + '%';
-  trEl.style.color = tr >= 0 ? 'var(--green)' : 'var(--red)';
+  document.getElementById('tradesVal').textContent = d.stats?.total_trades||0;
+  document.getElementById('winrateVal').textContent = '胜率 '+(d.stats?.win_rate||0)+'%';
 
-  /* Risk meter: how much of initial capital is drawdown */
-  const dd = tr < 0 ? Math.min(100, Math.abs(tr)) : 0;
-  const rm = document.getElementById('risk-meter');
-  rm.style.width = Math.min(dd, 50) + '%';
-  rm.style.background = dd > 20 ? 'var(--red)' : dd > 10 ? 'var(--orange)' : 'var(--green)';
-
-  /* Stats */
-  const s = d.stats || {};
-  document.getElementById('total-trades').textContent = s.total_trades || 0;
-  document.getElementById('win-rate').textContent = s.win_rate != null ? s.win_rate.toFixed(1) + '%' : '--';
-  document.getElementById('stats-hdr').textContent = (s.total_trades || 0) + ' trades';
-
-  /* Position summary (top bar) */
-  const posHdr = document.getElementById('pos-hdr');
-  const posSide = document.getElementById('pos-side');
-  const posPnl = document.getElementById('pos-pnl');
-  if (d.position) {
+  // Position
+  document.getElementById('posCount').textContent = d.position?'1 个':'0 个';
+  const pp = document.getElementById('positionPanel');
+  if(d.position){
     const pos = d.position;
-    posHdr.textContent = pos.side.toUpperCase() + ' ' + (pos.leverage || 1) + 'x';
-    posSide.textContent = pos.side.toUpperCase();
-    posSide.style.color = pos.side === 'long' ? 'var(--green)' : 'var(--red)';
-    const pnlVal = pos.pnl || 0;
-    posPnl.textContent = (pnlVal >= 0 ? '+' : '') + '$' + pos.pnl.toFixed(2);
-    posPnl.style.color = pnlVal >= 0 ? 'var(--green)' : 'var(--red)';
-  } else {
-    posHdr.textContent = 'FLAT';
-    posSide.textContent = '--';
-    posPnl.textContent = '--';
+    pp.innerHTML = `<table><tr>
+      <th>方向</th><th>数量</th><th>入场</th><th>当前</th><th>杠杆</th><th>保证金</th>
+    </tr><tr>
+      <td class="${pos.side==='long'?'blue':'red'}" style="font-weight:600">${pos.side.toUpperCase()}</td>
+      <td>${pos.size}</td>
+      <td>$${fmt(pos.entry_price)}</td>
+      <td class="${pos.pnl>=0?'green':'red'}">$${fmt(pos.current_price)}</td>
+      <td>${pos.leverage}x</td>
+      <td>$${pos.margin.toFixed(2)}</td>
+    </tr></table>`;
+  }else{
+    pp.innerHTML = '<div class="empty">暂无持仓 🏖️</div>';
   }
 
-  /* Position detail area */
-  const pa = document.getElementById('position-area');
-  if (d.position) {
-    const pos = d.position;
-    const pnlClass = (pos.pnl || 0) >= 0 ? 'pnl-pos' : 'pnl-neg';
-    const pnlSign = (pos.pnl || 0) >= 0 ? '+' : '';
-    pa.innerHTML =
-      '<div class="pos-row">' +
-        '<span class="pos-side ' + (pos.side === 'long' ? 'long' : 'short') + '">' + pos.side.toUpperCase() + '</span>' +
-        '<span>' + (pos.size || 0).toFixed(4) + ' BTC</span>' +
-        '<span>entry $' + (pos.entry_price || 0).toLocaleString() + '</span>' +
-        '<span>now $' + (pos.current_price || 0).toLocaleString() + '</span>' +
-        '<span class="' + pnlClass + '">' + pnlSign + '$' + Math.abs(pos.pnl || 0).toFixed(2) + '</span>' +
-      '</div>' +
-      '<div style="margin-top:6px;font-size:11px;color:var(--text-dim);display:flex;gap:14px;flex-wrap:wrap;">' +
-        '<span>Lvg: <b style="color:var(--text)">' + (pos.leverage || 1) + 'x</b></span>' +
-        '<span>Margin: <b style="color:var(--text)">$' + (pos.margin || 0).toFixed(0) + '</b></span>' +
-        '<span>PnL%: <b style="color:' + ((pos.pnl_pct || 0) >= 0 ? 'var(--green)' : 'var(--red)') + '">' + ((pos.pnl_pct || 0) >= 0 ? '+' : '') + (pos.pnl_pct || 0).toFixed(2) + '%</b></span>' +
-      '</div>';
-  } else {
-    pa.innerHTML = '<div class="pos-empty">&#9492; 无持仓</div>';
+  // Trades
+  const trades = d.trades||[];
+  document.getElementById('tradeCount').textContent = trades.length+' 条';
+  const tp = document.getElementById('tradesPanel');
+  if(trades.length>0){
+    const recent = trades.slice(-15).reverse();
+    tp.innerHTML = recent.map(t=>{
+      const isBuy = t.action==='做多'||t.action==='平空';
+      const cls = (t.pnl>0)?'green':(t.pnl<0?'red':'dim');
+      return `<div style="display:flex;justify-content:space-between;padding:4px 6px;border-bottom:1px solid rgba(30,41,59,0.3);font-size:11px">
+        <span style="color:${isBuy?'var(--green)':'var(--red)'};font-weight:600">${t.action}</span>
+        <span>$${fmt(t.price)}</span>
+        <span class="${cls}">${t.pnl>0?'+':''}$${t.pnl.toFixed(2)}</span>
+        <span class="dim" style="font-size:10px">${t.time.slice(11,19)}</span>
+      </div>`;
+    }).join('');
+  }else{
+    tp.innerHTML = '<div class="empty">等待首次交易 ⏳</div>';
   }
 
-  /* Indicators */
-  const ind = d.indicators || {};
-  document.getElementById('ind-body').innerHTML =
-    '<tr><td class="ik">MA7</td><td class="iv">' + (ind.ma7 ? '$' + ind.ma7.toFixed(0) : '--') + '</td></tr>' +
-    '<tr><td class="ik">MA25</td><td class="iv">' + (ind.ma25 ? '$' + ind.ma25.toFixed(0) : '--') + '</td></tr>' +
-    '<tr><td class="ik">MA99</td><td class="iv">' + (ind.ma99 ? '$' + ind.ma99.toFixed(0) : '--') + '</td></tr>' +
-    '<tr><td class="ik">RSI(14)</td><td class="iv" style="color:' + (ind.rsi > 70 ? 'var(--red)' : ind.rsi < 30 ? 'var(--green)' : 'var(--text)') + '">' + (ind.rsi != null ? ind.rsi.toFixed(1) : '--') + '</td></tr>' +
-    '<tr><td class="ik">ADX</td><td class="iv">' + (ind.adx != null ? ind.adx.toFixed(1) : '--') + '</td></tr>' +
-    '<tr><td class="ik">MACD</td><td class="iv" style="color:' + (ind.macd_hist > 0 ? 'var(--green)' : 'var(--red)') + '">' + (ind.macd_hist != null ? (ind.macd_hist >= 0 ? '+' : '') + ind.macd_hist.toFixed(1) : '--') + '</td></tr>' +
-    '<tr><td class="ik">VOL</td><td class="iv">' + (ind.volatility != null ? ind.volatility.toFixed(2) + '%' : '--') + '</td></tr>';
+  // Indicators
+  const ind = d.indicators||{};
+  document.getElementById('indicatorsPanel').innerHTML = `<div class="indicators">
+    <span>RSI <b class="${ind.rsi>60?'green':ind.rsi<35?'red':'dim'}">${fmt(ind.rsi)}</b></span>
+    <span>ADX <b class="${ind.adx>40?'yellow':ind.adx>25?'blue':'dim'}">${fmt(ind.adx)}</b></span>
+    <span>MACDh <b class="${(ind.macd_hist||0)>=0?'green':'red'}">${(ind.macd_hist||0).toFixed(1)}</b></span>
+    <span>MA7 <b>$${fmt(ind.ma7)}</b></span>
+    <span>MA25 <b>$${fmt(ind.ma25)}</b></span>
+    <span>价格 <b class="${p>=(ind.ma25||p)?'green':'red'}">${p>=(ind.ma25||p)?'↑':'↓'}</b></span>
+  </div>`;
 
-  /* Sparkline */
-  if (p > 0) {
-    priceSeries.push(p);
-    if (priceSeries.length > 80) priceSeries = priceSeries.slice(-80);
-    drawSparkline(priceSeries);
+  // Signals
+  const sigs = d.signals||[];
+  document.getElementById('signalCount').textContent = sigs.length+' 条';
+  const sp = document.getElementById('signalsPanel');
+  if(sigs.length>0){
+    const recent = sigs.slice(-25);
+    sp.innerHTML = '<div class="sig">'+recent.map(s=>{
+      const cls = s.signal==='BUY'||s.signal==='LONG'?'sig-buy':s.signal==='SELL'||s.signal==='SHORT'||s.signal==='COVER'?'sig-sell':'sig-hold';
+      const rsiText = s.rsi?` RSI=${s.rsi}`:'';
+      const scoreText = (s.short_score||s.long_score)?` S${s.short_score||'?'}/L${s.long_score||'?'}`:'';
+      return `<span class="${cls}">${s.time} ${s.signal}${rsiText}${scoreText}</span>`;
+    }).join('')+'</div>';
+  }else{
+    sp.innerHTML = '<div class="empty">等待信号...</div>';
   }
 
-  /* Trade log */
-  const trades = d.trades || [];
-  document.getElementById('trade-count').textContent = trades.length;
-  const tl = document.getElementById('trade-log');
-  if (trades.length === 0) {
-    tl.innerHTML = '<div class="log-line" style="color:var(--text-dim)">暂无记录</div>';
-  } else {
-    tl.innerHTML = trades.slice(-20).reverse().map(t => {
-      const isOpen = t.action === '做多' || t.action === '做空';
-      let detail = t.action + ' @ $' + (t.price || 0).toLocaleString();
-      if (t.leverage) detail += ' | ' + t.leverage + 'x';
-      if (t.pnl !== undefined && t.pnl !== 0) {
-        detail += ' | PnL=' + (t.pnl > 0 ? '+' : '') + t.pnl.toFixed(2);
-      }
-      return '<div class="log-line"><span class="ts">' + (t.time && t.time.includes(' ') ? t.time.split(' ')[1] : t.time || '') + '</span><span class="' + (isOpen ? 'act-open' : 'act-close') + '">' + detail + '</span></div>';
-    }).join('\n');
+  // Price bar
+  const prices = (d.price_history||[]).map(x=>x.price).filter(x=>x>0);
+  if(prices.length>0){
+    const min = Math.min(...prices);
+    const max = Math.max(...prices);
+    const range = max-min||1;
+    const bars = document.getElementById('klineBar');
+    const w = Math.max(2, Math.min(4, 120/prices.length));
+    bars.innerHTML = prices.map(pr=>{
+      const h = ((pr-min)/range)*50+10;
+      const color = pr>=prices[prices.length-1]?'var(--green)':'var(--red)';
+      return `<span class="bar" style="height:${h}px;background:${color};width:${w}px"></span>`;
+    }).join('');
   }
 
-  /* Signal log */
-  const signals = d.signals || [];
-  document.getElementById('sig-count').textContent = signals.length;
-  const sl = document.getElementById('signal-log');
-  if (signals.length === 0) {
-    sl.innerHTML = '<div class="log-line" style="color:var(--text-dim)">等待K线闭合...</div>';
-    document.getElementById('sig-latest').textContent = '--';
-  } else {
-    sl.innerHTML = signals.slice(-30).reverse().map(s =>
-      '<div class="log-line"><span class="ts">' + s.time + '</span><span class="sig-' + s.signal + '">' + s.signal + ' @ $' + (s.price || 0).toLocaleString() + '</span> <span style="color:var(--text-dim)">Eq=' + (s.equity || 0).toLocaleString() + '</span></div>'
-    ).join('\n');
-    const latest = signals[signals.length - 1];
-    if (latest) document.getElementById('sig-latest').textContent = latest.signal + ' #' + (latest.kline || '');
-  }
+  document.getElementById('footerTime').textContent = new Date().toLocaleString('zh-CN');
 }
 
-/* Sparkline */
-function drawSparkline(series) {
-  if (series.length < 2) return;
-  const svg = document.getElementById('sparkline');
-  const w = 300, h = 40, pad = 3;
-  const min = Math.min(...series), max = Math.max(...series);
-  const range = max - min || 1;
-  const step = w / (series.length - 1);
-  let path = '';
-  series.forEach((v, i) => {
-    const x = i * step;
-    const y = h - pad - ((v - min) / range * (h - pad*2));
-    path += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
-  });
-  const isUp = series[series.length-1] >= series[0];
-  svg.innerHTML =
-    '<defs>' +
-      '<linearGradient id="g" x1="0" y1="0" x2="0" y2="1">' +
-        '<stop offset="0%" stop-color="' + (isUp ? 'rgba(127,217,98,0.15)' : 'rgba(242,109,120,0.15)') + '"/>' +
-        '<stop offset="100%" stop-color="rgba(0,0,0,0)"/>' +
-      '</linearGradient>' +
-    '</defs>' +
-    '<path d="' + path + ' L' + ((series.length-1)*step) + ',' + (h-pad) + ' L0,' + (h-pad) + ' Z" fill="url(#g)" stroke="none"/>' +
-    '<path d="' + path + '" fill="none" stroke="' + (isUp ? 'var(--green)' : 'var(--red)') + '" stroke-width="1.5" stroke-linejoin="round"/>';
-}
+function fmt(n){return n?n.toLocaleString('zh-CN',{maximumFractionDigits:2,minimumFractionDigits:0}):'--';}
+function calcUptime(ts){return ts?'<1d':'--';}
 
-pollLoop();
-setInterval(() => { document.title = new Date().toLocaleTimeString() + ' | CryptoQuant'; }, 1000);
+fetchData();
+setInterval(fetchData, 3000);
 </script>
 </body>
 </html>

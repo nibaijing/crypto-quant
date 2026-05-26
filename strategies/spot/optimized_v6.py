@@ -37,51 +37,51 @@ from typing import Optional, Dict, List
 
 logger = logging.getLogger(__name__)
 
-# === 信号阈值（盈利优化 v7.2）===
-# 做空 (主要盈利来源)
-RSI_SHORT_ENTRY = 55       # RSI≥55做空加分
-RSI_SHORT_MIN = 28         # RSI必须>28 (仅防极端超卖)
-RSI_SHORT_EXIT = 22        # RSI跌到22以下平空(给更多盈利空间)
-ADX_SHORT_MIN = 25         # ADX≥25有趋势（降低门槛捕捉更多机会）
-ADX_SHORT_STRONG = 35      # 强趋势确认
-STOP_LOSS_SHORT_BP = 200   # 做空止损200bp(缩小止损让R:R更好)
+# === 信号阈值（盈利优化 v7.3 — 精简亏损交易，提升胜率）===
+# 做空 (核心盈利方向 — 强趋势下跌只做空)
+RSI_SHORT_ENTRY = 50       # RSI≥50做空加分(降低门槛)
+RSI_SHORT_MIN = 30         # RSI必须>30 (防极端超卖入场)
+RSI_SHORT_EXIT = 18        # RSI跌到18以下平空(给更多盈利空间，容忍小幅反弹)
+ADX_SHORT_MIN = 28         # ADX≥28有趋势
+ADX_SHORT_STRONG = 40      # 强趋势确认
+STOP_LOSS_SHORT_BP = 250   # 做空止损250bp(给价格波动足够空间)
 
-# 做多 (反弹交易 — 放宽条件抓更多机会)
-RSI_LONG_ENTRY = 45        # RSI低于45考虑做反弹(从38放宽)
-RSI_LONG_MAX_ENTRY = 58    # RSI不能>58还做多
-RSI_LONG_EXIT = 52         # RSI回到52以上平多(更早锁利)
-STOP_LOSS_LONG_BP = 180    # 做多止损180bp
+# 做多 (仅在强势上涨趋势中做多)
+RSI_LONG_ENTRY = 38        # RSI低于38才考虑做反弹(收紧，减少逆势做多)
+RSI_LONG_MAX_ENTRY = 48    # RSI不能>48还做多
+RSI_LONG_EXIT = 48         # RSI回到48以上平多(更早锁利)
+STOP_LOSS_LONG_BP = 200    # 做多止损200bp
 
 # 通用阈值
-ADX_NO_TRADE = 15          # ADX<15不开仓(降低至15抓偏弱趋势入场机会)
+ADX_NO_TRADE = 18          # ADX<18不开仓
 MIN_HOLD_BARS = 1          # 最少持仓1根K线(15分钟)
-MAX_HOLD_BARS = 36         # 最长持仓36根K线(9小时)
-COOLDOWN_BARS = 3          # 亏损后冷却3根K线(45分钟 — 从4小时大幅缩短)
-COOLDOWN_TICK_SEC = 60     # 亏损后tick级冷却60秒
+MAX_HOLD_BARS = 24         # 最长持仓24根K线(6小时)
+COOLDOWN_BARS = 6          # 亏损后冷却6根K线(90分钟 — 给价格足够时间恢复趋势)
+COOLDOWN_TICK_SEC = 300     # 亏损后tick级冷却5分钟(减少连续亏损)
 
 # === 仓位管理 ===
-MAX_POSITION_PCT = 0.18    # 单笔18%权益作保证金(从15%略升)
-RISK_PER_TRADE = 0.02      # 单笔风险2.0%(从1.5%略升)
-STOP_ATR_MULT = 2.0        # ATR止损倍数
+MAX_POSITION_PCT = 0.15    # 单笔15%权益作保证金
+RISK_PER_TRADE = 0.015     # 单笔风险1.5%
+STOP_ATR_MULT = 2.5        # ATR止损倍数(容忍更大波动)
 
 # === 风险管理 ===
-MAX_DRAWDOWN_PCT = 0.30    # 30%回撤熔断(从25%放宽给盈利策略更多空间)
-INITIAL_CAPITAL = 1000
+MAX_DRAWDOWN_PCT = 0.30    # 30%回撤熔断
+INITIAL_CAPITAL = 571
 
 # === 限价单参数 ===
-LIMIT_OFFSET_BP = 5        # 限价单偏移5bp(从3bp提高,成交概率更高)
+LIMIT_OFFSET_BP = 8        # 限价单偏移8bp(成交概率更高)
 LIMIT_SLIPPAGE_BP = 3      # 允许限价单最大滑点
-TP_ATR_MULT = 1.5          # 止盈 = ATR × 1.5(从2.0降低,更快锁利)
-TP_TRAIL_BP = 30           # 盈利30bp后移动止损到保本
-TP_LOCK_BP = 100           # 盈利100bp后移动止盈到ATR×1.0锁利
+TP_ATR_MULT = 2.0          # 止盈 = ATR × 2.0(1:1 R:R以上才止盈)
+TP_TRAIL_BP = 50           # 盈利50bp后移动止损到保本
+TP_LOCK_BP = 120           # 盈利120bp后移动止盈到ATR×1.0锁利
 
 # 限价单超时
-LIMIT_ORDER_TIMEOUT = 60   # 限价单60秒不成交撤单(从30s放宽)
+LIMIT_ORDER_TIMEOUT = 90   # 限价单90秒不成交撤单
 
 # === Tick 级评估参数 ===
 TICK_EVAL_INTERVAL = 1.0   # tick评估最小间隔(秒)
-PRICE_REENTER_DELTA_BP = 8 # 撤单后价格变化>8bp才重新挂单(从10bp降低)
-MIN_PRICE_CHANGE_BP = 5    # Tick级信号: 价格变化<5bp不重复评估开仓(减少无效开销)
+PRICE_REENTER_DELTA_BP = 12 # 撤单后价格变化>12bp才重新挂单(减少重复挂单)
+MIN_PRICE_CHANGE_BP = 8    # Tick级信号: 价格变化<8bp不重复评估开仓(减少无效开销)
 
 
 class LimitOrder:
@@ -154,12 +154,15 @@ class OptimizedV6:
         # 限价单状态
         self._last_entry_price = 0  # 上次尝试入场价格
         self._last_entry_try = 0    # 上次尝试入场时间
+        self._entry_price = 0
+        self._position_side = None
 
         # V7.2 盈利优化: 追踪止盈 & 价格过滤
         self._trailing_stop_price = 0  # 当前追踪止损价
         self._trailing_tp_price = 0    # 当前追踪止盈价
         self._last_signal_price = 0    # 上次发出信号时的价格(用于价格变化过滤)
         self._best_pnl_bp = 0          # 持仓期间最佳盈亏(用于追踪止盈)
+        self._last_trade_time = 0      # 上次交易时间(用于冷却计时)
 
     def restore_state(self, state):
         if not state:
@@ -461,12 +464,15 @@ class OptimizedV6:
 
             logger.info(f"📏 Kline(signal) | {' | '.join(log_parts)}")
 
-            # 多空互斥
+            # 多空互斥 — 强趋势方向优先
             if short_signal and long_signal:
-                if self._regime == "strong_trend" and self._trend_down:
+                if self._trend_down:
+                    long_signal = False  # 下跌趋势不做多
+                elif self._trend_up:
+                    short_signal = False  # 上涨趋势不做空
+                elif self._regime == "strong_trend":
+                    short_signal = False  # 强趋势不明朗时都不做
                     long_signal = False
-                elif self._regime == "strong_trend" and self._trend_up:
-                    short_signal = False
                 else:
                     short_signal = False
                     long_signal = False
@@ -654,16 +660,18 @@ class OptimizedV6:
                 # 还在等成交，不用重复评估
                 return result
 
-            # 2. 冷却期 (盈利后无冷却, 亏损后)
+# 2. 亏损后冷却 — 亏损越大冷却越久
             if self._last_trade_pnl is not None and self._last_trade_pnl < -0.02:
-                if time.time() - self._last_entry_try < COOLDOWN_TICK_SEC:
+                loss_magnitude = abs(self._last_trade_pnl)
+                cooldown_sec = min(COOLDOWN_TICK_SEC * (1 + int(loss_magnitude * 200)), 1200)
+                if time.time() - max(self._last_entry_try, self._last_trade_time or 0) < cooldown_sec:
                     return result
 
-            # 3. 价格变化过滤: 价格变化<MIN_PRICE_CHANGE_BP不重复评估
+            # 3. 价格变化过滤: 价格变化<MIN_PRICE_CHANGE_BP不重复评估开仓
             if abs(current_price - self._last_signal_price) / max(self._last_signal_price, 1) * 10000 < MIN_PRICE_CHANGE_BP:
                 return result
 
-            # 4. 信号评估 (实时 — MACD死叉优先)
+            # 5. 信号评估 (实时 — MACD死叉优先)
             if adx < ADX_NO_TRADE:
                 return result
 
@@ -672,13 +680,16 @@ class OptimizedV6:
             short_macd_dead = macdh < 0
             short_rsi_bonus = rsi >= RSI_SHORT_ENTRY
 
-            # 做多放宽: RSI≤45 + 价格接近MA20(1%内) + 盘整/弱趋势
+            # 做多: 仅在上涨趋势或强盘整时考虑
             long_base = rsi <= RSI_LONG_ENTRY and rsi <= RSI_LONG_MAX_ENTRY
             long_choppy = self._regime in ("weak_trend", "chop", "trend")
             long_near_ma = abs(current_price - self.latest_indicators.get("ma20", current_price)) / max(self.latest_indicators.get("ma20", 1), 1) < 0.015
+            # 多空互斥: 下跌趋势禁止做多, 上涨趋势禁止做空
+            short_disabled = self._trend_up
+            long_disabled = self._trend_down or self._regime == "strong_trend"
 
-            # 限价单: 做空
-            if short_base and short_macd_dead:
+            # 限价单: 做空 (只在下跌趋势)
+            if not short_disabled and short_base and short_macd_dead and rsi >= RSI_SHORT_MIN:
                 size = self.get_position_size(executor.cash, current_price, 10, atr, "short")
                 limit_price = self._get_limit_price(current_price, "short_sell")
 
@@ -690,7 +701,7 @@ class OptimizedV6:
                 self._last_signal_price = current_price
 
                 extras = []
-                if short_rsi_bonus: extras.append(f"RSI={rsi:.0f}\u2265{RSI_SHORT_ENTRY}")
+                if short_rsi_bonus: extras.append(f"RSI={rsi:.0f}≥{RSI_SHORT_ENTRY}")
                 ext = f" ({', '.join(extras)})" if extras else ""
                 result["action"] = "PLACE_LIMIT"
                 result["side"] = "short_sell"
@@ -698,8 +709,8 @@ class OptimizedV6:
                 result["size"] = size
                 result["message"] = f"SHORT limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) macdh={macdh:.1f} ADX={adx:.0f}{ext}"
 
-            # 限价单: 做多 (放宽条件)
-            elif long_base and long_choppy and long_near_ma:
+            # 限价单: 做多 (仅在上涨趋势或盘整, 不做逆势反弹)
+            elif not long_disabled and long_base and long_choppy and long_near_ma:
                 size = self.get_position_size(executor.cash, current_price, 10, atr, "long")
                 limit_price = self._get_limit_price(current_price, "buy")
 
@@ -721,6 +732,8 @@ class OptimizedV6:
 
     def _reset_trade_state(self):
         """平仓后重置交易状态"""
+        import time
+        self._last_trade_time = time.time()
         self._trailing_stop_price = 0
         self._trailing_tp_price = 0
         self._best_pnl_bp = 0

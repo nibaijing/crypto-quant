@@ -133,13 +133,13 @@ def _extract_equity_from_log() -> Optional[float]:
 def _read_state_file() -> dict:
     """读取 executor 写入的最新状态。文件可能陈旧（无持仓时不更新）。"""
     if not STATE_FILE.exists():
-        return {"cash": 1000.0, "total_trades": 0, "winning_trades": 0, "position": None}
+        return {"cash": 571.0, "total_trades": 0, "winning_trades": 0, "position": None}
 
     try:
         with open(STATE_FILE) as f:
             return json.load(f)
     except Exception:
-        return {"cash": 1000.0, "total_trades": 0, "winning_trades": 0, "position": None}
+        return {"cash": 571.0, "total_trades": 0, "winning_trades": 0, "position": None}
 
 
 # ===== 核心 equity 计算（增强版，支持日志回退）=====
@@ -217,15 +217,27 @@ def _normalize_indicators(indicators):
 
 # ===== 从日志解析信号（精确匹配最新格式）=====
 
+def _dedup_signals(signals: list) -> list:
+    """去除重复信号行（相同time+price+signal的只保留第一个）。"""
+    seen = set()
+    result = []
+    for s in signals:
+        key = (s["time"], s["price"], s["signal"], s["kline"])
+        if key not in seen:
+            seen.add(key)
+            result.append(s)
+    return result
+
+
 def _parse_signals_from_log() -> list:
-    """从日志解析信号行 — 匹配最新格式。
+    """从日志解析信号行 — 适配 v7.x 最新格式。
     
     最新日志格式:
-      📊 $76,955 | Eq=$571 | SIG=HOLD | K#1
-      📏 sig=SIG | RSI=66 ADX=26 ... | L=0.38[...] S=0.30[...] thr=0.55
+      📊 $76,955 | Eq=$571 | Pos=-1.66% | SIG=HOLD | K#4
+      📏 Kline(signal) | RSI=22 ADX=77 MACDh=-16.4✗ | regime=... | SHORT=6/8✓ LONG=7/9
     
     Returns:
-        [{time, price, equity, signal, kline, long_score, short_score, threshold, rsi, adx}, ...]
+        [{time, price, equity, signal, kline, long_score, short_score, rsi, adx}, ...]
     """
     if not LOG_FILE.exists():
         return []
@@ -242,13 +254,13 @@ def _parse_signals_from_log() -> list:
         return []
 
     signals = []
-    # 解析 📊 行 — 主信号行，📊 是必需标记
+    # 解析 📊 行 — 主信号行
     pat_main = re.compile(
         r'📊\s*\$?([\d,]+).*?Eq=\$?([\d,]+).*?SIG=(\w+).*?K#(\d+)'
     )
-    # 解析 📏 行 — 评分详情行
-    pat_detail = re.compile(
-        r'RSI=([\d.]+)\s+ADX=([\d.]+).*?L=([\d.]+)\[.*?\]\s+S=([\d.]+)\[.*?\]\s+thr=([\d.]+)'
+    # 解析 📏 Kline(signal) 行 — 评分详情
+    pat_kline = re.compile(
+        r'📏\s+Kline\(signal\).*?RSI=([\d.]+)\s+ADX=([\d.]+).*?SHORT=([\d.]+)/\d+.*?LONG=([\d.]+)/\d+'
     )
     # 解析时间
     pat_time = re.compile(r'(\d{2}:\d{2}:\d{2})')
@@ -279,42 +291,50 @@ def _parse_signals_from_log() -> list:
             "kline": int(m.group(4)),
             "long_score": None,
             "short_score": None,
-            "threshold": None,
             "rsi": None,
             "adx": None,
+            "is_entry": None,  # 是否有入场信号
         }
 
-        # 向后搜索最多5行找评分详情（可能隔1-2行，如⛔拦截行在中间）
+        # 向后搜索最多5行找 Kline(signal) 评分详情
         for back in range(1, min(i, 5) + 1):
             prev_line = lines[i - back]
-            d = pat_detail.search(prev_line)
+            d = pat_kline.search(prev_line)
             if d:
                 try:
                     sig["rsi"] = float(d.group(1))
                     sig["adx"] = float(d.group(2))
-                    sig["long_score"] = float(d.group(3))
-                    sig["short_score"] = float(d.group(4))
-                    sig["threshold"] = float(d.group(5))
+                    sig["short_score"] = float(d.group(3))
+                    sig["long_score"] = float(d.group(4))
                 except ValueError:
                     pass
                 break
 
+            # 也检查是否有 ✅ LIMIT FILLED (入场)
+            if "LIMIT FILLED" in prev_line:
+                sig["is_entry"] = True
+
         signals.append(sig)
         i += 1
 
-    return signals
+    return _dedup_signals(signals)
 
 
 # ===== 从日志解析交易 =====
 
 def _parse_trades_from_log() -> list:
-    """从日志解析交易行 — 匹配最新格式。
+    """从日志解析交易行 — 适配 v7.x 限价单格式。
     
-    最新格式:
-      ✅ 合约做多: 0.0014 BTC-USDT @ 74922.00 | 10x
+    最新格式 (v7.x):
+      ✅ LIMIT FILLED: SHORT_FILLED @ $76,578
+      ✅ LIMIT FILLED: LONG_FILLED @ $76,500
+      ⚡ Tick 止损: COVER PnL=-200bp
+      ⚡ Tick 止损: SELL PnL=-180bp
+      ⚡ 追踪止盈: COVER @76500 PnL=+50bp
+    
+    v6 旧格式 (兼容):
       ✅ 合约做空: 0.0014 BTC-USDT @ 74698.00 | 10x
-      ✅ 合约平多: 0.0014 @ 74275.00 | PnL=-$0.91 | 手续费=-$0.00 | 净利=-$0.91
-      ✅ 合约平空: 0.0014 @ 74350.00 | PnL=+$0.49 | 手续费=-$0.00 | 净利=+$0.49
+      ✅ 合约平空: 0.0014 @ 74350.00 | PnL=+$0.49 | 净利=+$0.49
     """
     if not LOG_FILE.exists():
         return []
@@ -330,7 +350,46 @@ def _parse_trades_from_log() -> list:
     trades = []
 
     for line in lines:
-        # 开多
+        # === v7.x 限价单格式 ===
+        # LIMIT FILLED: SHORT_FILLED
+        m_filled = re.search(r'✅\s*LIMIT\s+FILLED:\s*(\w+_FILLED)\s*@\s*\$?([\d,.]+)', line)
+        if m_filled:
+            action_raw = m_filled.group(1)
+            price = float(m_filled.group(2).replace(",", ""))
+            action_map = {
+                "SHORT_FILLED": "做空",
+                "LONG_FILLED": "做多",
+                "SELL_FILLED": "平多",
+                "COVER_FILLED": "平空",
+            }
+            action = action_map.get(action_raw, action_raw)
+            trades.append({
+                "time": line[:19],
+                "action": action,
+                "price": price,
+                "size": 0,
+                "pnl": 0.0,
+            })
+            continue
+
+        # Tick 止损/止盈 (exit events)
+        m_sl = re.search(r'⚡\s*(?:Tick\s+)?(止损|追踪止损(?:失效)?|追踪止盈|ATR止盈|Tick\s+RSI)\S*\s*[→:]\s*(SELL|COVER)\s*@?\$?([\d.,]+).*?PnL=([+-]?[\d.]+)bp', line)
+        if m_sl:
+            exit_action = m_sl.group(2)
+            price = float(m_sl.group(3).replace(",", ""))
+            pnl_bp = float(m_sl.group(4))
+            exit_map = {"SELL": "平多", "COVER": "平空"}
+            trades.append({
+                "time": line[:19],
+                "action": exit_map.get(exit_action, exit_action),
+                "price": price,
+                "size": 0,
+                "pnl": round(pnl_bp / 100 * 0.571, 2),  # 估算USD PnL
+                "pnl_bp": pnl_bp,
+            })
+            continue
+
+        # === v6 旧格式兼容 ===
         m_open_long = re.search(r'✅\s*合约做多:\s*([\d.]+)\s+\S+\s+@\s*([\d.]+)\s*\|\s*([\d.]+)x', line)
         if m_open_long:
             trades.append({
@@ -343,7 +402,6 @@ def _parse_trades_from_log() -> list:
             })
             continue
 
-        # 开空
         m_open_short = re.search(r'✅\s*合约做空:\s*([\d.]+)\s+\S+\s+@\s*([\d.]+)\s*\|\s*([\d.]+)x', line)
         if m_open_short:
             trades.append({
@@ -356,7 +414,6 @@ def _parse_trades_from_log() -> list:
             })
             continue
 
-        # 平多
         m_close_long = re.search(r'✅\s*合约平多:.*?@\s*([\d.]+).*?净利=\$?([+-]?[\d.]+)', line)
         if m_close_long:
             trades.append({
@@ -367,7 +424,6 @@ def _parse_trades_from_log() -> list:
             })
             continue
 
-        # 平空
         m_close_short = re.search(r'✅\s*合约平空:.*?@\s*([\d.]+).*?净利=\$?([+-]?[\d.]+)', line)
         if m_close_short:
             trades.append({
@@ -394,7 +450,7 @@ def get_all_data() -> dict:
         "indicators": {}, "kline": {},
     }
     current_price = current_snap.get("price", 0)
-    initial_capital = 1000.0
+    initial_capital = 571.0  # 实际入金
 
     cash = float(state_raw.get("cash", initial_capital))
     total_trades = int(state_raw.get("total_trades", 0))

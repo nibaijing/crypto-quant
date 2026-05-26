@@ -61,6 +61,7 @@ running = True
 start_time: datetime = None
 kline_count = 0
 last_kline_close_time = 0
+_last_kline_key = None  # K线去重
 last_hist_retry = 0  # 历史K线重试计时器
 PRICE_SNAPSHOT = Path(__file__).parent / "data" / "ws_price_snapshot.json"
 
@@ -304,7 +305,7 @@ def main():
     logger.info(f"   数据: WebSocket 实时推送 (trade + kline_15m)")
     logger.info(f"   模式: K线闭合触发策略 | 秒级价格更新")
     logger.info(f"   因子: Alpha 因子集 v1.0 (44个因子)")
-    logger.info(f"   初始资金: $1,000")
+    logger.info(f"   初始资金: $571")
     logger.info("=" * 60)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -462,6 +463,12 @@ def main():
         # 2. 等待 K 线闭合 (不阻塞, timeout=1s 让 tick 循环跑起来)
         closed = market_state.wait_kline_closed(timeout=1.0)
         if closed:
+            # 去重: 确保同一K线只处理一次
+            kline_key = (closed.open_time, closed.close_time)
+            if kline_key == _last_kline_key:
+                continue
+            _last_kline_key = kline_key
+
             kline_count += 1
             logger.info(f"📦 K线闭合 #{kline_count}: O={closed.open:.0f} H={closed.high:.0f} L={closed.low:.0f} C={closed.close:.0f}")
 
@@ -542,7 +549,7 @@ def main():
     # 清理
     ws_client.stop()
     account = executor.get_account()
-    total_return = (account.total_equity - 1000) / 1000 * 100
+    total_return = (account.total_equity - 571) / 571 * 100
     logger.info("=" * 60)
     logger.info(f"⏹️ 已停止 | 运行: {get_uptime()} | K线: {kline_count}")
     logger.info(f"💰 最终权益: ${account.total_equity:,.2f} ({total_return:+.2f}%)")
