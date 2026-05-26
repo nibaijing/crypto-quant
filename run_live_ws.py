@@ -15,6 +15,7 @@ CryptoQuant 高性能实盘引擎
 
 import sys
 import os
+import json
 import time
 import signal
 import logging
@@ -64,6 +65,7 @@ last_kline_close_time = 0
 _last_kline_key = None  # K线去重
 last_hist_retry = 0  # 历史K线重试计时器
 PRICE_SNAPSHOT = Path(__file__).parent / "data" / "ws_price_snapshot.json"
+TICK_HISTORY = Path(__file__).parent / "data" / "tick_history.jsonl"  # 每5秒追加tick行
 
 
 def signal_handler(sig, frame):
@@ -470,11 +472,40 @@ def main():
 
 # 每5秒保存价格快照 (供 Dashboard)
         if now - last_snapshot > 5.0:
-            market_state.save_snapshot(str(PRICE_SNAPSHOT))
+            # 包含限价单信息
+            snap = market_state.get_snapshot()
+            if hasattr(strategy, 'active_limit_order') and strategy.active_limit_order:
+                lo = strategy.active_limit_order
+                snap['active_limit'] = {
+                    'side': lo.side, 'price': lo.price,
+                    'size': lo.size, 'placed_at': lo.placed_at
+                }
+            try:
+                with open(PRICE_SNAPSHOT, 'w') as f:
+                    json.dump(snap, f)
+            except:
+                pass
             # 同时更新 executor state（即使无持仓，保证 Dashboard 读到最新权益）
             if hasattr(executor, '_save_state'):
                 executor._save_state()
+            # 追加tick历史行 (供 Dashboard 聚合OHLC K线)
+            try:
+                k = market_state.get_kline() if hasattr(market_state, 'get_kline') else None
+                with open(TICK_HISTORY, "a") as tf:
+                    tf.write(json.dumps({
+                        "t": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "p": live_price,
+                        "k_open": k.open if k else 0,
+                        "k_high": k.high if k else 0,
+                        "k_low": k.low if k else 0,
+                        "k_close": k.close if k else 0,
+                        "k_open_time": k.open_time if k else 0,
+                    }) + "\n")
+            except Exception:
+                pass
             last_snapshot = now
+
+        # 清理过旧tick历史 (>5000行)
 
         # 每5分钟心跳 (证明进程存活)
         if now - last_minute_log > 300:

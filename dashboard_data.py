@@ -23,6 +23,7 @@ PROJECT_ROOT = Path(__file__).parent
 STATE_FILE = PROJECT_ROOT / "data" / "live_futures_state.json"
 PRICE_SNAPSHOT = PROJECT_ROOT / "data" / "ws_price_snapshot.json"
 LOG_FILE = PROJECT_ROOT / "data" / "live_trading.log"
+TICK_HISTORY = PROJECT_ROOT / "data" / "tick_history.jsonl"
 
 # ===== 缓存 =====
 _price_cache: List[dict] = []
@@ -31,6 +32,7 @@ _last_snapshot_key: Any = None
 _last_valid_equity: Optional[float] = None
 _last_valid_position: Optional[dict] = None
 _last_equity_from_log: Optional[float] = None  # 从心跳日志提取的最近权益
+_tick_history_cache: List[dict] = []  # 缓存tick_history行
 
 
 # ===== 价格快照读取 =====
@@ -79,33 +81,76 @@ def get_recent_prices(limit=60):
 
 
 def get_kline_history() -> list:
-    """从 price_cache 提取 K线级历史（1分钟聚合，保留 OHLC 信息）。"""
-    _read_price_snapshot()
-    prices = list(_price_cache) if _price_cache else []
-    if not prices:
-        return []
-    # 按分钟聚合
-    from collections import OrderedDict
-    minute_buckets = OrderedDict()
-    for p in prices:
-        ts = p.get("time", "")
-        minute_key = ts[:16] if len(ts) >= 16 else ts  # "2026-05-26 19:36"
-        if minute_key not in minute_buckets:
-            minute_buckets[minute_key] = {
-                "time": minute_key,
-                "open": p["price"],
-                "high": p["price"],
-                "low": p["price"],
-                "close": p["price"],
-            }
-        else:
-            b = minute_buckets[minute_key]
-            px = p["price"]
-            if px < b["low"]: b["low"] = px
-            if px > b["high"]: b["high"] = px
-            b["close"] = px
-    bars = list(minute_buckets.values())
-    return bars[-40:]  # 最近40根
+    """从 tick_history.jsonl 读取并聚合分钟级OHLC K线。"""
+    global _tick_history_cache
+
+    if not TICK_HISTORY.exists():
+        return _tick_history_cache[-40:] if _tick_history_cache else []
+
+    try:
+        mtime = TICK_HISTORY.stat().st_mtime
+        _last_mtime = getattr(get_kline_history, '_last_mtime', 0)
+        if mtime == _last_mtime and _tick_history_cache:
+            return _tick_history_cache[-40:]
+        get_kline_history._last_mtime = mtime
+
+        # 只读最近20000字节（尾部500行左右）
+        size = TICK_HISTORY.stat().st_size
+        offset = max(0, size - 20000)
+        with open(TICK_HISTORY, "r") as f:
+            if offset > 0:
+                f.seek(offset)
+                f.readline()  # 跳过可能不完整的行
+            lines = f.readlines()
+
+        # 解析 + 去重
+        ticks = []
+        seen = set()
+        for line in lines:
+            try:
+                obj = json.loads(line.strip())
+                key = obj.get("t", "") + str(int(obj.get("p", 0)))
+                if key not in seen:
+                    seen.add(key)
+                    ticks.append({
+                        "t": obj.get("t", ""),
+                        "p": obj.get("p", 0),
+                        "ko": obj.get("k_open", 0),
+                        "kh": obj.get("k_high", 0),
+                        "kl": obj.get("k_low", 0),
+                        "kc": obj.get("k_close", 0),
+                    })
+            except Exception:
+                continue
+
+        # 按分钟聚合OHLC
+        from collections import OrderedDict
+        minute_buckets = OrderedDict()
+        for t in ticks:
+            ts = t["t"]
+            minute_key = ts[:16] if len(ts) >= 16 else ts
+            px = t["p"]
+            if px <= 0:  # 过滤无效价格
+                continue
+            if minute_key not in minute_buckets:
+                minute_buckets[minute_key] = {
+                    "time": minute_key,
+                    "open": px,
+                    "high": px,
+                    "low": px,
+                    "close": px,
+                }
+            else:
+                b = minute_buckets[minute_key]
+                if px < b["low"]: b["low"] = px
+                if px > b["high"]: b["high"] = px
+                b["close"] = px
+
+        bars = list(minute_buckets.values())
+        _tick_history_cache = bars
+        return bars[-60:]  # 最近60根
+    except Exception as e:
+        return _tick_history_cache[-40:] if _tick_history_cache else []
 
 
 # ===== 从日志提取最新权益 =====
@@ -248,11 +293,12 @@ def _normalize_indicators(indicators):
 # ===== 从日志解析信号（精确匹配最新格式）=====
 
 def _dedup_signals(signals: list) -> list:
-    """去除重复信号行（相同time+price+signal的只保留第一个）。"""
+    """去除重复信号行（相同time+price+signal+rsi的只保留第一个）。"""
     seen = set()
     result = []
     for s in signals:
-        key = (s["time"], s["price"], s["signal"], s["kline"])
+        key = (s["time"], s["price"], s["signal"],
+               int(s.get("rsi") or 0), int(s.get("adx") or 0))
         if key not in seen:
             seen.add(key)
             result.append(s)
@@ -508,6 +554,7 @@ def get_all_data() -> dict:
         "low_24h": round(current_snap.get("low_24h", 0), 2),
         "indicators": _normalize_indicators(current_snap.get("indicators", {})),
         "position": pos_info,
+        "active_limit": snap.get("active_limit") if snap else None,
         "price_history": [p["price"] for p in prices[-40:]],
         "kline_history": get_kline_history(),
         "kline": current_snap.get("kline", {}),

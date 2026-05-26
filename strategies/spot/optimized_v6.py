@@ -37,29 +37,29 @@ from typing import Optional, Dict, List
 
 logger = logging.getLogger(__name__)
 
-# === 信号阈值（v7.4 — 高频盈利优化）===
-# 做空 (核心盈利方向 — 强趋势下跌只做空)
-RSI_SHORT_ENTRY = 60       # RSI≥60超买区做空(回弹做空，原65)
-RSI_SHORT_MIN = 50         # RSI必须>50 (防无趋势入场)
-RSI_SHORT_EXIT = 28        # RSI跌到28以下平空
-ADX_SHORT_MIN = 30         # ADX≥30有趋势才做空(原28)
-ADX_SHORT_STRONG = 45      # 强趋势确认
-STOP_LOSS_SHORT_BP = 150   # 做空止损150bp(收紧，单笔亏损可控)
+# === 信号阈值（v7.7 — 高频盈利优化 + 盘整交易）===
+# 做空
+RSI_SHORT_ENTRY = 58       # RSI≥58超买区做空(原60)
+RSI_SHORT_MIN = 45         # RSI必须>45 (原50)
+RSI_SHORT_EXIT = 25        # RSI跌到25以下平空(原28)
+ADX_SHORT_MIN = 22         # ADX≥22即有趋势做空(原30，放宽)
+ADX_SHORT_STRONG = 38      # 强趋势确认(原45)
+STOP_LOSS_SHORT_BP = 150   # 做空止损150bp
 
-# 做多 (上涨趋势回踩多 + 盘整超卖反弹)
-RSI_LONG_ENTRY = 40        # RSI低于40可做回踩多(上涨趋势)/超卖反弹(盘整) — 收紧防止高RSI高买
-RSI_LONG_MAX_ENTRY = 50    # RSI不能>50还做多(原60，防止高RSI追涨)
-RSI_LONG_EXIT = 62         # RSI回到62以上才平多(原55，减少tick级误平仓)
-RSI_LONG_EXIT_MIN_PROFIT_BP = 15  # RSI平仓需要至少15bp利润覆盖手续费(≈0.06%开仓+0.06%平仓)
-MIN_HOLD_TICK_SEC = 30     # 持仓最少持30秒才允许RSI触发平仓
-STOP_LOSS_LONG_BP = 150    # 做多止损150bp(原200，收紧控制单笔亏损)
+# 做多
+RSI_LONG_ENTRY = 42        # RSI低于42可做回踩多/超卖反弹(原40)
+RSI_LONG_MAX_ENTRY = 52    # RSI不能>52还做多(原50)
+RSI_LONG_EXIT = 62         # RSI回到62以上才平多
+RSI_LONG_EXIT_MIN_PROFIT_BP = 12  # RSI平仓需要至少12bp利润(原15)
+MIN_HOLD_TICK_SEC = 20     # 持仓最少持20秒(原30)
+STOP_LOSS_LONG_BP = 150    # 做多止损150bp
 
 # 通用阈值
-ADX_NO_TRADE = 18          # ADX<18不开仓
+ADX_NO_TRADE = 12          # ADX<12才不开仓(原18 — 支持更多盘整交易)
 MIN_HOLD_BARS = 1          # 最少持仓1根K线(15分钟)
 MAX_HOLD_BARS = 24         # 最长持仓24根K线(6小时)
-COOLDOWN_BARS = 6          # 亏损后冷却6根K线(90分钟 — 给价格足够时间恢复趋势)
-COOLDOWN_TICK_SEC = 300     # 亏损后tick级冷却5分钟(减少连续亏损)
+COOLDOWN_BARS = 4          # 亏损后冷却4根K线(原6)
+COOLDOWN_TICK_SEC = 180    # 亏损后tick级冷却3分钟(原300)
 
 # === 仓位管理 ===
 MAX_POSITION_PCT = 0.12    # 单笔12%权益作保证金(原15%，更保守)
@@ -153,6 +153,9 @@ class OptimizedV6:
         }
         self._trend_down = False
         self._trend_up = False
+        self._trend_flat = True
+        self._prev_ma5 = 0
+        self._prev_ma20 = 0
         self._regime = "chop"
         self._index = 0  # K线计数
 
@@ -230,12 +233,18 @@ class OptimizedV6:
             "di_plus": di_plus, "di_minus": di_minus, "close": c,
         }
 
-        # 趋势方向
-        price_above_ma = c > ma5 > ma20
-        price_below_ma = c < ma5 < ma20
-        di_bullish = di_plus > di_minus
-        self._trend_up = price_above_ma and di_bullish
-        self._trend_down = price_below_ma and not di_bullish
+        # 趋势方向 — 使用MA斜率判断(比price_above_ma+di_bullish更稳定)
+        ma5_slope = ma5 - self._prev_ma5 if self._prev_ma5 > 0 else 0
+        ma20_slope = ma20 - self._prev_ma20 if self._prev_ma20 > 0 else 0
+        self._prev_ma5 = ma5
+        self._prev_ma20 = ma20
+
+        # MA5向上=上涨趋势，向下=下跌趋势
+        price_above_ma = c > ma20
+        self._trend_up = ma5_slope > 0 and price_above_ma
+        self._trend_down = ma5_slope < 0 and not price_above_ma
+        # 既不明确向上也不向下=盘整
+        self._trend_flat = not self._trend_up and not self._trend_down
 
         # 市场体制
         if adx > 40 and abs(di_plus - di_minus) > 10:
@@ -486,59 +495,65 @@ class OptimizedV6:
                     return 'short'
             return False
 
-        # === 信号评估 (基于闭合K线, 确认趋势) ===
+        # === 信号评估 v7.7 (支持所有regime) ===
         short_signal = False
         long_signal = False
         short_reason = ""
         long_reason = ""
 
         if not has_position and not in_cooldown:
-            # 做空新条件: trend_down + ADX≥30 + RSI≥65超买 + MACD死叉
             macdh = self.latest_indicators["macdh"]
-            short_base = self._trend_down and adx >= ADX_SHORT_MIN
-            short_macd_dead = macdh < 0  # MACD死叉信号
-            short_rsi_bonus = rsi >= RSI_SHORT_ENTRY  # RSI≥65超买
+            ma20_val = self.latest_indicators["ma20"]
+            long_near_ma = abs(c - ma20_val) / max(ma20_val, 1) < 0.02
+            long_continuation = _check_trend_continuation(df, idx, 'up')
+            short_continuation = _check_trend_continuation(df, idx, 'down')
+            short_breakout = _check_breakout(df, idx, 'short')
+            long_breakout = _check_breakout(df, idx, 'long')
+
+            # === 做空评分 ===
+            short_base = self._trend_down and adx >= ADX_SHORT_MIN  # 趋势向下+ADX够高
+            short_rsi_overbought = rsi >= RSI_SHORT_ENTRY  # RSI超买
+            short_macd_dead = macdh < 0  # MACD死叉
             short_score = 0
             if short_base: short_score += 3
             if short_macd_dead: short_score += 2
             if adx >= ADX_SHORT_STRONG: short_score += 2
-            if short_rsi_bonus: short_score += 2
-            # 趋势延续确认
-            short_continuation = _check_trend_continuation(df, idx, 'down')
+            if short_rsi_overbought: short_score += 2
             if short_continuation: short_score += 2
-            # 突破确认
-            short_breakout = _check_breakout(df, idx, 'short')
             if short_breakout: short_score += 1
-            if not short_base: short_reason += "not_trend_down "
-            if not short_macd_dead: short_reason += f"macdh={macdh:.1f}>=0 "
-            if not short_continuation: short_reason += "no_cont "
-            if not short_rsi_bonus: short_reason += f"rsi={rsi:.0f}<{RSI_SHORT_ENTRY} "
 
-            # SHORT入口: 基础要求 + 趋势延续 + RSI超买
-            short_signal = short_base and short_macd_dead and short_score >= 6
+            # 盘整做空路径: 无明确趋势但RSI超买+MACD死叉+价格在MA之上
+            chop_short = self._trend_flat and rsi >= RSI_SHORT_ENTRY and short_macd_dead and c > ma20_val
+            if chop_short: short_score += 3
 
-            # 做多入口 (两个路径: 上涨回踩多 + 超卖反弹多)
+            if not short_base and not chop_short:
+                if not self._trend_down: short_reason += "not_trend_down "
+                if not short_macd_dead: short_reason += f"macdh={macdh:.1f}>=0 "
+                if not short_rsi_overbought: short_reason += f"rsi={rsi:.0f}<{RSI_SHORT_ENTRY} "
+
+            short_signal = (short_base or chop_short) and short_score >= 6 and rsi >= RSI_SHORT_MIN
+
+            # === 做多评分 ===
             trend_pullback = self._trend_up and rsi >= 35 and rsi <= RSI_LONG_MAX_ENTRY
-            oversold_bounce = rsi <= RSI_LONG_ENTRY and self._regime in ("weak_trend", "chop")
-            long_near_ma = abs(c - self.latest_indicators["ma20"]) / max(self.latest_indicators["ma20"], 1) < 0.015
-            long_continuation = _check_trend_continuation(df, idx, 'up')
-            long_breakout = _check_breakout(df, idx, 'long')
+            oversold_bounce = rsi <= RSI_LONG_ENTRY and (self._trend_flat or self._trend_up)
+            trend_continuation_long = self._trend_up and adx > ADX_NO_TRADE and long_continuation
 
             long_score = 0
             if rsi <= RSI_LONG_MAX_ENTRY: long_score += 1
-            if trend_pullback: long_score += 4  # 上涨回踩是主力信号
-            if oversold_bounce: long_score += 3  # 超卖反弹
-            # 趋势延续: 上涨趋势+ADX>25+连续3阳线 → 不需要回踩也能入场
-            trend_continuation_long = self._trend_up and adx > ADX_NO_TRADE and long_continuation
+            if trend_pullback: long_score += 4
+            if oversold_bounce: long_score += 3
             if trend_continuation_long: long_score += 4
             if long_near_ma: long_score += 2
             if long_breakout: long_score += 1
             if rsi <= 30: long_score += 1
 
-            # 任意一条路满足即可
-            long_signal = (trend_pullback or oversold_bounce or trend_continuation_long) and long_score >= 5
+            # 盘整做多路径: MA附近+RSI中低+MACD金叉
+            chop_long = self._trend_flat and rsi >= 30 and rsi <= RSI_LONG_MAX_ENTRY and macdh > 0 and long_near_ma
+            if chop_long: long_score += 3
 
-            # 盘整突破信号 (额外信号源)
+            long_signal = (trend_pullback or oversold_bounce or trend_continuation_long or chop_long) and long_score >= 5
+
+            # 盘整突破信号
             consolidation = _check_consolidation_breakout(df, idx, adx)
             if consolidation == 'short' and not has_position and not in_cooldown:
                 short_signal = True
@@ -552,8 +567,8 @@ class OptimizedV6:
                 f"RSI={rsi:.0f} ADX={adx:.0f} MACDh={macdh:.1f}{'✗' if macdh<0 else ''}",
                 f"regime={self._regime}",
                 f"trend={'UP' if self._trend_up else 'DOWN' if self._trend_down else 'FLAT'}",
-                f"SHORT={short_score}/8{'✓' if short_signal else ''}",
-                f"LONG={long_score}/9{'✓' if long_signal else ''}",
+                f"SHORT={short_score}/10{'✓' if short_signal else ''}",
+                f"LONG={long_score}/10{'✓' if long_signal else ''}",
             ]
             if short_reason:
                 log_parts.append(f"no_short:{short_reason}")
@@ -562,20 +577,22 @@ class OptimizedV6:
             if in_cooldown:
                 log_parts.append(f"cool={bars_since_exit}/{effective_cooldown}")
 
-            # 多空互斥 — 强趋势方向优先
+            # 多空互斥
             if short_signal and long_signal:
                 if self._trend_down:
-                    long_signal = False  # 下跌趋势不做多
-                elif self._trend_up:
-                    short_signal = False  # 上涨趋势不做空
-                elif self._regime == "strong_trend":
-                    short_signal = False  # 强趋势不明朗时都不做
                     long_signal = False
+                elif self._trend_up:
+                    short_signal = False
+                elif self._trend_flat:
+                    # 盘整: 选分数高的
+                    if short_score >= long_score:
+                        long_signal = False
+                    else:
+                        short_signal = False
                 else:
                     short_signal = False
                     long_signal = False
         elif has_position:
-            # 如果有持仓, K线闭合时不产生新信号, 但记录持仓状态
             pass
 
         signal = "HOLD"
@@ -805,68 +822,83 @@ class OptimizedV6:
                 if time.time() - max(self._last_entry_try, self._last_trade_time or 0) < COOLDOWN_TICK_SEC // 2:
                     return result
 
-            # 3. 价格变化过滤: 价格变化<MIN_PRICE_CHANGE_BP不重复评估开仓
+# 3. 价格变化过滤: 价格变化<MIN_PRICE_CHANGE_BP不重复评估开仓
             if abs(current_price - self._last_signal_price) / max(self._last_signal_price, 1) * 10000 < MIN_PRICE_CHANGE_BP:
                 return result
 
-            # 5. 信号评估 (实时 — MACD死叉优先)
+            # 5. 信号评估 v7.7 (Tick级 — 支持所有regime)
             if adx < ADX_NO_TRADE:
                 return result
 
             macdh = self.latest_indicators.get("macdh", 0)
-            short_base = self._trend_down and adx >= ADX_SHORT_MIN
-            short_macd_dead = macdh < 0
-            short_rsi_bonus = rsi >= RSI_SHORT_ENTRY
+            ma20_val = self.latest_indicators.get("ma20", current_price)
+            long_near_ma = abs(current_price - ma20_val) / max(ma20_val, 1) < 0.02
 
-            # 做多: 两个路径 — 上涨回踩多(主力) + 超卖反弹多(盘整)
-            trend_pullback_long = self._trend_up and rsi >= 40 and rsi <= RSI_LONG_MAX_ENTRY
-            oversold_long = rsi <= RSI_LONG_ENTRY and rsi <= RSI_LONG_MAX_ENTRY
-            long_near_ma = abs(current_price - self.latest_indicators.get("ma20", current_price)) / max(self.latest_indicators.get("ma20", 1), 1) < 0.015
-            # 多空互斥: 下跌趋势禁止做多, 上涨趋势禁止做空
+            # 多空互斥
             short_disabled = self._trend_up
             long_disabled = self._trend_down or self._regime == "strong_trend"
 
-            # 限价单: 做空 (收紧: ADX≥30 + RSI≥60 + trend_down)
+            # === 做空入口 (趋势+盘整两条路) ===
+            short_base = self._trend_down and adx >= ADX_SHORT_MIN
+            short_macd_dead = macdh < 0
+            short_placed = False
+
+            # 趋势做空: trend_down + MACD死叉 + RSI超买
             if not short_disabled and short_base and short_macd_dead and rsi >= RSI_SHORT_ENTRY and rsi >= RSI_SHORT_MIN:
                 size = self.get_position_size(executor.cash, current_price, 10, atr, "short")
                 limit_price = self._get_limit_price(current_price, "short_sell")
-
                 lo = LimitOrder("short_sell", limit_price, size, "entry")
                 lo.placed_at = time.time()
                 self.active_limit_order = lo
                 self._last_entry_price = current_price
                 self._last_entry_try = time.time()
                 self._last_signal_price = current_price
-
-                extras = []
-                if short_rsi_bonus: extras.append(f"RSI={rsi:.0f}≥{RSI_SHORT_ENTRY}")
-                ext = f" ({', '.join(extras)})" if extras else ""
                 result["action"] = "PLACE_LIMIT"
                 result["side"] = "short_sell"
                 result["limit_price"] = limit_price
                 result["size"] = size
-                result["message"] = f"SHORT limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) macdh={macdh:.1f} ADX={adx:.0f}{ext}"
+                result["message"] = f"SHORT limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) macdh={macdh:.1f} ADX={adx:.0f} RSI={rsi:.0f}"
+                short_placed = True
 
-            # 限价单: 做多 (上涨回踩/趋势延续/超卖反弹, 不做逆势)
-            # strong_trend_long需要RSI<62且价格近MA20且有趋势延续信号
-            strong_trend_long = self._trend_up and adx > 25 and rsi < RSI_LONG_EXIT and rsi >= 35 and long_near_ma and long_continuation
-            if not long_disabled and (trend_pullback_long or oversold_long or strong_trend_long) and long_near_ma:
-                size = self.get_position_size(executor.cash, current_price, 10, atr, "long")
-                limit_price = self._get_limit_price(current_price, "buy")
-
-                lo = LimitOrder("buy", limit_price, size, "entry")
+            # 盘整做空: flat趋势 + RSI超买 + MACD死叉 + 价格>MA20
+            if not short_disabled and not short_placed and self._trend_flat and rsi >= RSI_SHORT_ENTRY and short_macd_dead and current_price > ma20_val:
+                size = self.get_position_size(executor.cash, current_price, 10, atr, "short")
+                limit_price = self._get_limit_price(current_price, "short_sell")
+                lo = LimitOrder("short_sell", limit_price, size, "entry")
                 lo.placed_at = time.time()
                 self.active_limit_order = lo
                 self._last_entry_price = current_price
                 self._last_entry_try = time.time()
                 self._last_signal_price = current_price
-
                 result["action"] = "PLACE_LIMIT"
-                result["side"] = "buy"
+                result["side"] = "short_sell"
                 result["limit_price"] = limit_price
                 result["size"] = size
-                result["message"] = f"LONG limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f} ADX={adx:.0f}"
-                logger.info(f"📋 {result['message']} | size={size:.6f}")
+                result["message"] = f"SHORT(chop) limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f} ADX={adx:.0f}"
+                short_placed = True
+
+            # === 做多入口 (上涨回踩/趋势延续/超卖反弹/盘整金叉) ===
+            if not short_placed:
+                trend_pullback_long = self._trend_up and rsi >= 38 and rsi <= RSI_LONG_MAX_ENTRY
+                oversold_long = rsi <= RSI_LONG_ENTRY and (self._trend_flat or self._trend_up)
+                chop_golden_long = self._trend_flat and rsi >= 30 and rsi <= RSI_LONG_MAX_ENTRY and macdh > 0 and long_near_ma
+                strong_trend_long = self._trend_up and adx > 20 and rsi >= 35 and rsi < RSI_LONG_EXIT and long_near_ma
+
+                if not long_disabled and (trend_pullback_long or oversold_long or chop_golden_long or strong_trend_long) and long_near_ma:
+                    size = self.get_position_size(executor.cash, current_price, 10, atr, "long")
+                    limit_price = self._get_limit_price(current_price, "buy")
+                    lo = LimitOrder("buy", limit_price, size, "entry")
+                    lo.placed_at = time.time()
+                    self.active_limit_order = lo
+                    self._last_entry_price = current_price
+                    self._last_entry_try = time.time()
+                    self._last_signal_price = current_price
+                    result["action"] = "PLACE_LIMIT"
+                    result["side"] = "buy"
+                    result["limit_price"] = limit_price
+                    result["size"] = size
+                    result["message"] = f"LONG limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f} ADX={adx:.0f}"
+                    logger.info(f"📋 {result['message']} | size={size:.6f}")
 
         return result
 

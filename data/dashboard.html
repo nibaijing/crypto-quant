@@ -208,6 +208,9 @@ function render(d){
     const side = d.position.side;
     pb.textContent = side==='long'?'📈 LONG':'📉 SHORT';
     pb.style.color = side==='long'?'var(--green)':'var(--red)';
+  }else if(d.active_limit){
+    pb.textContent = '⏳ '+d.active_limit.side.toUpperCase()+' PENDING';
+    pb.style.color = 'var(--yellow)';
   }else{pb.textContent='🏖️ FLAT';pb.style.color='var(--text-dim)';}
 
   // Metrics
@@ -234,7 +237,7 @@ function render(d){
   document.getElementById('winrateVal').textContent = 'WR '+(d.stats?.win_rate||0)+'%';
 
   // Position table
-  document.getElementById('posCount').textContent = d.position?'1':'0';
+  document.getElementById('posCount').textContent = d.position?'1':(d.active_limit?'Pending':'0');
   const pp = document.getElementById('positionPanel');
   if(d.position){
     const pos = d.position;
@@ -244,6 +247,14 @@ function render(d){
       <td class="${pos.pnl>=0?'green':'red'}">$${fmt(pos.current_price)}</td>
       <td>${pos.leverage}x</td>
     </tr></table>`;
+  }else if(d.active_limit){
+    const lo = d.active_limit;
+    const sideLabel = lo.side==='buy'?'LONG':lo.side==='short_sell'?'SHORT':lo.side.toUpperCase();
+    pp.innerHTML = `<div style="text-align:center;padding:6px;font-size:11px">
+      <span style="color:var(--yellow);font-weight:600">⏳ ${sideLabel} LIMIT PENDING</span><br>
+      <span style="color:var(--text)">$${fmt(lo.price)}</span>
+      <span class="dim"> × ${lo.size||'--'} | age: ${calcAge(lo.placed_at)}s</span>
+    </div>`;
   }else{
     pp.innerHTML = '<div class="empty">No position 🏖️</div>';
   }
@@ -309,45 +320,43 @@ function render(d){
 function renderOHLC(d){
   const container = document.getElementById('klineBar');
   const kh = d.kline_history||[];
-  const ph = d.price_history||[];
 
-  // 优先 Kline OHLC
   if(kh.length>=2){
-    const bars = kh.slice(-30);
+    // 过滤无效bar (low=0, high=0)
+    const valid = kh.filter(b=>b.low>0 && b.high>0);
+    if(valid.length<2){container.innerHTML='<div class="empty">Waiting for K-line data...</div>';return;}
+    const bars = valid.slice(-30);
     const allPx = bars.flatMap(b=>[b.high,b.low]);
     const min = Math.min(...allPx), max = Math.max(...allPx), range = max-min||1;
-    const h = 130, w = Math.max(4, Math.min(10, 280/bars.length));
+    const h = 130, cw = Math.max(4, Math.min(10, 280/bars.length));
 
     container.innerHTML = '<div class="ohlc-canvas">'+bars.map(b=>{
       const isGreen = b.close >= b.open;
       const bodyH = Math.max(2, ((Math.abs(b.close-b.open))/range)*h*0.7);
       const topWick = Math.max(0, ((b.high-Math.max(b.open,b.close))/range)*h*0.7);
       const botWick = Math.max(0, ((Math.min(b.open,b.close)-b.low)/range)*h*0.7);
-      return `<div class="candle ${isGreen?'candle-green':'candle-red'}" style="width:${w}px;height:${topWick+bodyH+botWick}px;justify-content:flex-end">
+      return `<div class="candle ${isGreen?'candle-green':'candle-red'}" style="width:${cw}px;height:${topWick+bodyH+botWick}px;justify-content:flex-end">
         <div class="candle-wick" style="height:${topWick}px"></div>
         <div class="candle-body" style="height:${bodyH}px"></div>
         <div class="candle-wick" style="height:${botWick}px"></div>
       </div>`;
     }).join('')+'</div>';
-  } else if(ph && ph.length>2){
-    // 回退: 价格线
-    const vals = ph.filter(x=>x>0);
-    if(vals.length<2){container.innerHTML='<div class="empty">Not enough data</div>';return;}
-    const min = Math.min(...vals), max = Math.max(...vals), range = max-min||1;
-    const h = 120;
-    const w = Math.max(2, Math.min(6, 240/vals.length));
-    container.innerHTML = '<div style="display:flex;align-items:flex-end;height:130px;overflow-x:auto">'+
-      vals.map(pr=>{
-        const hi = ((pr-min)/range)*h+6;
-        const color = pr>=vals[vals.length-1]?'var(--green)':'var(--red)';
-        return `<span style="display:inline-block;width:${w}px;height:${hi}px;background:${color};border-radius:1px;margin:0 0.5px;flex-shrink:0"></span>`;
-      }).join('')+'</div>';
+  } else if(d.kline && d.kline.open > 0){
+    // 只有当前一根K线时，显示价格线
+    const k = d.kline;
+    container.innerHTML = `<div style="display:flex;align-items:flex-end;height:130px;overflow-x:auto;justify-content:center">
+      <div class="candle ${k.close>=k.open?'candle-green':'candle-red'}" style="width:40px;height:130px;justify-content:flex-end">
+        <div class="candle-body" style="height:${Math.max(4,((Math.abs(k.close-k.open))/(k.high-k.low||1))*90)}px"></div>
+      </div>
+      <div style="margin-left:12px;font-size:10px;color:var(--text-dim)">O:$${fmt(k.open)} H:$${fmt(k.high)} L:$${fmt(k.low)} C:$${fmt(k.close)}</div>
+    </div>`;
   } else {
-    container.innerHTML = '<div class="empty">Waiting for price data...</div>';
+    container.innerHTML = '<div class="empty">Waiting for K-line data...</div>';
   }
 }
 
 function fmt(n){return n===null||n===undefined||isNaN(n)?'--':n.toLocaleString('zh-CN',{maximumFractionDigits:2,minimumFractionDigits:0})}
+function calcAge(ts){return ts?Math.floor((Date.now()/1000-ts)):0}
 function calcUptime(ts){return ts?'<1d':'--';}
 
 fetchData();
