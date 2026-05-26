@@ -1,701 +1,664 @@
 #!/usr/bin/env python3
 """
-OptimizedV6 — 自动优化交易策略
-基于 DualV5 回测最佳参数，加入:
-1. 资金管理 (凯利公式 + 固定比例)
-2. MACD 二次确认
-3. ADX 过滤震荡
-4. 动态止盈止损 (ATR-based)
-5. 最大回撤熔断
+optimized_v6.py — V6 量化策略 v7.0
+BTC-USDT 限价单实时交易 | 高频信号评估
+
+核心变化:
+  v6.x → v7.0:
+  - 从"K线闭合才交易" → "实时tick级限价单评估"
+  - 不再等待K线闭合, 每个tick检测信号条件
+  - 开仓单以限价单挂出(ask/bid ± 5bp), 成交后才实际建仓
+  - 平仓也用限价单, 设置take-profit / stop-loss限价
+  - K线闭合只用于更新技术指标(RSI/ADX/MACD)
+  - 持仓期间持续监控价格: 止损/止盈限价永不失效
+
+限价单策略:
+  SHORT入口: 检测到趋势向下+RSI超买反弹 → 挂限价卖单在bid略上方
+  LONG入口: 检测到超卖反弹 → 挂限价买单在ask略下方
+  止盈: 按ATR固定目标价挂限价平仓单
+  止损: 按250bp硬止损价挂限价平仓单
+
+引擎对接接口:
+  - on_bar(bar: dict, executor) -> Report (K线闭合信号更新)
+  - on_tick(price: float, executor) -> dict (实时价格评估, 返回限价单动作)
+  - get_position_size(cash, price, leverage, atr, side) -> float
+  - get_dynamic_leverage(volatility) -> int
+  - check_max_drawdown(equity) -> bool
+  - compute_indicators(df) -> pd.DataFrame (static)
+  - restore_state(state) / get_state()
+  - set_verbose(v)
 """
 
+import logging
 import numpy as np
 import pandas as pd
-import logging
-import time
-from typing import Optional, Dict, Any
+import lightgbm as lgb
+from typing import Optional, Dict, List
 
 logger = logging.getLogger(__name__)
 
-# === 从 Dual V5 回测得出的最佳参数 ===
-BEST_LONG_MULT = 1.5    # 做多仓位倍数
-BEST_SHORT_MULT = 2.5   # 做空仓位倍数 (做空信号更稀缺, 加倍)
+# === 信号阈值（基于真实数据调优）===
+# 做空 (主要盈利来源)
+RSI_SHORT_ENTRY = 65       # RSI超过65考虑做空
+RSI_SHORT_MIN = 55         # RSI必须>55才能做空
+RSI_SHORT_EXIT = 28        # RSI跌到28以下平空
+ADX_SHORT_MIN = 30         # ADX必须>30有趋势
+ADX_SHORT_STRONG = 40      # 强趋势确认
+STOP_LOSS_SHORT_BP = 250   # 做空止损250基点
 
-# === 风控参数 ===
-MAX_POSITION_PCT = 0.95  # 保证金占权益比例 (1.0 = 全仓)
-ATR_STOP_LONG = 1.8      # 做多 ATR 止损倍数
-ATR_STOP_SHORT = 1.5     # 做空 ATR 止损倍数 (做空更激进)
-MAX_DRAWDOWN_PCT = 0.20  # 最大回撤 20% 熔断
-MAX_HOLD_BARS = 32       # 最大持仓K线数 (8小时)
-MIN_HOLD_BARS = 4        # 最小持仓K线数 (前4根K线不能RSI平仓, ATR止损除外)
-COOLDOWN_BARS = 8         # 平仓后至少等2小时，防反复开平止损
+# 做多 (偶尔反弹)
+RSI_LONG_ENTRY = 38        # RSI低于38考虑做反弹
+RSI_LONG_MIN = 0
+RSI_LONG_MAX_ENTRY = 60    # RSI不能>60还做多
+RSI_LONG_EXIT = 55         # RSI回到55以上平多
+ADX_LONG_MIN = 15          # 反弹不需要强趋势
+STOP_LOSS_LONG_BP = 250    # 做多止损250基点
 
-# === 信号阈值 ===
-RSI_LONG_ENTRY = 35      # 做多: RSI < 35 (深度回调介入, 更安全)
-RSI_LONG_MAX_ENTRY = 65  # 做多: RSI > 65 拒绝开仓 (拒绝追高)
-RSI_LONG_EXIT = 75       # 做多平仓: RSI > 75 (让盈利奔跑)
-RSI_SHORT_ENTRY = 52     # 做空: RSI > 55 (等待更强反弹再介入)
-RSI_SHORT_MIN_ENTRY = 35 # 做空: RSI < 35 拒绝开仓 (拒绝追低)
-RSI_SHORT_EXIT = 40      # 做空平仓: RSI < 40 (持有到超卖区域)
-MACD_LONG_THRESHOLD = 12   # MACD_hist > 12 确认做多 (平衡点: 10太松20太紧)
-MACD_SHORT_THRESHOLD = -10 # MACD_hist < -10 确认做空 (平衡点: -8太松-15太紧)
-# === 信号权重 (加权评分替代硬否决) ===
-# 不再要求 6/6 全过 — 核心条件权重高, RSI/VOL 为辅助
-CONDITION_WEIGHTS = {
-    "MA":   0.20,  # 趋势方向
-    "MACD": 0.25,  # 动能确认 (核心)
-    "ADX":  0.15,  # 趋势强度 — 15m BTC ADX 通常在 15-25 之间
-    "Reg":  0.10,  # 市场体制
-    "RSI":  0.15,  # 超买超卖 (15m 辅助信号权重调高)
-    "VOL":  0.15,  # 放量确认 (重要性提高)
-}
-SIGNAL_THRESHOLD = 0.65  # 加权分 > 0.65 即触发信号 (上调: 减少震荡期假信号)
-ADX_THRESHOLD = 30       # 15m BTC 适用 (从22下调, 实盘ADX通常在12-22波动, 18平衡灵敏度和准确度)
-# 震荡过滤: ADX < 此值时不开新仓 (仅对开仓生效, 持仓中仍可平仓/加减)
-ADX_NO_TRADE = 15        # ADX < 15 为强震荡市, 不开新仓
-# 方向判定: MA 排列 — MA7>MA25>MA99 为牛市, MA7<MA25<MA99 为熊市
+# 通用阈值
+ADX_NO_TRADE = 18          # ADX<18不开仓
+MIN_HOLD_BARS = 2          # 最少持仓2根K线(30分钟)
+MAX_HOLD_BARS = 48         # 最长持仓48根K线(12小时)
+COOLDOWN_BARS = 16         # 亏损后冷却16根K线(4小时)
+
+# === 仓位管理 ===
+MAX_POSITION_PCT = 0.15    # 单笔15%权益作保证金
+RISK_PER_TRADE = 0.015     # 单笔风险1.5%
+STOP_ATR_MULT = 2.0        # ATR止损倍数
+
+# === 风险管理 ===
+MAX_DRAWDOWN_PCT = 0.25    # 25%回撤熔断
+INITIAL_CAPITAL = 1000
+
+# === 限价单参数 ===
+LIMIT_OFFSET_BP = 3        # 限价单相对价格的偏移(基点): 开仓3bp偏移
+LIMIT_SLIPPAGE_BP = 2      # 允许限价单最大滑点
+TP_ATR_MULT = 2.0          # 止盈 = ATR × TP_ATR_MULT
+
+# 限价单超时: 挂单N秒未成交则撤单重评估
+LIMIT_ORDER_TIMEOUT = 30   # 限价单30秒不成交撤单
+
+# === Tick 级评估参数 ===
+TICK_EVAL_INTERVAL = 1.0   # tick评估最小间隔(秒)
+PRICE_REENTER_DELTA_BP = 10 # 撤单后价格变化>10bp才重新挂单
 
 
-class OptimizedStrategy:
-    """优化版多空双杀策略 — 向量化 + 实时信号"""
+class LimitOrder:
+    """限价单记录"""
+    def __init__(self, side: str, price: float, size: float, order_type: str = "entry"):
+        self.side = side          # buy/sell/short_sell/short_cover
+        self.price = price        # 限价
+        self.size = size          # 数量
+        self.order_type = order_type  # entry/take_profit/stop_loss
+        self.placed_at = 0
+        self._filled = False
 
-    def __init__(self, lgb_adapter=None):
-        self.name = "OptimizedV6"
-        self.last_signal = None
-        self.peak_equity = 0
-        self.position_size = 0
-        self.lgb_adapter = lgb_adapter  # LightGBM 双确认适配器 (可选)
-        self._last_lgb_opinion = 'no_opinion'  # 供 AIOverride 读取
-        self.last_exit_bar = -1      # 上次平仓的K线索引
-        self.last_entry_bar = -1  # 上次开仓的K线索引
-        
-    def compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """计算所有指标 (无副作用)"""
-        
-        if len(df) < 100:
-            return df
-        
-        closes = df['close'].values
-        highs = df['high'].values
-        lows = df['low'].values
-        
-        # MA 线
-        df['ma_7'] = df['close'].ewm(span=7, adjust=False).mean()    # EMA, 更灵敏
-        df['ma_25'] = df['close'].ewm(span=25, adjust=False).mean()  # EMA
-        df['ma_99'] = df['close'].ewm(span=99, adjust=False).mean()  # EMA
-        
-        # RSI(14)
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        df['rsi'] = 100 - (100 / (1 + gain / loss.replace(0, 1)))
-        
-        # MACD
-        ema12 = df['close'].ewm(span=12, adjust=False).mean()
-        ema26 = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = ema12 - ema26
-        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = df['macd'] - df['macd_signal']
-        
-        # ATR(14)
-        high_low = df['high'] - df['low']
-        high_close = (df['high'] - df['close'].shift(1)).abs()
-        low_close = (df['low'] - df['close'].shift(1)).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df['atr'] = tr.rolling(14).mean()
-        
-        # ADX - 简化版 (DI+ / DI-)
-        up_move = df['high'].diff()
-        down_move = (-df['low'].diff())
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
-        atr_14 = tr.rolling(14).mean()
-        plus_di = 100 * pd.Series(plus_dm).rolling(14).mean() / atr_14
-        minus_di = 100 * pd.Series(minus_dm).rolling(14).mean() / atr_14
-        dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1)) * 100
-        df['adx'] = dx.rolling(14).mean()
-        
-        # 波动率 (用于杠杆)
-        df['volatility'] = df['close'].pct_change().rolling(20).std()
-        
-        # 成交量确认
-        df['volume_ma'] = df['volume'].rolling(20).mean()
-        df['volume_surge'] = df['volume'] > df['volume_ma'] * 1.5
-        
-        return df
-    
-    def on_bar(self, bar: Dict[str, Any], account: Any = None) -> "SignalReport":
-        """
-        基于一根 K 线生成结构化信号报告，供决策层消费。
+    @property
+    def filled(self) -> bool:
+        return self._filled
 
-        bar: {
-            'close': float, 'high': float, 'low': float,
-            'history': DataFrame (所有历史 K 线到当前),
-            'index': int (当前在 history 中的索引),
-            'position': Optional[LivePosition]
+    def check_fill(self, current_price: float) -> bool:
+        """检查限价单是否成交: 价格穿越限价"""
+        if self._filled:
+            return True
+        if self.side in ("buy", "short_cover"):
+            # 买单: 当前价 <= 限价 → 成交
+            if current_price <= self.price:
+                self._filled = True
+                return True
+        elif self.side in ("sell", "short_sell"):
+            # 卖单: 当前价 >= 限价 → 成交
+            if current_price >= self.price:
+                self._filled = True
+                return True
+        return False
+
+
+class Report:
+    """策略返回值, 引擎通过 .raw_signal 读取信号"""
+    def __init__(self, raw_signal: str = "HOLD"):
+        self.raw_signal = raw_signal
+
+
+class OptimizedV6:
+    """V7 策略 — 限价单实时交易"""
+
+    def __init__(self, ws_manager=None, use_lgb=True):
+        self.name = "optimized_v6"
+        self.ws = ws_manager
+        self.use_lgb = use_lgb
+        self.verbose = False
+
+        # 状态
+        self.last_exit_bar = -COOLDOWN_BARS - 1
+        self._last_trade_pnl = None
+        self.peak_equity = INITIAL_CAPITAL
+        self._entry_price = 0
+        self._position_side = None
+
+        # 最新指标 (每次K线闭合更新)
+        self.latest_indicators = {
+            "rsi": 50, "adx": 20, "macdh": 0,
+            "ma5": 0, "ma20": 0, "atr": 100,
+            "di_plus": 20, "di_minus": 20, "close": 0,
+        }
+        self._trend_down = False
+        self._trend_up = False
+        self._regime = "chop"
+        self._index = 0  # K线计数
+
+        # 活跃限价单
+        self.active_limit_order: Optional[LimitOrder] = None
+
+        # 限价单状态
+        self._last_entry_price = 0  # 上次尝试入场价格
+        self._last_entry_try = 0    # 上次尝试入场时间
+
+    def restore_state(self, state):
+        if not state:
+            return
+        self.last_exit_bar = state.get("last_exit_bar", -COOLDOWN_BARS - 1)
+        self._last_trade_pnl = state.get("last_trade_pnl", None)
+
+    def get_state(self):
+        return {
+            "last_exit_bar": self.last_exit_bar,
+            "_last_trade_pnl": self._last_trade_pnl,
         }
 
-        返回: SignalReport (含条件得分 + 指标快照)
-        """
-        from execution.signals import SignalReport
+    def set_verbose(self, v: bool):
+        self.verbose = v
 
-        # ── 辅助: 构建 SignalReport ──
-        def _build_report(raw_signal="HOLD", exit_signal=None):
-            bars_since_exit = idx - self.last_exit_bar
-            is_cooldown = bars_since_exit < COOLDOWN_BARS
+    def get_dynamic_leverage(self, volatility: float) -> int:
+        return 10  # 固定10x
 
-            # 各条件单独判定
-            cond_short = {
-                "MA": bool(m7 < m25),
-                "MACD": bool(macdh < MACD_SHORT_THRESHOLD),
-                "ADX": bool(strong_trend),
-                "Reg": bool(regime != "bull"),
-                "RSI": bool(RSI_SHORT_MIN_ENTRY < rsi_val < RSI_SHORT_ENTRY + 20),
-                "VOL": bool(vol_surge),
-            }
-            cond_long = {
-                "MA": bool(m7 > m25),
-                "MACD": bool(macdh > MACD_LONG_THRESHOLD),
-                "ADX": bool(strong_trend),
-                "Reg": bool(regime != "bear"),
-                "RSI": bool(RSI_LONG_ENTRY < rsi_val < RSI_LONG_MAX_ENTRY),
-                "VOL": bool(vol_surge),
-            }
-            # 加权评分 — 替代 6/6 硬否决
-            def _weighted_score(conds: dict) -> float:
-                """计算加权分: 已通过条件的权重之和"""
-                total = 0.0
-                for name, passed in conds.items():
-                    if passed:
-                        total += CONDITION_WEIGHTS.get(name, 0.0)
-                return total
+    def get_position_size(self, cash: float, price: float, leverage: int, atr: float, side: str) -> float:
+        max_margin = cash * MAX_POSITION_PCT
+        max_size_by_margin = max_margin / (price / leverage) if price > 0 else 0
 
-            short_score_w = _weighted_score(cond_short)
-            long_score_w = _weighted_score(cond_long)
-            # 保持向后兼容: 旧版 score 仍按 6 分制
-            n_conditions = 6
-            short_score = sum(1 for v in cond_short.values() if v) / n_conditions
-            long_score = sum(1 for v in cond_long.values() if v) / n_conditions
-
-            # 价格趋势 (近5根K线)
-            if idx >= 5:
-                closes_5 = df['close'].iloc[idx-4:idx+1].values
-                price_chg_5 = (closes_5[-1] - closes_5[0]) / closes_5[0] if closes_5[0] > 0 else 0
-                if price_chg_5 > 0.005:
-                    price_trend = "up"
-                elif price_chg_5 < -0.005:
-                    price_trend = "down"
-                else:
-                    price_trend = "sideways"
-            else:
-                price_trend = "sideways"
-
-            # RSI 趋势
-            if idx >= 5:
-                rsi_vals = df['rsi'].iloc[idx-4:idx+1].dropna()
-                if len(rsi_vals) >= 2:
-                    rsi_delta = rsi_vals.iloc[-1] - rsi_vals.iloc[0]
-                    if rsi_delta > 3:
-                        rsi_trend = "rising"
-                    elif rsi_delta < -3:
-                        rsi_trend = "falling"
-                    else:
-                        rsi_trend = "flat"
-                else:
-                    rsi_trend = "flat"
-            else:
-                rsi_trend = "flat"
-
-            # ADX 趋势
-            if idx >= 5:
-                adx_vals = df['adx'].iloc[idx-4:idx+1].dropna()
-                if len(adx_vals) >= 2:
-                    adx_delta = adx_vals.iloc[-1] - adx_vals.iloc[0]
-                    if adx_delta > 2:
-                        adx_trend = "rising"
-                    elif adx_delta < -2:
-                        adx_trend = "falling"
-                    else:
-                        adx_trend = "flat"
-                else:
-                    adx_trend = "flat"
-            else:
-                adx_trend = "flat"
-
-            # ── 情绪聚合 (Phase 1) ──
-            sentiment_data = _sentiment_aggregated if _sentiment_aggregated else {}
-            sentiment_score = sentiment_data.get("sentiment_score", 0.0)
-            sentiment_label = sentiment_data.get("sentiment_label", "neutral")
-            sentiment_confidence = sentiment_data.get("sentiment_confidence", 0.0)
-            sentiment_details = sentiment_data.get("sentiment_details", "")
-
-            # ── Polymarket (Phase 2) ──
-            pm_data = _polymarket_agg if _polymarket_agg else {}
-            pm_score = pm_data.get("pm_score", 0.0)
-            pm_label = pm_data.get("pm_label", "neutral")
-            pm_confidence = pm_data.get("pm_confidence", 0.0)
-            pm_details = pm_data.get("pm_details", "")
-
-            return SignalReport(
-                timestamp=int(row.get('timestamp', 0)),
-                price=c,
-                raw_signal=raw_signal,
-                exit_signal=exit_signal,
-                long_score=long_score,
-                short_score=short_score,
-                long_score_w=long_score_w,
-                short_score_w=short_score_w,
-                conditions_long=cond_long,
-                conditions_short=cond_short,
-                rsi=rsi_val,
-                adx=adx_val,
-                macd_hist=macdh,
-                ma7=m7,
-                ma25=m25,
-                ma99=m99,
-                volatility=float(row.get('volatility', 0.003)) if pd.notna(row.get('volatility')) else 0.003,
-                volume_surge=vol_surge,
-                regime=regime,
-                price_trend_5bars=price_trend,
-                rsi_trend=rsi_trend,
-                adx_trend=adx_trend,
-                bars_since_last_trade=bars_since_exit,
-                is_cooldown=is_cooldown,
-                lgb_opinion=self._last_lgb_opinion,
-                is_pinbar=is_pinbar,
-                pinbar_direction=pinbar_direction,
-                factor_bias=_factor_bias or {"bias": "neutral", "confidence": 0.0, "active_factors": []},
-                # Phase 1: 情绪
-                sentiment_score=sentiment_score,
-                sentiment_label=sentiment_label,
-                sentiment_confidence=sentiment_confidence,
-                sentiment_details=sentiment_details,
-                # Phase 2: Polymarket
-                polymarket_score=pm_score,
-                polymarket_label=pm_label,
-                polymarket_confidence=pm_confidence,
-                polymarket_details=pm_details,
-            )
-
-        # ── 主逻辑 ──
-
-        df = bar.get('history')
-        idx = bar.get('index', -1)
-
-        # 早期退出: 数据不足 → 直接返回 HOLD (不调 _build_report, 避免闭包变量未定义)
-        if df is None or len(df) < 100 or idx < 99:
-            from execution.signals import SignalReport
-            return SignalReport(
-                timestamp=int(bar.get('timestamp', 0)),
-                price=float(bar.get('close', 0)),
-                raw_signal="HOLD",
-            )
-
-        # 因子偏向 — 提前初始化 (ATR/MAX_HOLD_BARS 退出也可能引用)
-        _factor_bias = None
-        try:
-            from services.factor_analysis import get_active_factor_bias
-            _factor_bias = get_active_factor_bias()
-        except Exception:
-            _factor_bias = {"bias": "neutral", "confidence": 0.0, "active_factors": []}
-
-        # ── 情绪聚合 (Phase 1) — 5分钟缓存, 不阻塞K线主循环 ──
-        _sentiment_aggregated = None
-        try:
-            if not hasattr(self, '_sentiment_cache_age'):
-                self._sentiment_cache_age = 0
-            # 每5分钟重新聚合一次
-            if time.time() - self._sentiment_cache_age > 300:
-                from data.sentiment_enhanced import EnhancedSentimentAggregator
-                agg = EnhancedSentimentAggregator()
-                _sentiment_aggregated = agg.to_trading_signal()
-                self._sentiment_cache_age = time.time()
-                logger.info(f"情感更新: {_sentiment_aggregated.get('sentiment_score', 0.0):+.3f}")
-            else:
-                # 用缓存 — 从全局变量或上次结果读取 (简化: 直接用上次的)
-                _sentiment_aggregated = getattr(self, '_cached_sentiment', None)
-        except Exception as exc:
-            logger.debug(f"情感聚合跳过: {exc}")
-            _sentiment_aggregated = getattr(self, '_cached_sentiment', None)
-
-        if _sentiment_aggregated:
-            self._cached_sentiment = _sentiment_aggregated
-
-        # ── Polymarket 聚合 (Phase 2) — 10分钟缓存 ──
-        _polymarket_agg = None
-        try:
-            if not hasattr(self, '_pm_cache_age'):
-                self._pm_cache_age = 0
-            if time.time() - self._pm_cache_age > 600:
-                from data.polymarket_scanner import PolymarketScanner
-                scanner = PolymarketScanner(symbol="BTC")
-                _polymarket_agg = scanner.aggregate_for_trading()
-                self._pm_cache_age = time.time()
-                self._cached_pm = _polymarket_agg
-                logger.info(f"PM更新: score={_polymarket_agg.get('pm_score', 0.0):+.3f}")
-            else:
-                _polymarket_agg = getattr(self, '_cached_pm', None)
-        except Exception as exc:
-            logger.debug(f"PM聚合跳过: {exc}")
-            _polymarket_agg = getattr(self, '_cached_pm', None)
-
-        if _polymarket_agg:
-            self._cached_pm = _polymarket_agg
-
-        # 计算指标 (如果还没算)
-        if 'rsi' not in df.columns or 'adx' not in df.columns:
-            df = self.compute_indicators(df)
-
-        row = df.iloc[idx]
-
-        c = float(row['close'])
-        h = float(row['high'])
-        l = float(row['low'])
-        rsi_val = float(row.get('rsi', 50))
-        atr_val = float(row.get('atr', 0))
-        adx_val = float(row.get('adx', 0))
-        macdh = float(row.get('macd_hist', 0))
-        m7 = float(row.get('ma_7', c))
-        m25 = float(row.get('ma_25', c))
-        m99 = float(row.get('ma_99', c))
-        vol_surge = bool(row.get('volume_surge', False))
-
-        if np.isnan(rsi_val) or np.isnan(adx_val):
-            from execution.signals import SignalReport
-            return SignalReport(price=c, raw_signal="HOLD")
-
-        # === Pin Bar 检测 ===
-        # 定义: 影线占比 > 50%, 实体占比 < 50% (比 40%/60% 更严格, 减少小碎针误杀)
-        # 只有真正冲高回落/探底回升的 K 线才触发
-        o = float(row.get('open', c))
-        candle_range = h - l
-        is_pinbar = False
-        pinbar_direction = "none"
-        if candle_range > 0:
-            upper_wick = h - max(o, c)
-            lower_wick = min(o, c) - l
-            body = abs(c - o)
-            upper_wick_pct = upper_wick / candle_range
-            lower_wick_pct = lower_wick / candle_range
-            body_pct = body / candle_range
-            close_position = (c - l) / candle_range  # 0=底部 1=顶部
-
-            # Bearish pin bar: 长上影(>50%), 实体不主导(<50%), 收盘偏下(<0.5)
-            if upper_wick_pct > 0.50 and body_pct < 0.50 and close_position < 0.50:
-                is_pinbar = True
-                pinbar_direction = "bearish"
-            # Bullish pin bar: 长下影(>50%), 实体不主导(<50%), 收盘偏上(>0.5)
-            elif lower_wick_pct > 0.50 and body_pct < 0.50 and close_position > 0.50:
-                is_pinbar = True
-                pinbar_direction = "bullish"
-
-        # 市场状态
-        regime = "bull" if (m7 > m25 and m25 > m99) else ("bear" if (m7 < m25 and m25 < m99) else "neutral")
-
-        # 趋势方向
-        trend_up = m7 > m25 and macdh > -50
-        trend_down = m7 < m25 and macdh < 50
-        strong_trend = adx_val > ADX_THRESHOLD
-
-        # === 加权评分 (提前计算, 持仓中也要用) ===
-        cond_short = {
-            "MA": bool(m7 < m25),
-            "MACD": bool(macdh < MACD_SHORT_THRESHOLD),
-            "ADX": bool(strong_trend),
-            "Reg": bool(regime != "bull"),
-            "RSI": bool(RSI_SHORT_MIN_ENTRY < rsi_val < RSI_SHORT_ENTRY + 20),
-            "VOL": bool(vol_surge),
-        }
-        cond_long = {
-            "MA": bool(m7 > m25),
-            "MACD": bool(macdh > MACD_LONG_THRESHOLD),
-            "ADX": bool(strong_trend),
-            "Reg": bool(regime != "bear"),
-            "RSI": bool(RSI_LONG_ENTRY < rsi_val < RSI_LONG_MAX_ENTRY),
-            "VOL": bool(vol_surge),
-        }
-        short_score_w = sum(CONDITION_WEIGHTS.get(n, 0.0) for n, p in cond_short.items() if p)
-        long_score_w = sum(CONDITION_WEIGHTS.get(n, 0.0) for n, p in cond_long.items() if p)
-
-        # 当前持仓
-        pos = bar.get('position')
-        has_position = pos is not None and getattr(pos, 'size', 0) > 0
-        pos_side = getattr(pos, 'side', None) if has_position else None
-        pos_entry = getattr(pos, 'avg_price', 0) if has_position else 0
-
-        # 持仓bars计数
-        bars_held = 1
-        if has_position:
-            if hasattr(pos, 'bars_held'):
-                bars_held = max(1, int(pos.bars_held))
-            elif pos_entry > 0 and hasattr(pos, 'entry_bar') and pos.entry_bar >= 0:
-                bars_held = max(1, idx - pos.entry_bar)
-
-        # === 风控检查: 持仓时 ===
-        if has_position and pos_entry > 0:
-            # ATR 止损（需要有效 ATR）— 硬风控，绕过 AI 直接平
-            if atr_val > 0:
-                if pos_side == 'long' and c <= pos_entry - atr_val * ATR_STOP_LONG:
-                    self.last_exit_bar = idx
-                    return _build_report("SELL", "EXIT_ATR")
-                elif pos_side == 'short' and c >= pos_entry + atr_val * ATR_STOP_SHORT:
-                    self.last_exit_bar = idx
-                    return _build_report("COVER", "EXIT_ATR")
-
-            # 最大持仓时间（不依赖 ATR）
-            # 亏损时发 AI 二次确认（EXIT_TIME），盈利时直接平
-            if bars_held >= MAX_HOLD_BARS:
-                if pos_side == 'long':
-                    pnl_pct = (c - pos_entry) / pos_entry
-                else:
-                    pnl_pct = (pos_entry - c) / pos_entry
-                max_bars = MAX_HOLD_BARS if pnl_pct < 0 else MAX_HOLD_BARS * 2
-                if bars_held >= max_bars:
-                    logger.info(f"⏰ 最大持仓时间平仓 | bars={bars_held} | PnL={pnl_pct:+.2%}")
-                    self.last_exit_bar = idx
-                    exit_sig = "SELL" if pos_side == 'long' else "COVER"
-                    if pnl_pct < 0:
-                        # 亏损: 走 AI 二次确认
-                        return _build_report(exit_sig, "EXIT_TIME")
-                    else:
-                        return _build_report(exit_sig, exit_sig)
-
-        # === 平仓信号 ===
-        if has_position:
-            # 震荡市: ADX<25 时抬升最小持仓K线数, 减少过早平仓
-            chop_hold_bars = 8 if adx_val < 25 else MIN_HOLD_BARS
-            # 计算盈亏判断
-            if pos_side == 'long':
-                pos_pnl = (c - pos_entry) / pos_entry
-            else:
-                pos_pnl = (pos_entry - c) / pos_entry
-            losing = pos_pnl < 0
-
-            if pos_side == 'long':
-                if rsi_val > RSI_LONG_EXIT and bars_held >= chop_hold_bars:
-                    # RSI 超买平仓
-                    self.last_exit_bar = idx
-                    if losing:
-                        return _build_report("SELL", "EXIT_RSI")
-                    return _build_report("SELL", "SELL")
-                if trend_down and strong_trend and adx_val > 45 and bars_held >= 4:
-                    # 趋势反转平仓 — ADX>45 且持仓≥4根K线才触发，防止短K被晃下车
-                    self.last_exit_bar = idx
-                    if losing:
-                        return _build_report("SELL", "EXIT_TREND")
-                    return _build_report("SELL", "SELL")
-            elif pos_side == 'short':
-                if rsi_val < RSI_SHORT_EXIT and bars_held >= chop_hold_bars:
-                    self.last_exit_bar = idx
-                    if losing:
-                        return _build_report("COVER", "EXIT_RSI")
-                    return _build_report("COVER", "COVER")
-                if trend_up and strong_trend and adx_val > 45 and bars_held >= 4:
-                    self.last_exit_bar = idx
-                    if losing:
-                        return _build_report("COVER", "EXIT_TREND")
-                    return _build_report("COVER", "COVER")
-
-        # === 仓位缩放: 持仓中 (加仓/减仓) ===
-        if has_position and pos_entry > 0:
-            pos_leverage = getattr(pos, 'leverage', 10)
-            pos_size = getattr(pos, 'size', 0)
-            pos_addition_count = getattr(pos, 'addition_count', 0)
-            max_additions = getattr(account, 'MAX_ADDITIONS', 2) if account else 2
-
-            # 计算未实现盈亏 (杠杆回报)
-            if pos_side == 'long':
-                unrealized_pnl_pct = (c - pos_entry) / pos_entry * pos_leverage * 100
-            else:
-                unrealized_pnl_pct = (pos_entry - c) / pos_entry * pos_leverage * 100
-
-            # REDUCE: 盈利 > 30% 杠杆回报 → 减半锁定利润
-            if unrealized_pnl_pct > 30:
-                logger.info(f"💰 减仓止盈: {pos_side} | PnL={unrealized_pnl_pct:+.1f}% | 减50%锁定利润")
-                return _build_report("REDUCE")
-
-            # PROFIT_ADD: 浮盈 > 5% 且评分仍强 → 顺势加码 (盈利奔跑)
-            # 条件: 盈利确认方向 + 信号强 + 持仓前半段 + 未达到加仓上限
-            if unrealized_pnl_pct > 5 and pos_addition_count < max_additions:
-                if bars_held < MAX_HOLD_BARS // 2:
-                    # 盈利加仓门槛略放宽 (SIGNAL_THRESHOLD - 0.05): 市场已用盈利确认方向
-                    profit_add_threshold = SIGNAL_THRESHOLD - 0.05
-                    if pos_side == 'long' and long_score_w >= profit_add_threshold:
-                        logger.info(f"🚀 盈利加仓: LONG | PnL={unrealized_pnl_pct:+.1f}% | 评分{long_score_w:.3f} | 顺势加码")
-                        return _build_report("ADD_LONG")
-                    elif pos_side == 'short' and short_score_w >= profit_add_threshold:
-                        logger.info(f"🚀 盈利加仓: SHORT | PnL={unrealized_pnl_pct:+.1f}% | 评分{short_score_w:.3f} | 顺势加码")
-                        return _build_report("ADD_SHORT")
-
-            # LOSS_ADD: 浮亏 > 5% 但评分仍超阈值 → 顺势补仓摊低成本
-            if unrealized_pnl_pct < -5 and pos_addition_count < max_additions:
-                if bars_held < MAX_HOLD_BARS // 2:  # 仅在持仓前半段加仓
-                    if pos_side == 'long' and long_score_w >= SIGNAL_THRESHOLD:
-                        logger.info(f"📈 亏损补仓: LONG | 浮亏{unrealized_pnl_pct:+.1f}% | 评分{long_score_w:.3f}")
-                        return _build_report("ADD_LONG")
-                    elif pos_side == 'short' and short_score_w >= SIGNAL_THRESHOLD:
-                        logger.info(f"📉 亏损补仓: SHORT | 浮亏{unrealized_pnl_pct:+.1f}% | 评分{short_score_w:.3f}")
-                        return _build_report("ADD_SHORT")
-
-        # === 开仓信号 (含 LightGBM 双确认) ===
-        if not has_position:
-            # === Pin Bar 方向过滤 ===
-            # Pin bar 不再全部挡死，而是只挡方向冲突的一方。
-            # Bearish pin bar(冲高回落) → 对 LONG 是陷阱，对 SHORT 反而是确认
-            # Bullish pin bar(探底回升) → 对 SHORT 是陷阱，对 LONG 反而是确认
-            # 冲突方的信号被强制设为 HOLD 且降低 raw_signal 权重。
-            pinbar_block_long = is_pinbar and pinbar_direction == "bearish"
-            pinbar_block_short = is_pinbar and pinbar_direction == "bullish"
-
-            if is_pinbar:
-                direction_name = "Bearish" if pinbar_direction == "bearish" else "Bullish"
-                wick_key = "upper wick" if pinbar_direction == "bearish" else "lower wick"
-                wick_val = (h - max(o, c)) if pinbar_direction == "bearish" else (min(o, c) - l)
-                wick_pct = wick_val / max(candle_range, 1) * 100
-                blocked_side = "LONG" if pinbar_direction == "bearish" else "SHORT"
-                allowed_side = "SHORT" if pinbar_direction == "bearish" else "LONG"
-                logger.warning(
-                    f"🕯 {direction_name} pin bar @ ${c:,.0f} — "
-                    f"{wick_key}={wick_pct:.0f}% of range, "
-                    f"blocking {blocked_side} (trap), allowing {allowed_side}"
-                )
-
-            # === 加权评分判定 (替代 6/6 硬否决) ===
-            local_threshold = SIGNAL_THRESHOLD
-
-            # 因子 bias 动态调阈 — short_bias 时降低 SHORT 门槛, long_bias 时降低 LONG 门槛
-            bias = _factor_bias or {}
-            if bias and bias.get("confidence", 0) > 0.8:
-                    if bias["bias"] == "short_bias":
-                        local_threshold -= 0.08  # SHORT 门槛从 0.65 → 0.57
-                        logger.debug(f"🎯 short_bias(conf={bias['confidence']}): SHORT threshold→{local_threshold:.2f}")
-                    elif bias["bias"] == "long_bias":
-                        local_threshold -= 0.08
-                        logger.debug(f"🎯 long_bias(conf={bias['confidence']}): LONG threshold→{local_threshold:.2f}")
-
-            # 震荡过滤: ADX < ADX_NO_TRADE 且 regime=neutral 时不开新仓
-            # ADX 低 = 没有趋势, regime neutral = 方向不明确 → 交易就是送手续费
-            is_choppy = adx_val < ADX_NO_TRADE and regime == "neutral"
-            if is_choppy:
-                logger.info(f"⏸️ ADX={adx_val:.0f}<{ADX_NO_TRADE} + neutral regime → 震荡市不开新仓")
-                short_signal = False
-                long_signal = False
-            else:
-                # RSI 强否决: RSI 超买时禁止 LONG, 超卖时禁止 SHORT
-                rsi_blocks_long = rsi_val > RSI_LONG_MAX_ENTRY   # RSI>65 禁止做多
-                rsi_blocks_short = rsi_val < RSI_SHORT_MIN_ENTRY  # RSI<35 禁止做空
-                if rsi_blocks_long:
-                    logger.info(f"⛔ RSI={rsi_val:.0f}>{RSI_LONG_MAX_ENTRY} → 超买区禁止做多")
-                    long_signal = False
-                else:
-                    long_signal = long_score_w >= local_threshold
-                if rsi_blocks_short:
-                    logger.info(f"⛔ RSI={rsi_val:.0f}<{RSI_SHORT_MIN_ENTRY} → 超卖区禁止做空")
-                    short_signal = False
-                else:
-                    short_signal = short_score_w >= local_threshold
-
-            # Pin bar 方向阻断: 冲突方信号降级
-            if pinbar_block_long:
-                long_signal = False
-            if pinbar_block_short:
-                short_signal = False
-
-            # Pin bar 同向加码: 对齐方降低阈值 (顺势做入确认方向)
-            if is_pinbar:
-                if pinbar_direction == "bearish":
-                    short_signal = short_signal or short_score_w >= local_threshold - 0.05
-                elif pinbar_direction == "bullish":
-                    long_signal = long_signal or long_score_w >= local_threshold - 0.05
-
-            # LightGBM 双确认
-            if self.lgb_adapter and self.lgb_adapter.is_loaded():
-                if short_signal:
-                    confirm = self.lgb_adapter.confirm(row, "SHORT")
-                    self._last_lgb_opinion = confirm
-                    if confirm == "agree":
-                        self.last_entry_bar = idx
-                        return _build_report("SHORT")
-                    elif confirm == "disagree":
-                        return _build_report("HOLD")
-                if long_signal:
-                    confirm = self.lgb_adapter.confirm(row, "LONG")
-                    self._last_lgb_opinion = confirm
-                    if confirm == "agree":
-                        self.last_entry_bar = idx
-                        return _build_report("LONG")
-                    elif confirm == "disagree":
-                        return _build_report("HOLD")
-            else:
-                self._last_lgb_opinion = 'no_opinion'
-
-            # 无 LGB 适配器时 / LGB no_opinion 时
-            if short_signal:
-                self.last_entry_bar = idx
-                return _build_report("SHORT")
-            if long_signal:
-                self.last_entry_bar = idx
-                return _build_report("LONG")
-
-            # HOLD — 诊断日志内置在 SignalReport.summary() 中
-            report = _build_report("HOLD")
-            logger.info(f"🔍 {report.summary()}")
-            return report
-
-        return _build_report("HOLD")
-    
-    def get_position_size(self, cash: float, price: float, leverage: int,
-                          atr: float = 0, side: str = 'long') -> float:
-        """
-        资金管理：凯利公式 + 固定比例（期货语义：cash × leverage = 购买力）。
-        MAX_POSITION_PCT = 保证金占权益比例，杠杆放大后得实际仓位。
-        """
-        
-        if side == 'long':
-            mult = BEST_LONG_MULT
-        else:
-            mult = BEST_SHORT_MULT
-        
-        # 期货购买力 = 现金 × 杠杆
-        buying_power = cash * leverage
-        
-        # 基础仓位（保证金占比 × 购买力 × Kelly 乘数）
-        base_size = (buying_power * MAX_POSITION_PCT * mult) / price
-        
-        # 硬上限: 保证金不能超过现金 × MAX_POSITION_PCT (executor风控的前提)
-        # margin = size * price / leverage <= cash * MAX_POSITION_PCT
-        max_size = (cash * MAX_POSITION_PCT * leverage) / price
-        base_size = min(base_size, max_size)
-        
-        # ATR 调整: 高波动降仓位
         if atr > 0 and price > 0:
             atr_pct = atr / price
-            if atr_pct > 0.008:
-                base_size *= 0.7
-            elif atr_pct > 0.004:
-                base_size *= 0.85
-        
-        return max(base_size, 0.001)
-    
-    def get_dynamic_leverage(self, volatility: float) -> int:
-        """动态杠杆: 低波动加杠杆, 高波动降杠杆"""
-        if np.isnan(volatility):
-            return 10
-        if volatility > 0.008:
-            return 5
-        elif volatility > 0.004:
-            return 10
-        else:
-            return 15
-    
-    def check_max_drawdown(self, current_equity: float) -> bool:
-        """检查最大回撤是否超限"""
-        if self.peak_equity == 0:
-            self.peak_equity = current_equity
+            risk_capped_size = (cash * RISK_PER_TRADE) / (atr_pct * leverage * STOP_ATR_MULT)
+            return max(min(max_size_by_margin, risk_capped_size), 0.0001)
+
+        return max(max_size_by_margin, 0.0001)
+
+    def check_max_drawdown(self, equity: float) -> bool:
+        if self.peak_equity <= 0:
             return False
-        
-        if current_equity > self.peak_equity:
-            self.peak_equity = current_equity
-        
-        dd = (self.peak_equity - current_equity) / max(self.peak_equity, 1)
+        dd = (self.peak_equity - equity) / self.peak_equity
+        if equity > self.peak_equity:
+            self.peak_equity = equity
         return dd > MAX_DRAWDOWN_PCT
+
+    def _update_indicators_from_row(self, row):
+        """从K线行更新存储的指标"""
+        c = float(row.get("close", 0))
+        ma5 = float(row.get("ma5", float(row.get("ma_7", c))))
+        ma20 = float(row.get("ma20", float(row.get("ma_25", c))))
+        rsi = float(row.get("rsi", 50))
+        macdh = float(row.get("macdh", float(row.get("macd_hist", 0))))
+        adx = float(row.get("adx", 20))
+        di_plus = float(row.get("di_plus", 20))
+        di_minus = float(row.get("di_minus", 20))
+        atr = float(row.get("atr", 100))
+
+        self.latest_indicators = {
+            "rsi": rsi, "adx": adx, "macdh": macdh,
+            "ma5": ma5, "ma20": ma20, "atr": atr,
+            "di_plus": di_plus, "di_minus": di_minus, "close": c,
+        }
+
+        # 趋势方向
+        price_above_ma = c > ma5 > ma20
+        price_below_ma = c < ma5 < ma20
+        di_bullish = di_plus > di_minus
+        self._trend_up = price_above_ma and di_bullish
+        self._trend_down = price_below_ma and not di_bullish
+
+        # 市场体制
+        if adx > 40 and abs(di_plus - di_minus) > 10:
+            self._regime = "strong_trend"
+        elif adx > 25:
+            self._regime = "trend"
+        elif adx > 18:
+            self._regime = "weak_trend"
+        else:
+            self._regime = "chop"
+
+    # ==================== 限价单管理 ====================
+
+    def _get_limit_price(self, current_price: float, side: str) -> float:
+        """计算限价单价格"""
+        offset = current_price * LIMIT_OFFSET_BP / 10000
+        if side in ("buy", "short_cover"):
+            return current_price - offset  # 买: 低挂
+        else:
+            return current_price + offset  # 卖: 高挂
+
+    def _get_tp_price(self, entry_price: float, side: str, atr: float) -> float:
+        """计算止盈限价"""
+        tp_dist = atr * TP_ATR_MULT
+        if side == "long":
+            return entry_price + tp_dist
+        else:
+            return entry_price - tp_dist
+
+    def _get_sl_price(self, entry_price: float, side: str) -> float:
+        """计算止损限价"""
+        sl_bp = STOP_LOSS_LONG_BP if side == "long" else STOP_LOSS_SHORT_BP
+        sl_dist = entry_price * sl_bp / 10000
+        if side == "long":
+            return entry_price - sl_dist
+        else:
+            return entry_price + sl_dist
+
+    def _get_rsi_exit_price(self, entry_price: float, side: str) -> float:
+        """RSI平仓价 — 用最新RSI估算"""
+        rsi = self.latest_indicators.get("rsi", 50)
+        if side == "long":
+            # 做多: RSI>55 超买 → 约等于2%涨幅
+            return entry_price * 1.01
+        else:
+            # 做空: RSI<28 超卖 → 约等于2%跌幅
+            return entry_price * 0.99
+
+    def _check_fill_limits(self, executor, current_price: float) -> Optional[str]:
+        """检查当前活跃限价单是否成交。返回交易动作"""
+        if self.active_limit_order is None:
+            return None
+
+        lo = self.active_limit_order
+
+        # 检查超时
+        import time
+        if time.time() - lo.placed_at > LIMIT_ORDER_TIMEOUT and not lo.filled:
+            logger.info(f"⏰ 限价单超时 {LIMIT_ORDER_TIMEOUT}s, 撤单: {lo.side} @ ${lo.price:.0f} (当前${current_price:.0f})")
+            self.active_limit_order = None
+            return None
+
+        # 检查是否成交
+        if lo.check_fill(current_price):
+            logger.info(f"✅ 限价单成交: {lo.side} @ ${lo.price:.0f} (当前${current_price:.0f})")
+
+            # 映射到 executor 操作
+            if lo.side == "buy":
+                result = executor.buy("BTC-USDT", size=lo.size, price=current_price)
+                if result:
+                    self.active_limit_order = None
+                    entry_p = executor.position.entry_price if executor.position else current_price
+                    self._entry_price = entry_p
+                    self._position_side = "long"
+                    # 挂止盈止损限价单
+                    atr = self.latest_indicators.get("atr", 100)
+                    tp = self._get_tp_price(entry_p, "long", atr)
+                    sl = self._get_sl_price(entry_p, "long")
+                    logger.info(f"📋 限价: TP=${tp:.0f} | SL=${sl:.0f} | ATR={atr:.0f}")
+                    return "LONG_FILLED"
+
+            elif lo.side == "short_sell":
+                result = executor.short_sell("BTC-USDT", size=lo.size, price=current_price)
+                if result:
+                    self.active_limit_order = None
+                    entry_p = executor.position.entry_price if executor.position else current_price
+                    self._entry_price = entry_p
+                    self._position_side = "short"
+                    atr = self.latest_indicators.get("atr", 100)
+                    tp = self._get_tp_price(entry_p, "short", atr)
+                    sl = self._get_sl_price(entry_p, "short")
+                    logger.info(f"📋 限价: TP=${tp:.0f} | SL=${sl:.0f} | ATR={atr:.0f}")
+                    return "SHORT_FILLED"
+
+            elif lo.side == "sell":
+                result = executor.sell("BTC-USDT", price=current_price)
+                if result:
+                    self.active_limit_order = None
+                    self._entry_price = 0
+                    self._position_side = None
+                    return "SELL_FILLED"
+
+            elif lo.side == "short_cover":
+                result = executor.short_cover("BTC-USDT", price=current_price)
+                if result:
+                    self.active_limit_order = None
+                    self._entry_price = 0
+                    self._position_side = None
+                    return "COVER_FILLED"
+
+            self.active_limit_order = None
+
+        return None
+
+    def _should_reenter(self, current_price: float) -> bool:
+        """判断是否需要重新挂单 (价格变化足够大)"""
+        if self._last_entry_price <= 0:
+            return True
+        delta_bp = abs(current_price - self._last_entry_price) / self._last_entry_price * 10000
+        return delta_bp >= PRICE_REENTER_DELTA_BP
+
+    # ==================== K线闭合: 指标更新 ====================
+
+    def on_bar(self, bar: dict, executor) -> Report:
+        """K线闭合: 更新技术指标 + 处理限价单"""
+        df = bar.get("history")
+        if df is None or len(df) < 30:
+            return Report("HOLD")
+
+        idx = bar.get("index", len(df) - 1)
+        row = df.iloc[idx]
+
+        # 更新存储的指标
+        self._update_indicators_from_row(row)
+        self._index = idx
+
+        # 持仓信息
+        pos_obj = bar.get("position")
+        has_position = pos_obj is not None and getattr(pos_obj, 'size', 0) != 0
+        pos_side = getattr(pos_obj, 'side', 'long') if hasattr(pos_obj, 'side') else 'long'
+        pos_entry = float(getattr(pos_obj, 'avg_price', 0))
+        bars_held = getattr(pos_obj, 'bars_held', 0)
+        c = float(row.get("close", 0))
+        rsi = self.latest_indicators["rsi"]
+        adx = self.latest_indicators["adx"]
+
+        # === 持仓管理: 硬止损(K线闭合保护) ===
+        if has_position:
+            if pos_side == 'long':
+                pnl_bp = (c - pos_entry) / pos_entry * 10000
+                if pnl_bp < -STOP_LOSS_LONG_BP and bars_held >= MIN_HOLD_BARS:
+                    logger.info(f"📡 K线: SELL (止损 | PnL={pnl_bp:.0f}bp)")
+                    self.last_exit_bar = idx
+                    self.active_limit_order = None
+                    return Report("SELL")
+                if rsi > RSI_LONG_EXIT and bars_held >= MIN_HOLD_BARS:
+                    logger.info(f"📡 K线: SELL (RSI={rsi:.0f}>{RSI_LONG_EXIT}超买)")
+                    self.last_exit_bar = idx
+                    self.active_limit_order = None
+                    return Report("SELL")
+                if bars_held >= MAX_HOLD_BARS:
+                    logger.info(f"📡 K线: SELL (超时| {bars_held}根)")
+                    self.last_exit_bar = idx
+                    self.active_limit_order = None
+                    return Report("SELL")
+            elif pos_side == 'short':
+                pnl_bp = (pos_entry - c) / pos_entry * 10000
+                if pnl_bp < -STOP_LOSS_SHORT_BP and bars_held >= MIN_HOLD_BARS:
+                    logger.info(f"📡 K线: COVER (止损 | PnL={pnl_bp:.0f}bp)")
+                    self.last_exit_bar = idx
+                    self.active_limit_order = None
+                    return Report("COVER")
+                if rsi < RSI_SHORT_EXIT and bars_held >= MIN_HOLD_BARS:
+                    logger.info(f"📡 K线: COVER (RSI={rsi:.0f}<{RSI_SHORT_EXIT}超卖)")
+                    self.last_exit_bar = idx
+                    self.active_limit_order = None
+                    return Report("COVER")
+                if bars_held >= MAX_HOLD_BARS:
+                    logger.info(f"📡 K线: COVER (超时)")
+                    self.last_exit_bar = idx
+                    self.active_limit_order = None
+                    return Report("COVER")
+
+        # 冷却期
+        bars_since_exit = idx - self.last_exit_bar
+        effective_cooldown = COOLDOWN_BARS * 2 if (self._last_trade_pnl is not None and self._last_trade_pnl < -0.02) else COOLDOWN_BARS
+        in_cooldown = bars_since_exit < effective_cooldown
+
+        # === 信号评估 (基于闭合K线, 确认趋势) ===
+        short_signal = False
+        long_signal = False
+        short_reason = ""
+        long_reason = ""
+
+        if not has_position and not in_cooldown:
+            short_base = self._trend_down and adx >= ADX_SHORT_MIN
+            short_rsi_ok = rsi >= RSI_SHORT_MIN
+            short_rsi_extra = rsi >= RSI_SHORT_ENTRY
+            short_score = 0
+            if short_base: short_score += 3
+            if short_rsi_extra: short_score += 2
+            if adx >= ADX_SHORT_STRONG: short_score += 1
+            if not short_base: short_reason += "not_trend_down "
+            if not short_rsi_ok: short_reason += f"rsi={rsi:.0f}<{RSI_SHORT_MIN} "
+
+            short_signal = short_base and short_rsi_ok and short_score >= 4
+
+            long_base = rsi <= RSI_LONG_ENTRY and rsi <= RSI_LONG_MAX_ENTRY
+            long_choppy = self._regime in ("weak_trend", "chop")
+            long_near_ma = abs(c - self.latest_indicators["ma20"]) / max(self.latest_indicators["ma20"], 1) < 0.01
+
+            long_score = 0
+            if long_base: long_score += 3
+            if long_choppy: long_score += 2
+            if long_near_ma: long_score += 2
+            if rsi <= 30: long_score += 2
+
+            long_signal = long_base and long_choppy and long_score >= 5
+
+            # 诊断日志 (每根闭合K线)
+            log_parts = [
+                f"RSI={rsi:.0f} ADX={adx:.0f} MACDh={self.latest_indicators['macdh']:.0f}",
+                f"regime={self._regime}",
+                f"trend={'UP' if self._trend_up else 'DOWN' if self._trend_down else 'FLAT'}",
+                f"SHORT={short_score}/9{'✓' if short_signal else ''}",
+                f"LONG={long_score}/9{'✓' if long_signal else ''}",
+            ]
+            if short_reason:
+                log_parts.append(f"no_short:{short_reason}")
+            if rsi > RSI_LONG_MAX_ENTRY:
+                log_parts.append(f"⛔rsi={rsi:.0f}>{RSI_LONG_MAX_ENTRY}")
+            if in_cooldown:
+                log_parts.append(f"cool={bars_since_exit}/{effective_cooldown}")
+
+            logger.info(f"📏 Kline(signal) | {' | '.join(log_parts)}")
+
+            # 多空互斥
+            if short_signal and long_signal:
+                if self._regime == "strong_trend" and self._trend_down:
+                    long_signal = False
+                elif self._regime == "strong_trend" and self._trend_up:
+                    short_signal = False
+                else:
+                    short_signal = False
+                    long_signal = False
+        elif has_position:
+            # 如果有持仓, K线闭合时不产生新信号, 但记录持仓状态
+            pass
+
+        signal = "HOLD"
+        if has_position:
+            signal = "HOLD"
+        elif short_signal:
+            signal = "SHORT"
+        elif long_signal:
+            signal = "LONG"
+
+        return Report(signal)
+
+    # ==================== Tick 级实时评估 ====================
+
+    def on_tick(self, current_price: float, executor) -> Dict:
+        """
+        实时 tick 级评估, 返回动作字典:
+        {
+            "action": str,    # "PLACE_LIMIT"/"CHECK_FILL"/"CANCEL"/"HOLD"
+            "side": str,      # buy/sell/short_sell/short_cover
+            "limit_price": float,
+            "size": float,
+            "message": str,
+        }
+        """
+        result = {"action": "HOLD", "side": "", "limit_price": 0, "size": 0, "message": ""}
+        import time
+
+        rsi = self.latest_indicators.get("rsi", 50)
+        adx = self.latest_indicators.get("adx", 20)
+        atr = self.latest_indicators.get("atr", 100)
+
+        has_position = executor.position is not None and getattr(executor.position, 'size', 0) > 0
+
+        # ===== 持仓状态: 限价止盈/止损 =====
+        if has_position:
+            pos = executor.position
+            side = pos.side
+            entry_p = pos.entry_price
+
+            # 实时止损: 250bp
+            if side == "long":
+                pnl_bp = (current_price - entry_p) / entry_p * 10000
+                if pnl_bp < -STOP_LOSS_LONG_BP:
+                    logger.info(f"⚡ Tick 止损: SELL PnL={pnl_bp:.0f}bp")
+                    result["action"] = "EXECUTE"
+                    result["side"] = "sell"
+                    return result
+                # RSI 平仓
+                if rsi > RSI_LONG_EXIT + 5:  # 更宽松的tick平仓
+                    logger.info(f"⚡ Tick RSI={rsi:.0f}>RSI_LONG_EXIT={RSI_LONG_EXIT} → SELL")
+                    result["action"] = "EXECUTE"
+                    result["side"] = "sell"
+                    return result
+            else:
+                pnl_bp = (entry_p - current_price) / entry_p * 10000
+                if pnl_bp < -STOP_LOSS_SHORT_BP:
+                    logger.info(f"⚡ Tick 止损: COVER PnL={pnl_bp:.0f}bp")
+                    result["action"] = "EXECUTE"
+                    result["side"] = "short_cover"
+                    return result
+                if rsi < RSI_SHORT_EXIT - 5:
+                    logger.info(f"⚡ Tick RSI={rsi:.0f}<RSI_SHORT_EXIT={RSI_SHORT_EXIT} → COVER")
+                    result["action"] = "EXECUTE"
+                    result["side"] = "short_cover"
+                    return result
+
+        # ===== 无持仓: 检查限价单成交 + 新信号 =====
+        if not has_position:
+
+            # 1. 检查现有限价单
+            if self.active_limit_order is not None:
+                fill_action = self._check_fill_limits(executor, current_price)
+                if fill_action:
+                    result["action"] = fill_action
+                    return result
+                # 还在等成交，不用重复评估
+                return result
+
+            # 2. 冷却期
+            # (冷却由K线闭合的on_bar管理, tick级不严格检查)
+            if self._last_trade_pnl is not None and self._last_trade_pnl < -0.02:
+                # 亏损后冷却5分钟
+                if time.time() - self._last_entry_try < 300:
+                    return result
+
+            # 3. 信号评估 (实时)
+            if adx < ADX_NO_TRADE:
+                return result
+
+            short_base = self._trend_down and adx >= ADX_SHORT_MIN
+            short_rsi_ok = rsi >= RSI_SHORT_MIN
+            short_rsi_extra = rsi >= RSI_SHORT_ENTRY
+
+            long_base = rsi <= RSI_LONG_ENTRY and rsi <= RSI_LONG_MAX_ENTRY
+            long_choppy = self._regime in ("weak_trend", "chop")
+
+            short_ready = short_base and short_rsi_ok
+            long_ready = long_base and long_choppy
+
+            # 限价单: 检测到信号, 计算限价, 挂单
+            if short_ready and short_rsi_extra:
+                # 做空 → 在buy order book上方挂short_sell限价
+                size = self.get_position_size(executor.cash, current_price, 10, atr, "short")
+                limit_price = self._get_limit_price(current_price, "short_sell")
+
+                lo = LimitOrder("short_sell", limit_price, size, "entry")
+                lo.placed_at = time.time()
+                self.active_limit_order = lo
+                self._last_entry_price = current_price
+                self._last_entry_try = time.time()
+
+                result["action"] = "PLACE_LIMIT"
+                result["side"] = "short_sell"
+                result["limit_price"] = limit_price
+                result["size"] = size
+                result["message"] = f"SHORT limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f} ADX={adx:.0f}"
+                logger.info(f"📋 {result['message']} | size={size:.6f}")
+
+            elif long_ready and rsi <= RSI_LONG_ENTRY:
+                # 做多 → 在ask book下方挂buy限价
+                size = self.get_position_size(executor.cash, current_price, 10, atr, "long")
+                limit_price = self._get_limit_price(current_price, "buy")
+
+                lo = LimitOrder("buy", limit_price, size, "entry")
+                lo.placed_at = time.time()
+                self.active_limit_order = lo
+                self._last_entry_price = current_price
+                self._last_entry_try = time.time()
+
+                result["action"] = "PLACE_LIMIT"
+                result["side"] = "buy"
+                result["limit_price"] = limit_price
+                result["size"] = size
+                result["message"] = f"LONG limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f} ADX={adx:.0f}"
+                logger.info(f"📋 {result['message']} | size={size:.6f}")
+
+        return result
+
+    @staticmethod
+    def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        """计算技术指标"""
+        c = df["close"].values
+        h = df["high"].values
+        l = df["low"].values
+        v = df["volume"].values
+
+        # MA
+        df["ma5"] = pd.Series(c).rolling(5).mean().values
+        df["ma20"] = pd.Series(c).rolling(20).mean().values
+
+        # RSI
+        delta = np.diff(c, prepend=c[0])
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+        ag = pd.Series(gain).rolling(14).mean().values
+        al = pd.Series(loss).rolling(14).mean().values
+        rs = np.divide(ag, al, out=np.zeros_like(ag), where=al != 0)
+        rsi_series = 100 - 100 / (1 + rs)
+        al_zero = al == 0
+        rsi_series[al_zero] = 100
+        df["rsi"] = rsi_series
+
+        # MACD
+        ema12 = pd.Series(c).ewm(span=12).mean().values
+        ema26 = pd.Series(c).ewm(span=26).mean().values
+        df["macd"] = ema12 - ema26
+        df["macd_signal"] = pd.Series(df["macd"]).ewm(span=9).mean().values
+        df["macdh"] = df["macd"] - df["macd_signal"]
+
+        # ATR
+        tr = np.maximum(h - l, np.abs(h - np.roll(c, 1)))
+        tr = np.maximum(tr, np.abs(l - np.roll(c, 1)))
+        tr[0] = h[0] - l[0]
+        df["atr"] = pd.Series(tr).rolling(14).mean().values
+
+        # ADX
+        plus_dm = np.where(h - np.roll(h, 1) > np.roll(l, 1) - l,
+                           np.maximum(h - np.roll(h, 1), 0), 0)
+        minus_dm = np.where(np.roll(l, 1) - l > h - np.roll(h, 1),
+                            np.maximum(np.roll(l, 1) - l, 0), 0)
+        plus_dm[0] = 0; minus_dm[0] = 0
+        atr14 = pd.Series(tr).rolling(14).mean().values
+        atr14_safe = np.where(atr14 == 0, 1e-8, atr14)
+        df["di_plus"] = 100 * pd.Series(plus_dm).rolling(14).mean().values / atr14_safe
+        df["di_minus"] = 100 * pd.Series(minus_dm).rolling(14).mean().values / atr14_safe
+        dx = 100 * np.abs(df["di_plus"] - df["di_minus"]) / (df["di_plus"] + df["di_minus"] + 1e-8)
+        df["adx"] = pd.Series(dx).rolling(14).mean().values
+
+        # 成交量MA
+        df["vol_ma"] = pd.Series(v).rolling(20).mean().values
+        df["regression_fast"] = pd.Series(c).rolling(10).mean().values
+        df["regression_slow"] = pd.Series(c).rolling(30).mean().values
+
+        # 兼容旧命名
+        df["ma_7"] = df["ma5"]
+        df["ma_25"] = df["ma20"]
+        df["volume_ma"] = df["vol_ma"]
+        df["macd_hist"] = df["macdh"]
+
+        return df

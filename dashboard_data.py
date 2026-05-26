@@ -1,37 +1,36 @@
 #!/usr/bin/env python3
-"""Dashboard 数据 API — 直接从引擎核心数据结构读取，不再解析日志。
+"""Dashboard 数据 API — 完全重写，从可靠数据源读取。
 
-数据源:
-  1. live_futures_state.json — executor 每5秒写入精确账户数据 (cash, position, trades)
-  2. ws_price_snapshot.json — WS 模块每秒写入当前价格 (price, indicators, kline)
+数据源（按优先级）:
+  1. ws_price_snapshot.json — 引擎每5秒写入，始终有最新价格+指标+K线
+  2. live_trading.log — 所有信号/交易/心跳记录
+  3. live_futures_state.json — 辅助，仅当有持仓时可靠
 
-设计原则:
-  - equity 永远来自 executor 写入的完整数据，不做外部计算
-  - 价格0或异常时保持最近一次有效 equity 不变
-  - 所有数据一条路径，不混用多种数据源相互覆盖
+核心设计：
+  - 无持仓时 equity 从心跳日志取（每5分钟写一次 Eq=$XXX）
+  - 有持仓时从 state.json + 当前价格计算
+  - 信号/交易从日志正则解析（已适配最新日志格式）
 """
 
 import json
+import re
 import time
-import os
+from datetime import datetime, date
 from pathlib import Path
-from datetime import datetime
-from collections import deque
+from typing import Optional, Any, Dict, List
 
 PROJECT_ROOT = Path(__file__).parent
 STATE_FILE = PROJECT_ROOT / "data" / "live_futures_state.json"
 PRICE_SNAPSHOT = PROJECT_ROOT / "data" / "ws_price_snapshot.json"
+LOG_FILE = PROJECT_ROOT / "data" / "live_trading.log"
 
 # ===== 缓存 =====
-_price_cache = deque(maxlen=200)
+_price_cache: List[dict] = []
 _price_cache_mtime = 0
-_last_snapshot_key = None
-
-# equity 粘滞缓存：价格0时不降级
-_last_valid_equity = None
-_last_valid_position = None
-
-_MA_MAP = {"ma_7": "ma7", "ma_25": "ma25", "ma_99": "ma99"}
+_last_snapshot_key: Any = None
+_last_valid_equity: Optional[float] = None
+_last_valid_position: Optional[dict] = None
+_last_equity_from_log: Optional[float] = None  # 从心跳日志提取的最近权益
 
 
 # ===== 价格快照读取 =====
@@ -66,18 +65,73 @@ def _read_price_snapshot():
             "indicators": snap.get("indicators", {}),
             "kline": snap.get("kline", {}),
         })
+        # 限制缓存大小
+        if len(_price_cache) > 200:
+            _price_cache[:] = _price_cache[-200:]
     return snap
 
 
 def get_recent_prices(limit=60):
     _read_price_snapshot()
-    return list(_price_cache)[-limit:]
+    if _price_cache:
+        return list(_price_cache)[-limit:]
+    return []
 
 
-# ===== 状态读取 =====
+# ===== 从日志提取最新权益 =====
 
-def _read_state_file():
-    """读取 executor 写入的最新状态，单一路径。"""
+def _extract_equity_from_log() -> Optional[float]:
+    """从最近的心跳/状态日志中提取 equity 值。
+    
+    匹配格式:
+      - 📊 $76,955 | Eq=$571 | SIG=HOLD | K#1
+      - 💓 心跳 | 运行: 0d 01:00:04 | 权益: $571 | 交易: 0次 | K线: 4
+    """
+    global _last_equity_from_log
+
+    if not LOG_FILE.exists():
+        return _last_equity_from_log
+
+    try:
+        text = LOG_FILE.read_text(encoding="utf-8", errors="replace")
+        lines = text.strip().split("\n")
+        today = date.today().strftime("%Y-%m-%d")
+        today_lines = [l for l in lines if l.startswith(today)]
+    except Exception:
+        return _last_equity_from_log
+
+    if not today_lines:
+        return _last_equity_from_log
+
+    # 从后往前找最新的
+    for line in reversed(today_lines):
+        # 格式1: 📊 ... | Eq=$571 | ...
+        m = re.search(r'Eq=\$?([\d,]+)', line)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                _last_equity_from_log = val
+                return val
+            except ValueError:
+                pass
+
+        # 格式2: 💓 心跳 ... 权益: $571 ...
+        m = re.search(r'权益:\s*\$?([\d,]+)', line)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                _last_equity_from_log = val
+                return val
+            except ValueError:
+                pass
+
+    return _last_equity_from_log
+
+
+# ===== 状态文件读取 =====
+
+def _read_state_file() -> dict:
+    """读取 executor 写入的最新状态。文件可能陈旧（无持仓时不更新）。"""
     if not STATE_FILE.exists():
         return {"cash": 1000.0, "total_trades": 0, "winning_trades": 0, "position": None}
 
@@ -88,15 +142,15 @@ def _read_state_file():
         return {"cash": 1000.0, "total_trades": 0, "winning_trades": 0, "position": None}
 
 
-# ===== 核心 equity 计算 =====
+# ===== 核心 equity 计算（增强版，支持日志回退）=====
 
 def _calc_equity_core(state_raw, current_price):
     """从状态文件+当前价格计算准确 equity。
-
-    核心逻辑：
-      - 无持仓 → equity = cash
-      - 有持仓 + 有效价格 → equity = cash + margin + unrealized_pnl
-      - 有持仓 + 无效价格(0) → 返回 None，调用方用粘滞值
+    
+    增强：
+      - 无持仓时从日志提取 equity（不再依赖 state.json 更新）
+      - 有持仓+有效价格时精确计算
+      - 价格无效时回退到最近有效值
     """
     global _last_valid_equity, _last_valid_position
 
@@ -104,7 +158,13 @@ def _calc_equity_core(state_raw, current_price):
     pos_raw = state_raw.get("position")
 
     if not pos_raw or float(pos_raw.get("size", 0)) <= 0:
-        # 无持仓：直接用 cash
+        # 无持仓：尝试从日志取最新 equity，优于 stale cash
+        log_equity = _extract_equity_from_log()
+        if log_equity is not None and log_equity > 0:
+            _last_valid_equity = log_equity
+            _last_valid_position = None
+            return log_equity, None
+        # 回退到 state.json 的 cash
         _last_valid_equity = cash
         _last_valid_position = None
         return cash, None
@@ -115,7 +175,6 @@ def _calc_equity_core(state_raw, current_price):
     lev = float(pos_raw.get("leverage", 10))
 
     if current_price <= 0:
-        # 价格无效：如果之前有有效值则保持，否则 fallback 到 cash
         if _last_valid_equity is not None:
             return _last_valid_equity, _last_valid_position
         return cash, None
@@ -141,7 +200,6 @@ def _calc_equity_core(state_raw, current_price):
         "pnl_pct": round(pnl_pct, 2),
     }
 
-    # 更新粘滞缓存
     _last_valid_equity = round(equity, 2)
     _last_valid_position = pos_info
 
@@ -150,13 +208,182 @@ def _calc_equity_core(state_raw, current_price):
 
 # ===== 指标标准化 =====
 
+_MA_MAP = {"ma_7": "ma7", "ma_25": "ma25", "ma_99": "ma99"}
+
+
 def _normalize_indicators(indicators):
     return {_MA_MAP.get(k, k): v for k, v in indicators.items()}
 
 
+# ===== 从日志解析信号（精确匹配最新格式）=====
+
+def _parse_signals_from_log() -> list:
+    """从日志解析信号行 — 匹配最新格式。
+    
+    最新日志格式:
+      📊 $76,955 | Eq=$571 | SIG=HOLD | K#1
+      📏 sig=SIG | RSI=66 ADX=26 ... | L=0.38[...] S=0.30[...] thr=0.55
+    
+    Returns:
+        [{time, price, equity, signal, kline, long_score, short_score, threshold, rsi, adx}, ...]
+    """
+    if not LOG_FILE.exists():
+        return []
+
+    try:
+        text = LOG_FILE.read_text(encoding="utf-8", errors="replace")
+        lines = text.strip().split("\n")
+        today = date.today().strftime("%Y-%m-%d")
+        lines = [l for l in lines if l.startswith(today)]
+    except Exception:
+        return []
+
+    if not lines:
+        return []
+
+    signals = []
+    # 解析 📊 行 — 主信号行，📊 是必需标记
+    pat_main = re.compile(
+        r'📊\s*\$?([\d,]+).*?Eq=\$?([\d,]+).*?SIG=(\w+).*?K#(\d+)'
+    )
+    # 解析 📏 行 — 评分详情行
+    pat_detail = re.compile(
+        r'RSI=([\d.]+)\s+ADX=([\d.]+).*?L=([\d.]+)\[.*?\]\s+S=([\d.]+)\[.*?\]\s+thr=([\d.]+)'
+    )
+    # 解析时间
+    pat_time = re.compile(r'(\d{2}:\d{2}:\d{2})')
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = pat_main.search(line)
+        if not m:
+            i += 1
+            continue
+
+        t = pat_time.search(line)
+        m_time = t.group(1) if t else ""
+
+        try:
+            price = int(float(m.group(1).replace(",", "")))
+            equity = int(float(m.group(2).replace(",", "")))
+        except ValueError:
+            i += 1
+            continue
+
+        sig = {
+            "time": m_time,
+            "price": price,
+            "equity": equity,
+            "signal": m.group(3),
+            "kline": int(m.group(4)),
+            "long_score": None,
+            "short_score": None,
+            "threshold": None,
+            "rsi": None,
+            "adx": None,
+        }
+
+        # 向后搜索最多5行找评分详情（可能隔1-2行，如⛔拦截行在中间）
+        for back in range(1, min(i, 5) + 1):
+            prev_line = lines[i - back]
+            d = pat_detail.search(prev_line)
+            if d:
+                try:
+                    sig["rsi"] = float(d.group(1))
+                    sig["adx"] = float(d.group(2))
+                    sig["long_score"] = float(d.group(3))
+                    sig["short_score"] = float(d.group(4))
+                    sig["threshold"] = float(d.group(5))
+                except ValueError:
+                    pass
+                break
+
+        signals.append(sig)
+        i += 1
+
+    return signals
+
+
+# ===== 从日志解析交易 =====
+
+def _parse_trades_from_log() -> list:
+    """从日志解析交易行 — 匹配最新格式。
+    
+    最新格式:
+      ✅ 合约做多: 0.0014 BTC-USDT @ 74922.00 | 10x
+      ✅ 合约做空: 0.0014 BTC-USDT @ 74698.00 | 10x
+      ✅ 合约平多: 0.0014 @ 74275.00 | PnL=-$0.91 | 手续费=-$0.00 | 净利=-$0.91
+      ✅ 合约平空: 0.0014 @ 74350.00 | PnL=+$0.49 | 手续费=-$0.00 | 净利=+$0.49
+    """
+    if not LOG_FILE.exists():
+        return []
+
+    try:
+        text = LOG_FILE.read_text(encoding="utf-8", errors="replace")
+        lines = text.strip().split("\n")
+        today = date.today().strftime("%Y-%m-%d")
+        lines = [l for l in lines if l.startswith(today)]
+    except Exception:
+        return []
+
+    trades = []
+
+    for line in lines:
+        # 开多
+        m_open_long = re.search(r'✅\s*合约做多:\s*([\d.]+)\s+\S+\s+@\s*([\d.]+)\s*\|\s*([\d.]+)x', line)
+        if m_open_long:
+            trades.append({
+                "time": line[:19],
+                "action": "做多",
+                "price": float(m_open_long.group(2)),
+                "size": float(m_open_long.group(1)),
+                "leverage": float(m_open_long.group(3)),
+                "pnl": 0.0,
+            })
+            continue
+
+        # 开空
+        m_open_short = re.search(r'✅\s*合约做空:\s*([\d.]+)\s+\S+\s+@\s*([\d.]+)\s*\|\s*([\d.]+)x', line)
+        if m_open_short:
+            trades.append({
+                "time": line[:19],
+                "action": "做空",
+                "price": float(m_open_short.group(2)),
+                "size": float(m_open_short.group(1)),
+                "leverage": float(m_open_short.group(3)),
+                "pnl": 0.0,
+            })
+            continue
+
+        # 平多
+        m_close_long = re.search(r'✅\s*合约平多:.*?@\s*([\d.]+).*?净利=\$?([+-]?[\d.]+)', line)
+        if m_close_long:
+            trades.append({
+                "time": line[:19],
+                "action": "平多",
+                "price": float(m_close_long.group(1)),
+                "pnl": float(m_close_long.group(2)),
+            })
+            continue
+
+        # 平空
+        m_close_short = re.search(r'✅\s*合约平空:.*?@\s*([\d.]+).*?净利=\$?([+-]?[\d.]+)', line)
+        if m_close_short:
+            trades.append({
+                "time": line[:19],
+                "action": "平空",
+                "price": float(m_close_short.group(1)),
+                "pnl": float(m_close_short.group(2)),
+            })
+            continue
+
+    return trades
+
+
 # ===== 聚合 API =====
 
-def get_all_data():
+def get_all_data() -> dict:
     """聚合所有数据 — 单次调用返回完整 Dashboard 数据。"""
     state_raw = _read_state_file()
     snap = _read_price_snapshot()
@@ -167,10 +394,7 @@ def get_all_data():
         "indicators": {}, "kline": {},
     }
     current_price = current_snap.get("price", 0)
-
-    # 模式: 判断是否有 OKX 文件 (实盘模式)
-    okx_exists = (PROJECT_ROOT / "data" / "okx_live_state.json").exists()
-    initial_capital = 10000 if okx_exists else 1000.0
+    initial_capital = 1000.0
 
     cash = float(state_raw.get("cash", initial_capital))
     total_trades = int(state_raw.get("total_trades", 0))
@@ -178,17 +402,15 @@ def get_all_data():
 
     # ---- equity + position ----
     equity, pos_info = _calc_equity_core(state_raw, current_price)
-
-    initial_cap_used = initial_capital if initial_capital > 0 else 1000.0
-    total_return_pct = ((equity - initial_cap_used) / initial_cap_used * 100) if equity > 0 else 0.0
+    total_return_pct = ((equity - initial_capital) / initial_capital * 100) if equity and equity > 0 else 0.0
 
     result = {
-        "mode": "LIVE" if okx_exists else "SIMULATION",
+        "mode": "SIMULATION",
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "initial_capital": round(initial_cap_used, 2),
+        "initial_capital": round(initial_capital, 2),
         "total_return_pct": round(total_return_pct, 2),
         "cash": round(cash, 2),
-        "equity": equity,
+        "equity": round(equity, 2) if equity else cash,
         "current_price": round(current_price, 2),
         "change_pct": round(current_snap.get("change_pct", 0), 2),
         "high_24h": round(current_snap.get("high_24h", 0), 2),
@@ -207,100 +429,21 @@ def get_all_data():
         },
     }
 
-    # 信号 & 交易历史: 仍从日志解析（保持向后兼容）
+    # 信号 & 交易历史 — 从日志解析
     result["signals"] = _parse_signals_from_log()
     result["trades"] = _parse_trades_from_log()
 
+    # 更新 stats：如果日志中有交易数据，从日志取更准确的值
+    if result["trades"]:
+        trade_actions = [t for t in result["trades"] if t["action"] in ("平多", "平空")]
+        if trade_actions:
+            win_trades = sum(1 for t in trade_actions if t.get("pnl", 0) > 0)
+            if win_trades > winning_trades:
+                result["stats"]["winning_trades"] = win_trades
+                result["stats"]["win_rate"] = round(win_trades / max(len(trade_actions), 1) * 100, 1)
+                result["stats"]["total_trades"] = len(trade_actions)
+
     return result
-
-
-# ===== 日志信号/交易解析（简化版）=====
-
-_LOG_FILE = PROJECT_ROOT / "data" / "live_trading.log"
-
-
-def _parse_signals_from_log():
-    """从日志解析信号行 — 按今日日期过滤，覆盖当天所有信号。"""
-    import re
-    from datetime import datetime
-
-    pat_main = re.compile(r'📊\s*\$?\s*([\d,]+).*Eq=\$?([\d,]+)')
-    pat_sig = re.compile(r'SIG=(\w+)')
-    pat_k = re.compile(r'K#(\d+)')
-    pat_time = re.compile(r'(\d{2}:\d{2}:\d{2})')
-
-    if not _LOG_FILE.exists():
-        return []
-
-    try:
-        text = _LOG_FILE.read_text()
-        lines = text.strip().split("\n")
-        today = datetime.now().strftime("%Y-%m-%d")
-        lines = [l for l in lines if l.startswith(today)]
-    except Exception:
-        return []
-
-    signals = []
-    for line in lines:
-        m = pat_main.search(line)
-        if not m:
-            continue
-        t = pat_time.search(line)
-        sig_m = pat_sig.search(line)
-        k_m = pat_k.search(line)
-        try:
-            price = int(float(m.group(1).replace(",", "")))
-            equity = int(float(m.group(2).replace(",", "")))
-        except ValueError:
-            continue
-        signals.append({
-            "time": t.group(1) if t else "",
-            "price": price,
-            "equity": equity,
-            "signal": sig_m.group(1) if sig_m else "?",
-            "kline": int(k_m.group(1)) if k_m else 0,
-        })
-    return signals
-
-
-def _parse_trades_from_log():
-    """从日志解析交易行 — 按今日日期过滤。"""
-    import re
-    from datetime import datetime
-
-    patterns = [
-        re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*合约做多.*?@ ([\d.]+).*?\|\s*([\d.]+)x'),
-        re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*合约做空.*?@ ([\d.]+).*?\|\s*([\d.]+)x'),
-        re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*合约平[仓多].*?@ ([\d.]+).*?(?:PnL=\$?|净利=\$?)([+-]?[\d.]+)'),
-        re.compile(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*合约平空.*?@ ([\d.]+).*?(?:PnL=\$?|净利=\$?)([+-]?[\d.]+)'),
-    ]
-    actions = ["做多", "做空", "平多", "平空"]
-
-    if not _LOG_FILE.exists():
-        return []
-
-    try:
-        text = _LOG_FILE.read_text()
-        lines = text.strip().split("\n")
-        today = datetime.now().strftime("%Y-%m-%d")
-        lines = [l for l in lines if l.startswith(today)]
-    except Exception:
-        return []
-
-    trades = []
-    for line in lines:
-        for pat, action in zip(patterns, actions):
-            m = pat.search(line)
-            if m:
-                trades.append({
-                    "time": m.group(1),
-                    "action": action,
-                    "price": float(m.group(2)),
-                    "pnl": float(m.group(3)) if action in ("平多", "平空") else 0,
-                    "leverage": float(m.group(3)) if action in ("做多", "做空") else 0,
-                })
-                break
-    return trades
 
 
 if __name__ == "__main__":
@@ -318,3 +461,4 @@ if __name__ == "__main__":
             print("Position: FLAT")
         print(f"Cash: ${data['cash']:,.2f} | Equity: ${data['equity']:,.2f} | Return: {data['total_return_pct']:+.2f}%")
         print(f"Trades: {data['stats']['total_trades']} | Win: {data['stats']['win_rate']}%")
+        print(f"Signals: {len(data['signals'])} | Trades: {len(data['trades'])}")

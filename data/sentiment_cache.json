@@ -1,17 +1,17 @@
 {
-  "overall_score": 0.011,
+  "overall_score": -0.18,
   "overall_label": "neutral",
-  "confidence": 0.31,
+  "confidence": 0.41,
   "sources": [
     {
       "source": "market_sentiment",
-      "score": 0.011,
-      "confidence": 0.31,
-      "label": "neutral",
-      "detail": "CoinGecko 50%up/50%down | GoogleNews 3bull/2bear (20条) | FG=43 (fear)",
+      "score": -0.18,
+      "confidence": 0.41,
+      "label": "bearish",
+      "detail": "CoinGecko 50%up/50%down | GoogleNews 2bull/3bear (20条) | FG=28 (fear)",
       "raw_data": {}
     }
   ],
-  "timestamp": 1778841008.111112,
-  "fetch_timestamp": "2026-05-15T10:30:05.350270+00:00"
+  "timestamp": 1779543008.8198667,
+  "fetch_timestamp": "2026-05-23T13:30:06.614863+00:00"
 }

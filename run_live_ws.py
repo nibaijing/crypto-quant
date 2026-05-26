@@ -30,7 +30,7 @@ import numpy as np
 from core.config import init_config
 from execution.executor_v2 import FuturesExecutor, LiveAccount, LivePosition, LiveOrder
 from execution.signals import SignalReport
-from strategies.spot.optimized_v6 import OptimizedStrategy
+from strategies.spot.optimized_v6 import OptimizedV6 as OptimizedStrategy
 import strategies.spot.optimized_v6 as strat_mod
 from data.ws_price_stream import SharedMarketState, BinanceWebSocket, create_price_stream
 from data.alpha_factors import AlphaFactors
@@ -100,7 +100,7 @@ def fetch_historical_klines(strategy_obj=None) -> pd.DataFrame:
         if strategy_obj and hasattr(strategy_obj, 'compute_indicators'):
             df = strategy_obj.compute_indicators(df)
         else:
-            from strategies.spot.optimized_v6 import OptimizedStrategy
+            from strategies.spot.optimized_v6 import OptimizedV6 as OptimizedStrategy
             df = OptimizedStrategy().compute_indicators(df)
 
         # Alpha 因子集
@@ -206,6 +206,10 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
             pnl_pct = (close_price - executor.position.entry_price) / executor.position.entry_price * 100 * lev
             result = executor.sell(symbol, price=close_price)
             if result:
+                # 记录平仓盈亏到策略(用于冷却增强)
+                raw_pnl = (close_price - executor.position.entry_price) / executor.position.entry_price
+                if hasattr(strategy, '_last_trade_pnl'):
+                    strategy._last_trade_pnl = raw_pnl
                 notify_trade("SELL", close_price, f"平多仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
                 if hasattr(strategy, 'last_exit_bar'):
                     strategy.last_exit_bar = latest_idx
@@ -224,6 +228,10 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
             pnl_pct = (executor.position.entry_price - close_price) / executor.position.entry_price * 100 * lev
             result = executor.short_cover(symbol, price=close_price)
             if result:
+                # 记录平仓盈亏到策略(用于冷却增强)
+                raw_pnl = (executor.position.entry_price - close_price) / executor.position.entry_price
+                if hasattr(strategy, '_last_trade_pnl'):
+                    strategy._last_trade_pnl = raw_pnl
                 notify_trade("COVER", close_price, f"平空仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
                 if hasattr(strategy, 'last_exit_bar'):
                     strategy.last_exit_bar = latest_idx
@@ -262,11 +270,6 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
 
     logger.info(f"📊 {' | '.join(status)}")
 
-    # 策略决策日志 (for daily_log.py parsing)
-    # 记录决策来源: risk/auto/ai/HOLD
-    if decision is not None and decision.source:
-        logger.info(f"📋 DECISION: action={decision.action} source={decision.source} "
-                    f"confidence={decision.confidence:.2f} price=${close_price:,.0f}")
     last_kline_close_time = time.time()
 
     # 更新 Dashboard 指标
@@ -306,13 +309,18 @@ def main():
     strategy = OptimizedStrategy()
     alpha_factors = AlphaFactors()
 
-    # 加载 LightGBM 模型 (可选, 如果不存在则降级为纯 MATrend)
+    # 加载 LightGBM 模型 (可选, 如果不存在则降级为纯信号驱动)
     lgb_adapter = LGBAdapter(horizon=24)
+    MIN_LGB_AUC = 0.65  # AUC低于此值的模型是噪声, 跳过
     if lgb_adapter.is_loaded():
-        strategy.lgb_adapter = lgb_adapter
-        logger.info(f"🧠 LightGBM 双确认已启用 | AUC={lgb_adapter.predictor.metrics.get('auc', '?'):.3f}")
+        lgb_auc = float(lgb_adapter.predictor.metrics.get('auc', 0))
+        if lgb_auc >= MIN_LGB_AUC:
+            strategy.lgb_adapter = lgb_adapter
+            logger.info(f"🧠 LightGBM 双确认已启用 | AUC={lgb_auc:.3f}")
+        else:
+            logger.info(f"⚠️ LightGBM AUC={lgb_auc:.3f} < {MIN_LGB_AUC}, 跳过 (AUC过低=噪声)")
     else:
-        logger.info("⚠️ LightGBM 模型未找到, 仅依赖 MATrend 信号")
+        logger.info("⚠️ LightGBM 模型未找到, 仅依赖信号驱动")
 
     # 启动 WebSocket
     market_state, ws_client = create_price_stream()
@@ -366,6 +374,7 @@ def main():
     last_heartbeat = time.time()
     last_minute_log = time.time()
     last_snapshot = 0
+    last_tick_time = 0  # tick 级评估计时器
 
     while running:
         now = time.time()
@@ -375,19 +384,72 @@ def main():
         if live_price > 0:
             executor.update_price("BTC-USDT", live_price)
 
-        # 1.5 每5秒保存价格快照 (供 Dashboard)
+        # === Tick 级实时评估 (每1秒, 限价单检查 + 信号评估) ===
+        if live_price > 0 and now - last_tick_time > 1.0:
+            last_tick_time = now
+            try:
+                tick_decision = strategy.on_tick(live_price, executor)
+                action = tick_decision.get("action", "HOLD")
+
+                if action in ("PLACE_LIMIT",):
+                    # 策略要求挂限价单 — 通过 executor 现有方法以指定价成交
+                    side = tick_decision["side"]
+                    lp = tick_decision["limit_price"]
+                    sz = tick_decision["size"]
+                    if side == "short_sell":
+                        executor.short_sell("BTC-USDT", size=sz, price=lp)
+                        tick_count += 1
+                        logger.info(f"🔖 LIMIT SHORT {sz:.6f} @ ${lp:.0f}")
+                    elif side == "buy":
+                        executor.buy("BTC-USDT", size=sz, price=lp)
+                        tick_count += 1
+                        logger.info(f"🔖 LIMIT LONG {sz:.6f} @ ${lp:.0f}")
+
+                elif action in ("EXECUTE",):
+                    # 策略要求直接平仓 (限价单成交 or 止损)
+                    side = tick_decision["side"]
+                    if side == "sell":
+                        if executor.position and executor.position.side == "long":
+                            executor.sell("BTC-USDT", price=live_price)
+                            tick_count += 1
+                            pnl_raw = (live_price - executor.position.entry_price) / executor.position.entry_price if executor.position else 0
+                            if hasattr(strategy, '_last_trade_pnl'):
+                                strategy._last_trade_pnl = pnl_raw
+                    elif side == "short_cover":
+                        if executor.position and executor.position.side == "short":
+                            executor.short_cover("BTC-USDT", price=live_price)
+                            tick_count += 1
+                            pnl_raw = (executor.position.entry_price - live_price) / executor.position.entry_price if executor.position else 0
+                            if hasattr(strategy, '_last_trade_pnl'):
+                                strategy._last_trade_pnl = pnl_raw
+
+                elif action in ("LONG_FILLED", "SHORT_FILLED"):
+                    # 限价单成交 — 记录事件
+                    logger.info(f"✅ LIMIT FILLED: {action} @ ${live_price:,.0f}")
+
+            except Exception as e:
+                logger.error(f"Tick 评估异常: {e}", exc_info=True)
+
+# 每5秒保存价格快照 (供 Dashboard)
         if now - last_snapshot > 5.0:
             market_state.save_snapshot(str(PRICE_SNAPSHOT))
+            # 同时更新 executor state（即使无持仓，保证 Dashboard 读到最新权益）
+            if hasattr(executor, '_save_state'):
+                executor._save_state()
             last_snapshot = now
 
         # 每5分钟心跳 (证明进程存活)
         if now - last_minute_log > 300:
             k = market_state.get_kline()
+            limit_order_status = ""
+            if hasattr(strategy, 'active_limit_order') and strategy.active_limit_order:
+                lo = strategy.active_limit_order
+                limit_order_status = f" | Limit: {lo.side} @ ${lo.price:.0f}"
             kline_info = f"K:{k.close:.0f}|closed={k.is_closed}" if k else "K:waiting"
-            logger.info(f"💚 存活 | ${live_price:,.0f} | {kline_info} | 等待闭合...")
+            logger.info(f"💚 存活 | ${live_price:,.0f} | {kline_info}{limit_order_status}")
             last_minute_log = now
 
-        # 2. 等待 K 线闭合
+        # 2. 等待 K 线闭合 (不阻塞, timeout=1s 让 tick 循环跑起来)
         closed = market_state.wait_kline_closed(timeout=1.0)
         if closed:
             kline_count += 1

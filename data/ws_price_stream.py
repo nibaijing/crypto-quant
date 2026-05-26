@@ -58,12 +58,37 @@ class SharedMarketState:
     kline_closed_event: threading.Event = field(default_factory=threading.Event)
     closed_kline: Optional[KlineBar] = None
 
+    # 价格变化事件（实时 tick 级别，用于高频策略评估）
+    price_change_event: threading.Event = field(default_factory=threading.Event)
+    _pending_price_change: bool = False
+    _last_tick_eval_time: float = 0
+
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def update_price(self, price: float):
         with self._lock:
             self.price = price
             self.price_updated_at = time.time()
+
+    def signal_price_change(self):
+        """标记有新的价格变动，供主线程轮询"""
+        with self._lock:
+            self.price_change_event.set()
+
+    def wait_price_change(self, timeout: float = 1.0, min_interval: float = 1.0) -> Optional[float]:
+        """等待价格变化，返回当前价格。
+        
+        min_interval: 最小触发间隔(秒)，避免高频策略过于频繁评估。
+        """
+        if self.price_change_event.wait(timeout):
+            now = time.time()
+            with self._lock:
+                self.price_change_event.clear()
+                if now - self._last_tick_eval_time < min_interval:
+                    return None  # 未到最小间隔，静默跳过
+                self._last_tick_eval_time = now
+                return self.price
+        return None
 
     def update_ticker(self, data: Dict):
         with self._lock:
@@ -133,8 +158,12 @@ class SharedMarketState:
             self.current_kline = bar
 
     def on_kline_closed(self, bar: KlineBar):
-        """REST 轮询检测到K线闭合"""
+        """REST 轮询检测到K线闭合 (含去重)"""
         with self._lock:
+            # 去重: 同一 close_time 的K线只处理一次
+            if hasattr(self, '_last_closed_time') and bar.close_time == self._last_closed_time:
+                return
+            self._last_closed_time = bar.close_time
             self.closed_kline = bar
             self.kline_closed_event.set()
 
@@ -244,7 +273,7 @@ class RESTKlinePoller:
 class BinanceWebSocket:
     """Binance WebSocket 客户端 — 多流合并"""
 
-    STREAM_URL = "wss://fstream.binance.com/stream?streams=btcusdt@trade"
+    STREAM_URL = "wss://fstream.binance.com/stream?streams=btcusdt@trade/btcusdt@kline_15m"
 
     def __init__(self, state: SharedMarketState):
         self.state = state
@@ -284,7 +313,8 @@ class BinanceWebSocket:
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                self.ws.run_forever(sslopt={'context': ssl.create_default_context()}, ping_interval=30, ping_timeout=10)
+                self.ws.run_forever(sslopt={'context': ssl.create_default_context()},
+                                     ping_interval=60, ping_timeout=30,)
             except Exception as e:
                 logger.error(f"WebSocket 异常: {e}")
 
@@ -314,6 +344,14 @@ class BinanceWebSocket:
             if 'trade' in stream:
                 if 'p' in payload:
                     self.state.update_price(float(payload['p']))
+                    # 实时标记价格变化，供主线程 tick 级评估
+                    self.state.signal_price_change()
+
+            # WebSocket kline 处理（组合流: stream=data.stream）
+            if 'kline' in stream or 'kline_15m' in stream:
+                k = payload.get('k', payload)
+                if k and 't' in k:
+                    self.state.update_kline(k)
 
         except json.JSONDecodeError:
             pass
