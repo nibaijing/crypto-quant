@@ -47,10 +47,12 @@ ADX_SHORT_STRONG = 45      # 强趋势确认
 STOP_LOSS_SHORT_BP = 150   # 做空止损150bp(收紧，单笔亏损可控)
 
 # 做多 (上涨趋势回踩多 + 盘整超卖反弹)
-RSI_LONG_ENTRY = 45        # RSI低于45可做回踩多(上涨趋势)/超卖反弹(盘整)
-RSI_LONG_MAX_ENTRY = 60    # RSI不能>60还做多(放宽到60，原55)
-RSI_LONG_EXIT = 55         # RSI回到55以上平多
-STOP_LOSS_LONG_BP = 200    # 做多止损200bp
+RSI_LONG_ENTRY = 40        # RSI低于40可做回踩多(上涨趋势)/超卖反弹(盘整) — 收紧防止高RSI高买
+RSI_LONG_MAX_ENTRY = 50    # RSI不能>50还做多(原60，防止高RSI追涨)
+RSI_LONG_EXIT = 62         # RSI回到62以上才平多(原55，减少tick级误平仓)
+RSI_LONG_EXIT_MIN_PROFIT_BP = 15  # RSI平仓需要至少15bp利润覆盖手续费(≈0.06%开仓+0.06%平仓)
+MIN_HOLD_TICK_SEC = 30     # 持仓最少持30秒才允许RSI触发平仓
+STOP_LOSS_LONG_BP = 150    # 做多止损150bp(原200，收紧控制单笔亏损)
 
 # 通用阈值
 ADX_NO_TRADE = 18          # ADX<18不开仓
@@ -72,10 +74,9 @@ MAX_DRAWDOWN_PCT = 0.30    # 30%回撤熔断
 INITIAL_CAPITAL = 1000
 
 # === 限价单参数 ===
-LIMIT_OFFSET_BP = 5        # 限价单偏移5bp(原8，更快成交)
-LIMIT_SLIPPAGE_BP = 2      # 允许限价单最大滑点
-TP_ATR_MULT = 1.5           # 止盈 = ATR × 1.5(提前兑现利润，原2.0)
-TP_TRAIL_BP = 50           # 盈利50bp后移动止损到保本
+LIMIT_OFFSET_BP = 6        # 限价单偏移6bp(原5，略多给确认空间)
+TP_ATR_MULT = 2.0           # 止盈 = ATR × 2.0(多给空间让利润跑，原1.5)
+TP_TRAIL_BP = 30            # 盈利30bp后移动止损到保本(原50，更早保护)
 TP_LOCK_BP = 120           # 盈利120bp后移动止盈到ATR×1.0锁利
 
 # 限价单超时
@@ -170,6 +171,7 @@ class OptimizedV6:
         self._last_signal_price = 0    # 上次发出信号时的价格(用于价格变化过滤)
         self._best_pnl_bp = 0          # 持仓期间最佳盈亏(用于追踪止盈)
         self._last_trade_time = 0      # 上次交易时间(用于冷却计时)
+        self._entry_time = 0           # 当前仓位开仓时间戳(用于持有时间保护)
         self._partial_tp_done = False  # 部分止盈已执行
         self._consecutive_losses = 0   # 连续亏损计数器
 
@@ -308,6 +310,7 @@ class OptimizedV6:
                     entry_p = executor.position.entry_price if executor.position else current_price
                     self._entry_price = entry_p
                     self._position_side = "long"
+                    self._entry_time = time.time()  # 记录开仓时间
                     # 挂止盈止损限价单
                     atr = self.latest_indicators.get("atr", 100)
                     tp = self._get_tp_price(entry_p, "long", atr)
@@ -322,6 +325,7 @@ class OptimizedV6:
                     entry_p = executor.position.entry_price if executor.position else current_price
                     self._entry_price = entry_p
                     self._position_side = "short"
+                    self._entry_time = time.time()  # 记录开仓时间
                     atr = self.latest_indicators.get("atr", 100)
                     tp = self._get_tp_price(entry_p, "short", atr)
                     sl = self._get_sl_price(entry_p, "short")
@@ -514,7 +518,7 @@ class OptimizedV6:
             short_signal = short_base and short_macd_dead and short_score >= 6
 
             # 做多入口 (两个路径: 上涨回踩多 + 超卖反弹多)
-            trend_pullback = self._trend_up and rsi >= 40 and rsi <= RSI_LONG_MAX_ENTRY
+            trend_pullback = self._trend_up and rsi >= 35 and rsi <= RSI_LONG_MAX_ENTRY
             oversold_bounce = rsi <= RSI_LONG_ENTRY and self._regime in ("weak_trend", "chop")
             long_near_ma = abs(c - self.latest_indicators["ma20"]) / max(self.latest_indicators["ma20"], 1) < 0.015
             long_continuation = _check_trend_continuation(df, idx, 'up')
@@ -557,8 +561,6 @@ class OptimizedV6:
                 log_parts.append(f"⛔rsi={rsi:.0f}>{RSI_LONG_MAX_ENTRY}")
             if in_cooldown:
                 log_parts.append(f"cool={bars_since_exit}/{effective_cooldown}")
-
-            logger.info(f"📏 Kline(signal) | {' | '.join(log_parts)}")
 
             # 多空互斥 — 强趋势方向优先
             if short_signal and long_signal:
@@ -671,14 +673,23 @@ class OptimizedV6:
                     self._reset_trade_state()
                     return result
 
-                # RSI 平仓 (超买)
+                # RSI 平仓 (超买 — 最后防线, 需要最少持有时间+利润覆盖手续费)
                 if rsi > RSI_LONG_EXIT:
-                    logger.info(f"⚡ Tick RSI={rsi:.0f}>{RSI_LONG_EXIT} → SELL")
-                    result["action"] = "EXECUTE"
-                    result["side"] = "sell"
-                    result["message"] = f"RSI={rsi:.0f} PnL={pnl_bp:.0f}bp"
-                    self._reset_trade_state()
-                    return result
+                    hold_sec = time.time() - self._entry_time if self._entry_time > 0 else 0
+                    if hold_sec < MIN_HOLD_TICK_SEC and pnl_bp > 0:
+                        # 持有时间不够或利润不够手续费: 跳过RSI退出，等ATR止盈
+                        pass
+                    else:
+                        # 有利润但不够手续费时继续持有等ATR止盈
+                        if pnl_bp > 0 and pnl_bp < RSI_LONG_EXIT_MIN_PROFIT_BP:
+                            pass
+                        else:
+                            logger.info(f"⚡ Tick RSI={rsi:.0f}>{RSI_LONG_EXIT} → SELL (hold={hold_sec:.0f}s PnL={pnl_bp:.0f}bp)")
+                            result["action"] = "EXECUTE"
+                            result["side"] = "sell"
+                            result["message"] = f"RSI={rsi:.0f} PnL={pnl_bp:.0f}bp"
+                            self._reset_trade_state()
+                            return result
 
                 # ATR止盈 (部分TP后剩余仓位继续持有)
                 if atr > 0 and pnl_bp > 0:
@@ -837,7 +848,8 @@ class OptimizedV6:
                 result["message"] = f"SHORT limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) macdh={macdh:.1f} ADX={adx:.0f}{ext}"
 
             # 限价单: 做多 (上涨回踩/趋势延续/超卖反弹, 不做逆势)
-            strong_trend_long = self._trend_up and adx > 25 and rsi < 70 and long_near_ma
+            # strong_trend_long需要RSI<62且价格近MA20且有趋势延续信号
+            strong_trend_long = self._trend_up and adx > 25 and rsi < RSI_LONG_EXIT and rsi >= 35 and long_near_ma and long_continuation
             if not long_disabled and (trend_pullback_long or oversold_long or strong_trend_long) and long_near_ma:
                 size = self.get_position_size(executor.cash, current_price, 10, atr, "long")
                 limit_price = self._get_limit_price(current_price, "buy")
@@ -866,6 +878,7 @@ class OptimizedV6:
         self._trailing_tp_price = 0
         self._best_pnl_bp = 0
         self._entry_price = 0
+        self._entry_time = 0
         self._position_side = None
         self._partial_tp_done = False
 

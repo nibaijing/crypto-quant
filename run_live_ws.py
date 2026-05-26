@@ -311,7 +311,7 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
 
 
 def main():
-    global market_state, ws_client, executor, strategy, alpha_factors, start_time, kline_count, last_hist_retry
+    global market_state, ws_client, executor, strategy, alpha_factors, start_time, kline_count, last_hist_retry, _last_kline_key
 
     init_config()
     start_time = datetime.now()
@@ -489,9 +489,6 @@ def main():
 
         # 2. 等待 K 线闭合 (不阻塞, timeout=1s 让 tick 循环跑起来)
         closed = market_state.wait_kline_closed(timeout=1.0)
-        # 确保 _last_kline_key 始终定义（防止 try/except 内 continue 跳过初始化）
-        if '_last_kline_key' not in dir():
-            _last_kline_key = None
         if closed:
             # 去重: 确保同一K线只处理一次
             kline_key = (closed.open_time, closed.close_time)
