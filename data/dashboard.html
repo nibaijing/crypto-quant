@@ -2,100 +2,168 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>CryptoQuant · Live</title>
 <style>
+/* ========== Reset & Variables ========== */
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#0a0e14;--bg-panel:#0f1419;--border:#1a2332;--text:#bfbdb6;--text-dim:#5c6773;--text-bright:#e6e1cf;--green:#7fd962;--red:#f26d78;--blue:#59c2ff;--yellow:#ffb454;--cyan:#95e6cb;--pink:#d2a6ff;--orange:#ff8f40;--mono:'Fira Code','Cascadia Mono','JetBrains Mono','Consolas',monospace}
-body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:13px;line-height:1.6;padding:0;min-height:100vh}
-.container{max-width:960px;margin:0 auto;padding:12px}
-.header{border-bottom:1px solid var(--border);padding:10px 0 14px;margin-bottom:12px}
-.header-top{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:6px}
-.title{color:var(--cyan);font-size:16px;font-weight:700;letter-spacing:1px}
-.title .dim{color:var(--text-dim);font-weight:400}
-.status-line{color:var(--text-dim);font-size:11px;margin-top:4px}
-.badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:600}
+:root{--bg:#0a0e14;--bg-panel:#0f1419;--border:#1a2332;--text:#bfbdb6;--text-dim:#5c6773;--text-bright:#e6e1cf;--green:#7fd962;--red:#f26d78;--blue:#59c2ff;--yellow:#ffb454;--cyan:#95e6cb;--pink:#d2a6ff;--orange:#ff8f40;--mono:'Fira Code','Cascadia Mono','JetBrains Mono','Consolas',monospace;--radius:8px}
+
+body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:13px;line-height:1.5;min-height:100vh}
+
+.container{max-width:960px;margin:0 auto;padding:8px}
+
+.green{color:var(--green)}.red{color:var(--red)}.blue{color:var(--blue)}
+.cyan{color:var(--cyan)}.yellow{color:var(--yellow)}.dim{color:var(--text-dim)}
+
+/* ========== Header ========== */
+.header{border-bottom:1px solid var(--border);padding:10px 0 12px;margin-bottom:10px}
+.h-top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px}
+.title{color:var(--cyan);font-size:15px;font-weight:700;letter-spacing:1px}
+.title .dim{color:var(--text-dim);font-weight:400;font-size:11px}
+.status-line{color:var(--text-dim);font-size:10px;margin-top:6px;display:flex;flex-wrap:wrap;gap:4px 10px}
+
+.badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:600}
 .badge-live{background:rgba(127,217,98,0.12);color:var(--green)}
 .badge-sim{background:rgba(255,180,84,0.12);color:var(--yellow)}
 .badge-off{background:rgba(242,109,120,0.12);color:var(--red)}
-.dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;animation:blink 1.5s infinite}
+
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:3px;animation:blink 1.5s infinite;vertical-align:middle}
 .dot-green{background:var(--green)}.dot-yellow{background:var(--yellow)}.dot-red{background:var(--red)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0.2}}
-.ticker{display:flex;align-items:baseline;gap:12px;margin:6px 0;flex-wrap:wrap}
-.ticker .price{font-size:32px;font-weight:700;color:var(--text-bright);letter-spacing:-1px}
-.ticker .change{font-size:16px;font-weight:600}
-.ticker .meta{font-size:11px;color:var(--text-dim)}
-.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
-.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px}
-.grid-4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:12px}
-.panel{background:var(--bg-panel);border:1px solid var(--border);border-radius:6px;padding:12px 14px}
-.panel-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+
+/* ========== Ticker ========== */
+.ticker{display:flex;align-items:baseline;gap:8px;margin:6px 0;flex-wrap:wrap}
+.ticker .price{font-size:28px;font-weight:700;color:var(--text-bright);letter-spacing:-0.5px;line-height:1.1}
+.ticker .change{font-size:14px;font-weight:600}
+.ticker .meta{font-size:10px;color:var(--text-dim)}
+@media(min-width:640px){
+  .ticker .price{font-size:34px}
+  .ticker .change{font-size:16px}
+}
+
+/* ========== Panel ========== */
+.panel{background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px}
+.panel-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)}
 .panel-hdr .label{color:var(--text-dim);font-size:10px;text-transform:uppercase;letter-spacing:1.5px}
-.stat{text-align:center;padding:6px 0}
-.stat .val{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
-.stat .sub{font-size:10px;color:var(--text-dim);margin-top:2px}
-.stat .hint{font-size:10px;color:var(--text-dim)}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;color:var(--text-dim);font-size:10px;text-transform:uppercase;letter-spacing:1px;padding:4px 6px;border-bottom:1px solid var(--border)}
-td{padding:6px;border-bottom:1px solid rgba(30,41,59,0.4);font-variant-numeric:tabular-nums}
+.empty{text-align:center;padding:16px;color:var(--text-dim);font-size:11px}
+
+/* ========== Metrics ========== */
+.metrics-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+@media(min-width:480px){.metrics-grid{grid-template-columns:repeat(4,1fr)}}
+.stat{text-align:center;padding:6px 4px}
+.stat .val{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.2}
+.stat .sub{font-size:9px;color:var(--text-dim);margin-top:2px}
+.stat .hint{font-size:9px;color:var(--text-dim)}
+@media(min-width:480px){
+  .stat .val{font-size:22px}
+  .stat .sub,.stat .hint{font-size:10px}
+}
+
+.flex-grid{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+@media(min-width:640px){.flex-grid{flex-direction:row}.flex-grid .panel{flex:1;min-width:0}}
+
+/* ========== Tables ========== */
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{text-align:left;color:var(--text-dim);font-size:9px;text-transform:uppercase;letter-spacing:1px;padding:3px 4px;border-bottom:1px solid var(--border)}
+td{padding:4px;border-bottom:1px solid rgba(30,41,59,0.4);font-variant-numeric:tabular-nums;white-space:nowrap}
 tr:hover td{background:rgba(89,194,255,0.03)}
-.green{color:var(--green)}.red{color:var(--red)}.blue{color:var(--blue)}.cyan{color:var(--cyan)}.yellow{color:var(--yellow)}.dim{color:var(--text-dim)}
-.sig{display:flex;flex-wrap:wrap;gap:4px;font-size:11px;max-height:100px;overflow-y:auto}
-.sig span{background:rgba(255,255,255,0.03);padding:2px 6px;border-radius:3px;font-size:10px;white-space:nowrap}
-.sig-buy{color:var(--green)}.sig-sell{color:var(--red)}.sig-hold{color:var(--text-dim)}
-.empty{text-align:center;padding:20px;color:var(--text-dim);font-size:12px}
-.indicators{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:11px;margin-top:6px}
+@media(min-width:480px){
+  table{font-size:12px}
+  th{padding:4px 6px;font-size:10px}
+  td{padding:5px 6px}
+}
+
+.trade-item{display:flex;justify-content:space-between;padding:3px 4px;border-bottom:1px solid rgba(30,41,59,0.3);font-size:10px;flex-wrap:wrap;gap:2px}
+.trade-item .ta{font-weight:600}
+.trade-item .tp{font-variant-numeric:tabular-nums}
+.trade-item .tt{color:var(--text-dim);font-size:9px}
+@media(min-width:480px){.trade-item{font-size:11px;padding:4px 6px}}
+
+.indicators{display:flex;flex-wrap:wrap;gap:3px 12px;font-size:10px;margin-top:4px}
 .indicators span{white-space:nowrap}
-.bar{display:inline-block;width:2px;border-radius:1px;margin-right:1px;min-height:20px;transition:height 0.3s}
+@media(min-width:480px){.indicators{font-size:11px;gap:4px 16px}}
+
+.sig{display:flex;flex-wrap:wrap;gap:3px;font-size:10px;max-height:90px;overflow-y:auto}
+.sig span{background:rgba(255,255,255,0.03);padding:2px 5px;border-radius:3px;white-space:nowrap}
+.sig-buy{color:var(--green)}.sig-sell{color:var(--red)}.sig-hold{color:var(--text-dim)}
+@media(min-width:480px){.sig{font-size:11px;max-height:100px}.sig span{padding:2px 6px}}
+
+/* ========== OHLC K线图 ========== */
+.ohlc-wrap{position:relative;height:140px;margin:8px 0;overflow-x:auto;overflow-y:hidden}
+.ohlc-canvas{display:flex;align-items:flex-end;height:100%;position:relative}
+.candle{position:relative;display:flex;flex-direction:column;align-items:center;flex-shrink:0;margin:0 0.5px}
+.candle-body{width:100%;min-height:2px;border-radius:1px;transition:height 0.3s}
+.candle-wick{width:1px;border-radius:1px;margin:0 auto;transition:height 0.3s}
+.candle-green .candle-body,.candle-green .candle-wick{background:var(--green)}
+.candle-red .candle-body,.candle-red .candle-wick{background:var(--red)}
+.ohlc-labels{display:flex;font-size:8px;color:var(--text-dim);margin-top:2px;overflow:hidden}
+.ohlc-labels span{flex-shrink:0;text-align:center}
+
+.footer{text-align:center;color:var(--text-dim);font-size:9px;padding:10px 0;border-top:1px solid var(--border);margin-top:10px}
 </style>
 </head>
 <body>
 <div class="container">
+
+<!-- Header -->
 <div class="header">
-  <div class="header-top">
-    <div><span class="title">CryptoQuant · Live</span><span class="dim" style="margin-left:8px;font-size:11px">BTC-USDT</span></div>
-    <div><span class="badge badge-live" id="modeBadge">LIVE</span><span class="dim" style="margin-left:8px;font-size:10px" id="updateTime">--</span></div>
+  <div class="h-top">
+    <div><span class="title">CryptoQuant <span class="dim">· BTC-USDT</span></span></div>
+    <div><span class="badge badge-sim" id="modeBadge">LIVE</span><span class="dim" style="margin-left:6px;font-size:10px" id="updateTime">--</span></div>
   </div>
-  <div class="status-line"><span class="dot dot-green" id="statusDot"></span><span id="statusText">connecting...</span> · <span id="uptimeText">--</span> · <span id="klineCount">K#--</span></div>
-  <div class="ticker"><span class="price" id="priceVal">--</span><span class="change" id="changeVal">--</span><span class="meta" id="meta24h">H:-- L:--</span></div>
+  <div class="status-line">
+    <span><span class="dot dot-green" id="statusDot"></span><span id="statusText">connecting...</span></span>
+    <span id="uptimeText">--</span>
+    <span id="klineCount">K#--</span>
+    <span id="posBadge">📋 --</span>
+  </div>
+  <div class="ticker">
+    <span class="price" id="priceVal">--</span>
+    <span class="change" id="changeVal">--</span>
+    <span class="meta" id="meta24h">H:-- L:--</span>
+  </div>
 </div>
 
-<div class="grid-4" id="metricsGrid">
-  <div class="panel"><div class="stat"><div class="val" id="equityVal">--</div><div class="sub">权益</div><div class="hint" id="returnVal">--</div></div></div>
-  <div class="panel"><div class="stat"><div class="val" id="cashVal">--</div><div class="sub">可用余额</div></div></div>
-  <div class="panel"><div class="stat"><div class="val" id="pnlVal">--</div><div class="sub">浮动盈亏</div></div></div>
-  <div class="panel"><div class="stat"><div class="val" id="tradesVal">--</div><div class="sub">交易次数</div><div class="hint" id="winrateVal">--</div></div></div>
+<!-- Key Metrics -->
+<div class="metrics-grid" id="metricsGrid">
+  <div class="panel"><div class="stat"><div class="val" id="equityVal">--</div><div class="sub">Equity</div><div class="hint" id="returnVal">--</div></div></div>
+  <div class="panel"><div class="stat"><div class="val" id="cashVal">--</div><div class="sub">Cash</div></div></div>
+  <div class="panel"><div class="stat"><div class="val" id="pnlVal">--</div><div class="sub">PnL</div></div></div>
+  <div class="panel"><div class="stat"><div class="val" id="tradesVal">--</div><div class="sub">Trades</div><div class="hint" id="winrateVal">--</div></div></div>
 </div>
 
-<div class="grid-2">
+<!-- Position + Trades -->
+<div class="flex-grid">
   <div class="panel">
-    <div class="panel-hdr"><span class="label">📌 持仓</span><span class="dim" style="font-size:10px" id="posCount">--</span></div>
-    <div id="positionPanel"><div class="empty">加载中...</div></div>
+    <div class="panel-hdr"><span class="label">📌 Position</span><span class="dim" style="font-size:10px" id="posCount">--</span></div>
+    <div id="positionPanel"><div class="empty">Loading...</div></div>
   </div>
   <div class="panel">
-    <div class="panel-hdr"><span class="label">🕐 最近交易</span><span class="dim" style="font-size:10px" id="tradeCount">--</span></div>
-    <div id="tradesPanel"><div class="empty">加载中...</div></div>
+    <div class="panel-hdr"><span class="label">🕐 Recent Trades</span><span class="dim" style="font-size:10px" id="tradeCount">--</span></div>
+    <div id="tradesPanel"><div class="empty">Waiting...</div></div>
   </div>
 </div>
 
-<div class="panel" style="margin-bottom:10px">
-  <div class="panel-hdr"><span class="label">⚙️ 指标</span></div>
+<!-- Indicators -->
+<div class="panel" style="margin-bottom:6px">
+  <div class="panel-hdr"><span class="label">⚙️ Indicators</span></div>
   <div id="indicatorsPanel"><div class="empty">--</div></div>
 </div>
 
-<div class="panel" style="margin-bottom:10px">
-  <div class="panel-hdr"><span class="label">📡 信号</span><span class="dim" style="font-size:10px" id="signalCount">--</span></div>
-  <div id="signalsPanel"><div class="empty">等待信号...</div></div>
+<!-- OHLC K-line Chart -->
+<div class="panel" style="margin-bottom:6px">
+  <div class="panel-hdr"><span class="label">📊 OHLC · K-line Bars</span></div>
+  <div id="klineBar" class="ohlc-wrap"><div class="empty">Loading price bars...</div></div>
 </div>
 
-<div class="panel" style="margin-bottom:10px">
-  <div class="panel-hdr"><span class="label">📊 K线 & 价格</span></div>
-  <div style="display:flex;align-items:flex-end;height:60px;gap:1px;margin-top:6px" id="klineBar"></div>
+<!-- Signals -->
+<div class="panel" style="margin-bottom:6px">
+  <div class="panel-hdr"><span class="label">📡 Signals</span><span class="dim" style="font-size:10px" id="signalCount">--</span></div>
+  <div id="signalsPanel"><div class="empty">Waiting...</div></div>
 </div>
 
-<div class="footer" style="text-align:center;color:var(--text-dim);font-size:10px;padding:12px 0;border-top:1px solid var(--border);margin-top:12px">
-  CryptoQuant v7.2 · <span id="footerTime">--</span>
-</div>
+<div class="footer">CryptoQuant · <span id="footerTime">--</span></div>
 </div>
 
 <script>
@@ -111,88 +179,95 @@ async function fetchData(){
     render(lastData);
   }catch(e){
     document.getElementById('updateTime').textContent='ERR: '+e.message;
-    if(!lastData) document.querySelectorAll('.val').forEach(el=>el.textContent='ERR');
   }
 }
 
 function render(d){
   // Header
-  const upEl = document.getElementById('updateTime');
-  upEl.textContent = d.updated_at||'--';
+  document.getElementById('updateTime').textContent = d.updated_at||'--';
   document.getElementById('statusText').textContent = d.mode||'--';
   document.getElementById('klineCount').textContent = 'K# '+(d.kline?.is_closed?'closed':'open');
-  document.getElementById('uptimeText').textContent = '运行 '+calcUptime(d.updated_at);
+  document.getElementById('uptimeText').textContent = 'Run '+calcUptime(d.updated_at);
 
-  const p = d.current_price||0;
-  const cp = d.change_pct||0;
+  // Price
+  const p = d.current_price||0, cp = d.change_pct||0;
   document.getElementById('priceVal').textContent = p>0?'$'+fmt(p):'--';
   const chEl = document.getElementById('changeVal');
   chEl.textContent = (cp>=0?'+':'')+cp.toFixed(2)+'%';
   chEl.className = 'change '+(cp>=0?'green':'red');
-  document.getElementById('meta24h').textContent = '24H H:'+fmt(d.high_24h||0)+' L:'+fmt(d.low_24h||0);
+  document.getElementById('meta24h').textContent = 'H:'+fmt(d.high_24h||0)+' L:'+fmt(d.low_24h||0);
 
   // Badge
   const mb = document.getElementById('modeBadge');
-  mb.textContent = d.mode||'SIMULATION';
+  mb.textContent = d.mode||'SIM';
   mb.className = 'badge '+(d.mode==='LIVE'?'badge-live':'badge-sim');
+
+  // Position badge
+  const pb = document.getElementById('posBadge');
+  if(d.position){
+    const side = d.position.side;
+    pb.textContent = side==='long'?'📈 LONG':'📉 SHORT';
+    pb.style.color = side==='long'?'var(--green)':'var(--red)';
+  }else{pb.textContent='🏖️ FLAT';pb.style.color='var(--text-dim)';}
 
   // Metrics
   const eq = d.equity||0;
+  const initCap = d.initial_capital||1000;
+  const retPct = ((eq - initCap)/initCap*100)||d.total_return_pct||0;
   const eqEl = document.getElementById('equityVal');
   eqEl.textContent = '$'+eq.toFixed(2);
-  eqEl.style.color = d.total_return_pct>=0?'var(--green)':'var(--red)';
+  eqEl.style.color = retPct>=0?'var(--green)':'var(--red)';
   const rtEl = document.getElementById('returnVal');
-  rtEl.textContent = (d.total_return_pct>=0?'+':'')+d.total_return_pct.toFixed(2)+'%';
-  rtEl.style.color = d.total_return_pct>=0?'var(--green)':'var(--red)';
+  rtEl.textContent = (retPct>=0?'+':'')+retPct.toFixed(2)+'%';
+  rtEl.style.color = retPct>=0?'var(--green)':'var(--red)';
 
   document.getElementById('cashVal').textContent = '$'+(d.cash||0).toFixed(2);
 
   const uPnl = d.position?.pnl||0;
   const pnlEl = document.getElementById('pnlVal');
-  pnlEl.textContent = (uPnl>=0?'+':'')+'$'+uPnl.toFixed(2);
+  let pnlStr = (uPnl>=0?'+':'')+'$'+uPnl.toFixed(2);
+  if(d.position) pnlStr += ' ('+(d.position.pnl_pct>=0?'+':'')+d.position.pnl_pct.toFixed(1)+'%)';
+  pnlEl.textContent = pnlStr;
   pnlEl.style.color = uPnl>=0?'var(--green)':'var(--red)';
-  if(d.position) document.getElementById('pnlVal').textContent += ' ('+(d.position.pnl_pct>=0?'+':'')+d.position.pnl_pct.toFixed(2)+'%)';
 
   document.getElementById('tradesVal').textContent = d.stats?.total_trades||0;
-  document.getElementById('winrateVal').textContent = '胜率 '+(d.stats?.win_rate||0)+'%';
+  document.getElementById('winrateVal').textContent = 'WR '+(d.stats?.win_rate||0)+'%';
 
-  // Position
-  document.getElementById('posCount').textContent = d.position?'1 个':'0 个';
+  // Position table
+  document.getElementById('posCount').textContent = d.position?'1':'0';
   const pp = document.getElementById('positionPanel');
   if(d.position){
     const pos = d.position;
-    pp.innerHTML = `<table><tr>
-      <th>方向</th><th>数量</th><th>入场</th><th>当前</th><th>杠杆</th><th>保证金</th>
-    </tr><tr>
+    pp.innerHTML = `<table><tr><th>Side</th><th>Size</th><th>Entry</th><th>Px</th><th>Lev</th></tr><tr>
       <td class="${pos.side==='long'?'blue':'red'}" style="font-weight:600">${pos.side.toUpperCase()}</td>
-      <td>${pos.size}</td>
-      <td>$${fmt(pos.entry_price)}</td>
+      <td>${pos.size}</td><td>$${fmt(pos.entry_price)}</td>
       <td class="${pos.pnl>=0?'green':'red'}">$${fmt(pos.current_price)}</td>
       <td>${pos.leverage}x</td>
-      <td>$${pos.margin.toFixed(2)}</td>
     </tr></table>`;
   }else{
-    pp.innerHTML = '<div class="empty">暂无持仓 🏖️</div>';
+    pp.innerHTML = '<div class="empty">No position 🏖️</div>';
   }
 
-  // Trades
+  // Trades (last 12)
   const trades = d.trades||[];
-  document.getElementById('tradeCount').textContent = trades.length+' 条';
+  document.getElementById('tradeCount').textContent = trades.length+'';
   const tp = document.getElementById('tradesPanel');
   if(trades.length>0){
-    const recent = trades.slice(-15).reverse();
+    const recent = trades.slice(-12).reverse();
     tp.innerHTML = recent.map(t=>{
-      const isBuy = t.action==='做多'||t.action==='平空';
-      const cls = (t.pnl>0)?'green':(t.pnl<0?'red':'dim');
-      return `<div style="display:flex;justify-content:space-between;padding:4px 6px;border-bottom:1px solid rgba(30,41,59,0.3);font-size:11px">
-        <span style="color:${isBuy?'var(--green)':'var(--red)'};font-weight:600">${t.action}</span>
-        <span>$${fmt(t.price)}</span>
-        <span class="${cls}">${t.pnl>0?'+':''}$${t.pnl.toFixed(2)}</span>
-        <span class="dim" style="font-size:10px">${t.time.slice(11,19)}</span>
+      const isEntry = t.action==='做多'||t.action==='做空';
+      const pnl = t.pnl||0;
+      const pnlStr = t.pnl!==undefined?(pnl>0?'+'+pnl.toFixed(2):pnl.toFixed(2)):'--';
+      const pnlCls = pnl>0?'green':pnl<0?'red':'dim';
+      return `<div class="trade-item">
+        <span class="ta" style="color:${isEntry?'var(--green)':'var(--red)'}">${t.action}</span>
+        <span class="tp">$${fmt(t.price)}</span>
+        <span class="${pnlCls}">${pnlStr}${t.pnl_bp!==undefined?t.pnl_bp+'bp':'$'}</span>
+        <span class="tt">${(t.time||'').slice(11,19)}</span>
       </div>`;
     }).join('');
   }else{
-    tp.innerHTML = '<div class="empty">等待首次交易 ⏳</div>';
+    tp.innerHTML = '<div class="empty">No trades yet ⏳</div>';
   }
 
   // Indicators
@@ -203,44 +278,76 @@ function render(d){
     <span>MACDh <b class="${(ind.macd_hist||0)>=0?'green':'red'}">${(ind.macd_hist||0).toFixed(1)}</b></span>
     <span>MA7 <b>$${fmt(ind.ma7)}</b></span>
     <span>MA25 <b>$${fmt(ind.ma25)}</b></span>
-    <span>价格 <b class="${p>=(ind.ma25||p)?'green':'red'}">${p>=(ind.ma25||p)?'↑':'↓'}</b></span>
+    <span>Price <b class="${p>=(ind.ma25||p)?'green':'red'}">${p>=(ind.ma25||p)?'↑':'↓'}</b></span>
   </div>`;
 
-  // Signals
+  // ===== OHLC K-line Chart =====
+  renderOHLC(d);
+
+  // Signals (last 20)
   const sigs = d.signals||[];
-  document.getElementById('signalCount').textContent = sigs.length+' 条';
+  document.getElementById('signalCount').textContent = sigs.length+'';
   const sp = document.getElementById('signalsPanel');
   if(sigs.length>0){
-    const recent = sigs.slice(-25);
+    const recent = sigs.slice(-20);
     sp.innerHTML = '<div class="sig">'+recent.map(s=>{
-      const cls = s.signal==='BUY'||s.signal==='LONG'?'sig-buy':s.signal==='SELL'||s.signal==='SHORT'||s.signal==='COVER'?'sig-sell':'sig-hold';
-      const rsiText = s.rsi?` RSI=${s.rsi}`:'';
-      const scoreText = (s.short_score||s.long_score)?` S${s.short_score||'?'}/L${s.long_score||'?'}`:'';
-      return `<span class="${cls}">${s.time} ${s.signal}${rsiText}${scoreText}</span>`;
+      const cls = s.signal==='BUY'||s.signal==='LONG'?'sig-buy':
+                 s.signal==='SELL'||s.signal==='SHORT'||s.signal==='COVER'?'sig-sell':'sig-hold';
+      let detail = s.time+' '+s.signal;
+      if(s.long_score!==null || s.short_score!==null){
+        detail += ' L='+(s.long_score||0)+' S='+(s.short_score||0);
+      }
+      return `<span class="${cls}">${detail}</span>`;
     }).join('')+'</div>';
   }else{
-    sp.innerHTML = '<div class="empty">等待信号...</div>';
-  }
-
-  // Price bar
-  const prices = (d.price_history||[]).map(x=>x.price).filter(x=>x>0);
-  if(prices.length>0){
-    const min = Math.min(...prices);
-    const max = Math.max(...prices);
-    const range = max-min||1;
-    const bars = document.getElementById('klineBar');
-    const w = Math.max(2, Math.min(4, 120/prices.length));
-    bars.innerHTML = prices.map(pr=>{
-      const h = ((pr-min)/range)*50+10;
-      const color = pr>=prices[prices.length-1]?'var(--green)':'var(--red)';
-      return `<span class="bar" style="height:${h}px;background:${color};width:${w}px"></span>`;
-    }).join('');
+    sp.innerHTML = '<div class="empty">Waiting...</div>';
   }
 
   document.getElementById('footerTime').textContent = new Date().toLocaleString('zh-CN');
 }
 
-function fmt(n){return n?n.toLocaleString('zh-CN',{maximumFractionDigits:2,minimumFractionDigits:0}):'--';}
+function renderOHLC(d){
+  const container = document.getElementById('klineBar');
+  const kh = d.kline_history||[];
+  const ph = d.price_history||[];
+
+  // 优先 Kline OHLC
+  if(kh.length>=2){
+    const bars = kh.slice(-30);
+    const allPx = bars.flatMap(b=>[b.high,b.low]);
+    const min = Math.min(...allPx), max = Math.max(...allPx), range = max-min||1;
+    const h = 130, w = Math.max(4, Math.min(10, 280/bars.length));
+
+    container.innerHTML = '<div class="ohlc-canvas">'+bars.map(b=>{
+      const isGreen = b.close >= b.open;
+      const bodyH = Math.max(2, ((Math.abs(b.close-b.open))/range)*h*0.7);
+      const topWick = Math.max(0, ((b.high-Math.max(b.open,b.close))/range)*h*0.7);
+      const botWick = Math.max(0, ((Math.min(b.open,b.close)-b.low)/range)*h*0.7);
+      return `<div class="candle ${isGreen?'candle-green':'candle-red'}" style="width:${w}px;height:${topWick+bodyH+botWick}px;justify-content:flex-end">
+        <div class="candle-wick" style="height:${topWick}px"></div>
+        <div class="candle-body" style="height:${bodyH}px"></div>
+        <div class="candle-wick" style="height:${botWick}px"></div>
+      </div>`;
+    }).join('')+'</div>';
+  } else if(ph && ph.length>2){
+    // 回退: 价格线
+    const vals = ph.filter(x=>x>0);
+    if(vals.length<2){container.innerHTML='<div class="empty">Not enough data</div>';return;}
+    const min = Math.min(...vals), max = Math.max(...vals), range = max-min||1;
+    const h = 120;
+    const w = Math.max(2, Math.min(6, 240/vals.length));
+    container.innerHTML = '<div style="display:flex;align-items:flex-end;height:130px;overflow-x:auto">'+
+      vals.map(pr=>{
+        const hi = ((pr-min)/range)*h+6;
+        const color = pr>=vals[vals.length-1]?'var(--green)':'var(--red)';
+        return `<span style="display:inline-block;width:${w}px;height:${hi}px;background:${color};border-radius:1px;margin:0 0.5px;flex-shrink:0"></span>`;
+      }).join('')+'</div>';
+  } else {
+    container.innerHTML = '<div class="empty">Waiting for price data...</div>';
+  }
+}
+
+function fmt(n){return n===null||n===undefined||isNaN(n)?'--':n.toLocaleString('zh-CN',{maximumFractionDigits:2,minimumFractionDigits:0})}
 function calcUptime(ts){return ts?'<1d':'--';}
 
 fetchData();

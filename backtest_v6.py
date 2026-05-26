@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-OptimizedV6 策略回测 — 用 OptimizedStrategy.on_bar() 模拟实盘逻辑
+OptimizedV6 策略回测 — 用 OptimizedStrategy.on_bar() 模拟实盘逻辑 (v7.3)
+
+使用策略直接的原始信号 (raw_signal), 跳过 DecisionEngine (AI层),
+因为 backtest 测试的是策略信号本身的质量。
 """
-import sys, time
+import sys, time, os
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -10,41 +13,38 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 
 from execution.executor_v2 import FuturesExecutor
-from strategies.spot.optimized_v6 import OptimizedStrategy
+from strategies.spot.optimized_v6 import OptimizedV6 as OptimizedStrategy
 import strategies.spot.optimized_v6 as strat_mod
-from execution.ai_override import DecisionEngine
 
 DATA = Path(__file__).parent / "data" / "backtest_btc_15m.csv"
+INITIAL_CAPITAL = 1000
+
 
 def run_backtest():
     df = pd.read_csv(DATA)
-    # 添加 datetime 列 (extract_15m_data.py 不输出 datetime)
     df["datetime"] = pd.to_datetime(df["open_time"], unit="ms")
     print(f"📊 回测数据: {len(df)} 条 K线")
     print(f"   范围: {df['datetime'].min()} ~ {df['datetime'].max()}")
     print()
 
-    # 预计算指标（OptimizedStrategy 内置）
+    # 策略计算指标
     strat = OptimizedStrategy()
     df = strat.compute_indicators(df)
     print("✅ 指标计算完成")
 
-    # 初始化 executor + DecisionEngine (规则回退模式, dry_run=1 禁用LLM)
+    # 初始化模拟执行器
     executor = FuturesExecutor()
-    executor.set_leverage(10)
-    os.environ["AI_OVERRIDE_DRY_RUN"] = "1"
-    engine = DecisionEngine()
 
     trades = []
     signal_log = []
     equity_curve = []
 
     n = len(df)
-    COOLDOWN = 4
     for i in range(100, n):
         row = df.iloc[i]
         close_price = float(row["close"])
 
+        # 动态杠杆
         vol = float(row.get("volatility", 0.003))
         if not np.isnan(vol):
             lev = strat.get_dynamic_leverage(vol)
@@ -80,19 +80,16 @@ def run_backtest():
 
         executor.update_price("BTC-USDT", close_price)
 
-        # 策略 → DecisionEngine (规则回退) → 最终信号
-        signal = None
+        # === 直接取策略原始信号 (跳过 DecisionEngine) ===
+        signal = "HOLD"
         try:
             report = strat.on_bar(bar, executor)
             executor.update_bars_held()
             if report is not None and hasattr(report, 'raw_signal'):
-                if executor.position and executor.position.size > 0:
-                    report.current_position = executor.position.side
-                    report.position_pnl_pct = executor.position.unrealized_pnl_pct
-                decision = engine.decide(report)
-                signal = decision.action
-        except Exception:
-            pass
+                signal = report.raw_signal or "HOLD"
+        except Exception as e:
+            print(f"  ⚠️ 策略异常 @ {i}: {e}")
+            continue
 
         symbol = "BTC-USDT"
 
@@ -108,22 +105,15 @@ def run_backtest():
                 "m25": float(row.get("ma_25", 0)) if pd.notna(row.get("ma_25")) else 0,
             })
 
+        # 执行信号
         if signal == "LONG" and (not executor.position or executor.position.size == 0):
-            bars_since_exit = i - strat.last_exit_bar if strat.last_exit_bar >= 0 else COOLDOWN + 1
-            if bars_since_exit <= COOLDOWN:
-                pass  # 冷却中
-            else:
-                executor.buy(symbol, price=close_price)
+            executor.buy(symbol, price=close_price)
         elif signal == "SELL" and executor.position and executor.position.side == "long":
             pnl = (close_price - executor.position.entry_price) / executor.position.entry_price * 100 * executor.position.leverage
             executor.sell(symbol, price=close_price)
             trades.append(("LONG", close_price, pnl, row["datetime"]))
         elif signal == "SHORT" and (not executor.position or executor.position.size == 0):
-            bars_since_exit = i - strat.last_exit_bar if strat.last_exit_bar >= 0 else COOLDOWN + 1
-            if bars_since_exit <= COOLDOWN:
-                pass  # 冷却中
-            else:
-                executor.short_sell(symbol, price=close_price)
+            executor.short_sell(symbol, price=close_price)
         elif signal == "COVER" and executor.position and executor.position.side == "short":
             pnl = (executor.position.entry_price - close_price) / executor.position.entry_price * 100 * executor.position.leverage
             executor.short_cover(symbol, price=close_price)
@@ -166,16 +156,18 @@ def run_backtest():
         emoji = "🟢" if t[2] > 0 else "🔴"
         print(f"  {t[3]} | {t[0]:6s} | PnL={t[2]:+.2f}% {emoji}")
 
-    total_ret = (executor.equity - 1000) / 1000 * 100
+    total_ret = (executor.equity - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
     wins = sum(1 for t in trades if t[2] > 0)
     wr = wins / max(len(trades), 1) * 100
     avg_win = sum(t[2] for t in trades if t[2] > 0) / max(sum(1 for t in trades if t[2] > 0), 1)
     avg_loss = sum(t[2] for t in trades if t[2] < 0) / max(sum(1 for t in trades if t[2] < 0), 1)
 
     print()
-    print(f"最终权益: ${executor.equity:,.0f} ({total_ret:+.2f}%)")
+    print(f"初始资金: ${INITIAL_CAPITAL:,}")
+    print(f"最终权益: ${executor.equity:,.2f} ({total_ret:+.2f}%)")
     print(f"胜率: {wr:.1f}% ({wins}/{len(trades)})")
-    print(f"平均盈利: {avg_win:+.2f}% | 平均亏损: {avg_loss:+.2f}% | 盈亏比: {abs(avg_win/avg_loss):.2f}" if avg_loss != 0 else "")
+    if avg_loss != 0:
+        print(f"平均盈利: {avg_win:+.2f}% | 平均亏损: {avg_loss:+.2f}% | 盈亏比: {abs(avg_win/avg_loss):.2f}")
 
     long_wr = sum(1 for t in long_trades if t[2] > 0) / max(len(long_trades), 1) * 100
     short_wr = sum(1 for t in short_trades if t[2] > 0) / max(len(short_trades), 1) * 100

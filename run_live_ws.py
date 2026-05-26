@@ -214,10 +214,10 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
             pnl_pct = (close_price - executor.position.entry_price) / executor.position.entry_price * 100 * lev
             result = executor.sell(symbol, price=close_price)
             if result:
-                # 记录平仓盈亏到策略(用于冷却增强)
+                # 记录平仓盈亏到策略(用于冷却+连续亏损保护)
                 raw_pnl = (close_price - executor.position.entry_price) / executor.position.entry_price
-                if hasattr(strategy, '_last_trade_pnl'):
-                    strategy._last_trade_pnl = raw_pnl
+                if hasattr(strategy, 'record_trade_result'):
+                    strategy.record_trade_result(raw_pnl)
                 notify_trade("SELL", close_price, f"平多仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
                 if hasattr(strategy, 'last_exit_bar'):
                     strategy.last_exit_bar = latest_idx
@@ -236,10 +236,10 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
             pnl_pct = (executor.position.entry_price - close_price) / executor.position.entry_price * 100 * lev
             result = executor.short_cover(symbol, price=close_price)
             if result:
-                # 记录平仓盈亏到策略(用于冷却增强)
+                # 记录平仓盈亏到策略(用于冷却+连续亏损保护)
                 raw_pnl = (executor.position.entry_price - close_price) / executor.position.entry_price
-                if hasattr(strategy, '_last_trade_pnl'):
-                    strategy._last_trade_pnl = raw_pnl
+                if hasattr(strategy, 'record_trade_result'):
+                    strategy.record_trade_result(raw_pnl)
                 notify_trade("COVER", close_price, f"平空仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
                 if hasattr(strategy, 'last_exit_bar'):
                     strategy.last_exit_bar = latest_idx
@@ -267,6 +267,23 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
                 result = executor.short_cover(symbol, price=close_price, size=reduce_size)
                 if result:
                     notify_trade("REDUCE", close_price, f"减空仓 -50% | 均价→{executor.position.entry_price:,.0f}")
+
+    # === Kline(signal) 详情行 (供 Dashboard 解析) ===
+    sig = report.raw_signal if report else "HOLD"
+    rsi_v = float(row.get("rsi", 50))
+    adx_v = float(row.get("adx", 20))
+    macdh = float(row.get("macd_hist", 0))
+    regime = strategy._detect_regime(row) if hasattr(strategy, '_detect_regime') else "neutral"
+    # 评分
+    long_score = int(strategy._signal_ctx.get("long_score", 0)) if hasattr(strategy, '_signal_ctx') else 0
+    short_score = int(strategy._signal_ctx.get("short_score", 0)) if hasattr(strategy, '_signal_ctx') else 0
+    trend = strategy._trend if hasattr(strategy, '_trend') else "neutral"
+    logger.info(
+        f"📏 Kline(signal) | RSI={rsi_v:.0f} ADX={adx_v:.0f} MACDh={macdh:.1f}{'✗' if macdh<0 else '✓'}"
+        f" | regime={regime} | trend={trend}"
+        f" | SHORT={short_score}/9{'✓' if short_score>=6 else '✗'}"
+        f" LONG={long_score}/9{'✓' if long_score>=6 else '✗'}"
+    )
 
     # 状态日志
     status = [f"${close_price:,.0f}", f"Eq=${executor.equity:,.0f}"]
@@ -305,7 +322,7 @@ def main():
     logger.info(f"   数据: WebSocket 实时推送 (trade + kline_15m)")
     logger.info(f"   模式: K线闭合触发策略 | 秒级价格更新")
     logger.info(f"   因子: Alpha 因子集 v1.0 (44个因子)")
-    logger.info(f"   初始资金: $571")
+    logger.info(f"   初始资金: $1000")
     logger.info("=" * 60)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -372,6 +389,16 @@ def main():
             init_indicators["adx"] = 20.0
         market_state.set_indicators(init_indicators)
 
+        # 重要: 用最后一根K线初始化策略的 latest_indicators
+        # 否则策略的 ma20=0 rsi=50 导致第一个信号前所有条件都失败
+        try:
+            strategy._update_indicators_from_row(last_row)
+            logger.info(f"📊 策略指标初始化: RSI={strategy.latest_indicators.get('rsi', 'N/A'):.1f} "
+                        f"ADX={strategy.latest_indicators.get('adx', 'N/A'):.1f} "
+                        f"MA20={strategy.latest_indicators.get('ma20', 'N/A'):.0f}")
+        except Exception as e:
+            logger.warning(f"策略指标初始化失败: {e}")
+
     # 记录当前K线时间，避免重复触发
     init_kline = market_state.get_kline()
     if init_kline:
@@ -424,15 +451,15 @@ def main():
                             executor.sell("BTC-USDT", price=live_price)
                             tick_count += 1
                             pnl_raw = (live_price - executor.position.entry_price) / executor.position.entry_price if executor.position else 0
-                            if hasattr(strategy, '_last_trade_pnl'):
-                                strategy._last_trade_pnl = pnl_raw
+                            if hasattr(strategy, 'record_trade_result'):
+                                strategy.record_trade_result(pnl_raw)
                     elif side == "short_cover":
                         if executor.position and executor.position.side == "short":
                             executor.short_cover("BTC-USDT", price=live_price)
                             tick_count += 1
                             pnl_raw = (executor.position.entry_price - live_price) / executor.position.entry_price if executor.position else 0
-                            if hasattr(strategy, '_last_trade_pnl'):
-                                strategy._last_trade_pnl = pnl_raw
+                            if hasattr(strategy, 'record_trade_result'):
+                                strategy.record_trade_result(pnl_raw)
 
                 elif action in ("LONG_FILLED", "SHORT_FILLED"):
                     # 限价单成交 — 记录事件
@@ -462,6 +489,9 @@ def main():
 
         # 2. 等待 K 线闭合 (不阻塞, timeout=1s 让 tick 循环跑起来)
         closed = market_state.wait_kline_closed(timeout=1.0)
+        # 确保 _last_kline_key 始终定义（防止 try/except 内 continue 跳过初始化）
+        if '_last_kline_key' not in dir():
+            _last_kline_key = None
         if closed:
             # 去重: 确保同一K线只处理一次
             kline_key = (closed.open_time, closed.close_time)
@@ -549,7 +579,7 @@ def main():
     # 清理
     ws_client.stop()
     account = executor.get_account()
-    total_return = (account.total_equity - 571) / 571 * 100
+    total_return = (account.total_equity - 1000) / 1000 * 100
     logger.info("=" * 60)
     logger.info(f"⏹️ 已停止 | 运行: {get_uptime()} | K线: {kline_count}")
     logger.info(f"💰 最终权益: ${account.total_equity:,.2f} ({total_return:+.2f}%)")

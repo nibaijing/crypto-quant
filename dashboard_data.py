@@ -78,6 +78,36 @@ def get_recent_prices(limit=60):
     return []
 
 
+def get_kline_history() -> list:
+    """从 price_cache 提取 K线级历史（1分钟聚合，保留 OHLC 信息）。"""
+    _read_price_snapshot()
+    prices = list(_price_cache) if _price_cache else []
+    if not prices:
+        return []
+    # 按分钟聚合
+    from collections import OrderedDict
+    minute_buckets = OrderedDict()
+    for p in prices:
+        ts = p.get("time", "")
+        minute_key = ts[:16] if len(ts) >= 16 else ts  # "2026-05-26 19:36"
+        if minute_key not in minute_buckets:
+            minute_buckets[minute_key] = {
+                "time": minute_key,
+                "open": p["price"],
+                "high": p["price"],
+                "low": p["price"],
+                "close": p["price"],
+            }
+        else:
+            b = minute_buckets[minute_key]
+            px = p["price"]
+            if px < b["low"]: b["low"] = px
+            if px > b["high"]: b["high"] = px
+            b["close"] = px
+    bars = list(minute_buckets.values())
+    return bars[-40:]  # 最近40根
+
+
 # ===== 从日志提取最新权益 =====
 
 def _extract_equity_from_log() -> Optional[float]:
@@ -133,13 +163,13 @@ def _extract_equity_from_log() -> Optional[float]:
 def _read_state_file() -> dict:
     """读取 executor 写入的最新状态。文件可能陈旧（无持仓时不更新）。"""
     if not STATE_FILE.exists():
-        return {"cash": 571.0, "total_trades": 0, "winning_trades": 0, "position": None}
+        return {"cash": 1000.0, "total_trades": 0, "winning_trades": 0, "position": None}
 
     try:
         with open(STATE_FILE) as f:
             return json.load(f)
     except Exception:
-        return {"cash": 571.0, "total_trades": 0, "winning_trades": 0, "position": None}
+        return {"cash": 1000.0, "total_trades": 0, "winning_trades": 0, "position": None}
 
 
 # ===== 核心 equity 计算（增强版，支持日志回退）=====
@@ -233,8 +263,8 @@ def _parse_signals_from_log() -> list:
     """从日志解析信号行 — 适配 v7.x 最新格式。
     
     最新日志格式:
-      📊 $76,955 | Eq=$571 | Pos=-1.66% | SIG=HOLD | K#4
-      📏 Kline(signal) | RSI=22 ADX=77 MACDh=-16.4✗ | regime=... | SHORT=6/8✓ LONG=7/9
+      📏 Kline(signal) | RSI=62 ADX=33 MACDh=13.3✓ | regime=neutral | trend=up | SHORT=5/9✗ LONG=4/9
+      📊 $77,022 | Eq=$1000 | SIG=LONG | K#0
     
     Returns:
         [{time, price, equity, signal, kline, long_score, short_score, rsi, adx}, ...]
@@ -254,16 +284,22 @@ def _parse_signals_from_log() -> list:
         return []
 
     signals = []
-    # 解析 📊 行 — 主信号行
+    # 解析 📊 行 — 主信号行 (v7.x 格式: $77,022 | Eq=$1000 | SIG=LONG | K#0)
     pat_main = re.compile(
         r'📊\s*\$?([\d,]+).*?Eq=\$?([\d,]+).*?SIG=(\w+).*?K#(\d+)'
     )
-    # 解析 📏 Kline(signal) 行 — 评分详情
+    # 解析 📏 Kline(signal) 行 — 评分详情 (v7.4 格式: RSI=62 ADX=33 MACDh=13.3✓ | regime=neutral | trend=up | SHORT=5/9✗ LONG=4/9)
     pat_kline = re.compile(
-        r'📏\s+Kline\(signal\).*?RSI=([\d.]+)\s+ADX=([\d.]+).*?SHORT=([\d.]+)/\d+.*?LONG=([\d.]+)/\d+'
+        r'📏\s+Kline\(signal\)'
+        r'.*?RSI=([\d.]+)\s+ADX=([\d.]+)\s+MACDh=([\d.-]+)'
+        r'.*?SHORT=([\d.]+)/\d+.*?LONG=([\d.]+)/\d+'
     )
     # 解析时间
     pat_time = re.compile(r'(\d{2}:\d{2}:\d{2})')
+
+    # 📏 行在 📊 行之前出现，我们需要关联它们
+    # 策略: 先找 📊 行，再向前搜索找最近的 📏 行
+    # 因为 📏 行是在 📊 行之前打印的
 
     i = 0
     while i < len(lines):
@@ -296,23 +332,20 @@ def _parse_signals_from_log() -> list:
             "is_entry": None,  # 是否有入场信号
         }
 
-        # 向后搜索最多5行找 Kline(signal) 评分详情
-        for back in range(1, min(i, 5) + 1):
-            prev_line = lines[i - back]
+        # 向前搜索最多3行找 Kline(signal) 评分详情
+        # (📏 行在 📊 行之前，最多隔0-1行)
+        for prev in range(1, min(i, 3) + 1):
+            prev_line = lines[i - prev]
             d = pat_kline.search(prev_line)
             if d:
                 try:
                     sig["rsi"] = float(d.group(1))
                     sig["adx"] = float(d.group(2))
-                    sig["short_score"] = float(d.group(3))
-                    sig["long_score"] = float(d.group(4))
+                    sig["short_score"] = float(d.group(4))
+                    sig["long_score"] = float(d.group(5))
                 except ValueError:
                     pass
                 break
-
-            # 也检查是否有 ✅ LIMIT FILLED (入场)
-            if "LIMIT FILLED" in prev_line:
-                sig["is_entry"] = True
 
         signals.append(sig)
         i += 1
@@ -328,6 +361,8 @@ def _parse_trades_from_log() -> list:
     最新格式 (v7.x):
       ✅ LIMIT FILLED: SHORT_FILLED @ $76,578
       ✅ LIMIT FILLED: LONG_FILLED @ $76,500
+      ✅ LIMIT FILLED: COVER_FILLED @ $76,500
+      ✅ LIMIT FILLED: SELL_FILLED @ $76,500
       ⚡ Tick 止损: COVER PnL=-200bp
       ⚡ Tick 止损: SELL PnL=-180bp
       ⚡ 追踪止盈: COVER @76500 PnL=+50bp
@@ -351,7 +386,7 @@ def _parse_trades_from_log() -> list:
 
     for line in lines:
         # === v7.x 限价单格式 ===
-        # LIMIT FILLED: SHORT_FILLED
+        # LIMIT FILLED: SHORT_FILLED @ $76,578
         m_filled = re.search(r'✅\s*LIMIT\s+FILLED:\s*(\w+_FILLED)\s*@\s*\$?([\d,.]+)', line)
         if m_filled:
             action_raw = m_filled.group(1)
@@ -450,7 +485,7 @@ def get_all_data() -> dict:
         "indicators": {}, "kline": {},
     }
     current_price = current_snap.get("price", 0)
-    initial_capital = 571.0  # 实际入金
+    initial_capital = 1000.0  # 实际入金
 
     cash = float(state_raw.get("cash", initial_capital))
     total_trades = int(state_raw.get("total_trades", 0))
@@ -473,10 +508,8 @@ def get_all_data() -> dict:
         "low_24h": round(current_snap.get("low_24h", 0), 2),
         "indicators": _normalize_indicators(current_snap.get("indicators", {})),
         "position": pos_info,
-        "price_history": [
-            {"time": p["time"], "price": p["price"]}
-            for p in prices[-40:]
-        ],
+        "price_history": [p["price"] for p in prices[-40:]],
+        "kline_history": get_kline_history(),
         "kline": current_snap.get("kline", {}),
         "stats": {
             "total_trades": total_trades,
@@ -517,4 +550,3 @@ if __name__ == "__main__":
             print("Position: FLAT")
         print(f"Cash: ${data['cash']:,.2f} | Equity: ${data['equity']:,.2f} | Return: {data['total_return_pct']:+.2f}%")
         print(f"Trades: {data['stats']['total_trades']} | Win: {data['stats']['win_rate']}%")
-        print(f"Signals: {len(data['signals'])} | Trades: {len(data['trades'])}")
