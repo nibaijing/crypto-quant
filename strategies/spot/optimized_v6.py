@@ -39,10 +39,10 @@ logger = logging.getLogger(__name__)
 
 # === 信号阈值（基于真实数据调优）===
 # 做空 (主要盈利来源)
-RSI_SHORT_ENTRY = 65       # RSI超过65考虑做空
-RSI_SHORT_MIN = 55         # RSI必须>55才能做空
-RSI_SHORT_EXIT = 28        # RSI跌到28以下平空
-ADX_SHORT_MIN = 30         # ADX必须>30有趋势
+RSI_SHORT_ENTRY = 55       # RSI超过55做空加分 (不再是硬性要求)
+RSI_SHORT_MIN = 30         # RSI必须>30 (仅防极端超卖)
+RSI_SHORT_EXIT = 25        # RSI跌到25以下平空
+ADX_SHORT_MIN = 28         # ADX必须>28有趋势（略降捕捉早期趋势）
 ADX_SHORT_STRONG = 40      # 强趋势确认
 STOP_LOSS_SHORT_BP = 250   # 做空止损250基点
 
@@ -409,17 +409,20 @@ class OptimizedV6:
         long_reason = ""
 
         if not has_position and not in_cooldown:
+            # 做空新条件: trend_down + ADX≥28 + MACD死叉(macdh<0)
+            macdh = self.latest_indicators["macdh"]
             short_base = self._trend_down and adx >= ADX_SHORT_MIN
-            short_rsi_ok = rsi >= RSI_SHORT_MIN
-            short_rsi_extra = rsi >= RSI_SHORT_ENTRY
+            short_macd_dead = macdh < 0  # MACD死叉信号
+            short_rsi_bonus = rsi >= RSI_SHORT_ENTRY  # RSI≥55加分
             short_score = 0
             if short_base: short_score += 3
-            if short_rsi_extra: short_score += 2
+            if short_macd_dead: short_score += 2
             if adx >= ADX_SHORT_STRONG: short_score += 1
+            if short_rsi_bonus: short_score += 2
             if not short_base: short_reason += "not_trend_down "
-            if not short_rsi_ok: short_reason += f"rsi={rsi:.0f}<{RSI_SHORT_MIN} "
+            if not short_macd_dead: short_reason += f"macdh={macdh:.1f}>=0 "
 
-            short_signal = short_base and short_rsi_ok and short_score >= 4
+            short_signal = short_base and short_macd_dead and short_score >= 5
 
             long_base = rsi <= RSI_LONG_ENTRY and rsi <= RSI_LONG_MAX_ENTRY
             long_choppy = self._regime in ("weak_trend", "chop")
@@ -435,10 +438,10 @@ class OptimizedV6:
 
             # 诊断日志 (每根闭合K线)
             log_parts = [
-                f"RSI={rsi:.0f} ADX={adx:.0f} MACDh={self.latest_indicators['macdh']:.0f}",
+                f"RSI={rsi:.0f} ADX={adx:.0f} MACDh={macdh:.1f}{'✗' if macdh<0 else ''}",
                 f"regime={self._regime}",
                 f"trend={'UP' if self._trend_up else 'DOWN' if self._trend_down else 'FLAT'}",
-                f"SHORT={short_score}/9{'✓' if short_signal else ''}",
+                f"SHORT={short_score}/8{'✓' if short_signal else ''}",
                 f"LONG={long_score}/9{'✓' if long_signal else ''}",
             ]
             if short_reason:
@@ -547,22 +550,20 @@ class OptimizedV6:
                 if time.time() - self._last_entry_try < 300:
                     return result
 
-            # 3. 信号评估 (实时)
+            # 3. 信号评估 (实时 — MACD死叉优先)
             if adx < ADX_NO_TRADE:
                 return result
 
+            macdh = self.latest_indicators.get("macdh", 0)
             short_base = self._trend_down and adx >= ADX_SHORT_MIN
-            short_rsi_ok = rsi >= RSI_SHORT_MIN
-            short_rsi_extra = rsi >= RSI_SHORT_ENTRY
+            short_macd_dead = macdh < 0
+            short_rsi_bonus = rsi >= RSI_SHORT_ENTRY
 
             long_base = rsi <= RSI_LONG_ENTRY and rsi <= RSI_LONG_MAX_ENTRY
             long_choppy = self._regime in ("weak_trend", "chop")
 
-            short_ready = short_base and short_rsi_ok
-            long_ready = long_base and long_choppy
-
-            # 限价单: 检测到信号, 计算限价, 挂单
-            if short_ready and short_rsi_extra:
+            # 限价单: MACD死叉 + downtrend + ADX≥28 → 挂空
+            if short_base and short_macd_dead:
                 # 做空 → 在buy order book上方挂short_sell限价
                 size = self.get_position_size(executor.cash, current_price, 10, atr, "short")
                 limit_price = self._get_limit_price(current_price, "short_sell")
@@ -573,14 +574,17 @@ class OptimizedV6:
                 self._last_entry_price = current_price
                 self._last_entry_try = time.time()
 
+                extras = []
+                if short_rsi_bonus: extras.append(f"RSI={rsi:.0f}≥{RSI_SHORT_ENTRY}")
+                ext = f" ({', '.join(extras)})" if extras else ""
                 result["action"] = "PLACE_LIMIT"
                 result["side"] = "short_sell"
                 result["limit_price"] = limit_price
                 result["size"] = size
-                result["message"] = f"SHORT limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f} ADX={adx:.0f}"
+                result["message"] = f"SHORT limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) macdh={macdh:.1f} ADX={adx:.0f}{ext}"
                 logger.info(f"📋 {result['message']} | size={size:.6f}")
 
-            elif long_ready and rsi <= RSI_LONG_ENTRY:
+            elif long_base and long_choppy:
                 # 做多 → 在ask book下方挂buy限价
                 size = self.get_position_size(executor.cash, current_price, 10, atr, "long")
                 limit_price = self._get_limit_price(current_price, "buy")

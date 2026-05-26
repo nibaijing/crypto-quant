@@ -121,6 +121,8 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
     row = df.iloc[latest_idx]
     close_price = float(row["close"])
 
+    symbol = "BTC-USDT"
+
     # 更新 executor 杠杆
     if "volatility" in df.columns:
         vol = float(row["volatility"])
@@ -176,13 +178,18 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
         strategy.peak_equity = 0
         return
 
-    # === 决策: 直接使用策略信号 ===
+    # === 决策: 限价单模式 — K线闭合只更新指标, 入场由on_tick挂限价单 ===
+    signal = "HOLD"
     if report is not None:
-        final_action = report.raw_signal or "HOLD"
-
-    # 执行信号
-    signal = final_action  # 保持变量名兼容
-    symbol = "BTC-USDT"
+        raw = report.raw_signal or "HOLD"
+        if raw in ("LONG", "SHORT"):
+            # 开仓信号: 记录但不直接交易, 由on_tick挂限价单
+            logger.info(f"📡 信号: {raw} (限价单模式 — 由on_tick挂单)")
+        elif raw in ("SELL", "COVER"):
+            # 平仓信号: K线闭合时直接市价平仓(风控保护)
+            signal = raw
+        elif raw in ("ADD_LONG", "ADD_SHORT", "REDUCE"):
+            signal = raw
     if signal and signal != "HOLD":
         logger.info(f"📡 信号: {signal} | close=${close_price:,.0f}")
 
@@ -307,6 +314,9 @@ def main():
     executor = FuturesExecutor()
     executor.set_leverage(10)
     strategy = OptimizedStrategy()
+    # 用实际权益初始化 peak_equity, 避免回撤误报
+    strategy.peak_equity = max(executor.equity, 500)
+    logger.info(f"📊 初始权益: ${executor.equity:.0f} | peak_equity={strategy.peak_equity:.0f}")
     alpha_factors = AlphaFactors()
 
     # 加载 LightGBM 模型 (可选, 如果不存在则降级为纯信号驱动)
