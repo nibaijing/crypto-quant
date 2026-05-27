@@ -177,6 +177,7 @@ class OptimizedV6:
         self._entry_time = 0           # 当前仓位开仓时间戳(用于持有时间保护)
         self._partial_tp_done = False  # 部分止盈已执行
         self._consecutive_losses = 0   # 连续亏损计数器
+        self._signal_ctx = {"long_score": 0, "short_score": 0}  # 评分缓存(供Dashboard日志)
 
     def restore_state(self, state):
         if not state:
@@ -562,6 +563,9 @@ class OptimizedV6:
                 long_signal = True
                 long_score = max(long_score, 5)
 
+            # 保存评分供 Dashboard 日志使用
+            self._signal_ctx = {"long_score": long_score, "short_score": short_score}
+
             # 诊断日志 (每根闭合K线)
             log_parts = [
                 f"RSI={rsi:.0f} ADX={adx:.0f} MACDh={macdh:.1f}{'✗' if macdh<0 else ''}",
@@ -593,6 +597,37 @@ class OptimizedV6:
                     short_signal = False
                     long_signal = False
         elif has_position:
+            # 有持仓时也更新评分供 Dashboard 日志使用
+            # 使用最新价格/指标计算（不影响信号，只做显示）
+            try:
+                macdh = self.latest_indicators["macdh"]
+                ma20_val = self.latest_indicators["ma20"]
+                long_near_ma = abs(c - ma20_val) / max(ma20_val, 1) < 0.02
+                short_base = self._trend_down and adx >= ADX_SHORT_MIN
+                short_rsi_overbought = rsi >= RSI_SHORT_ENTRY
+                short_macd_dead = macdh < 0
+                hold_short_score = 0
+                if short_base: hold_short_score += 3
+                if short_macd_dead: hold_short_score += 2
+                if adx >= ADX_SHORT_STRONG: hold_short_score += 2
+                if short_rsi_overbought: hold_short_score += 2
+                chop_short = self._trend_flat and rsi >= RSI_SHORT_ENTRY and short_macd_dead and c > ma20_val
+                if chop_short: hold_short_score += 3
+                trend_pullback = self._trend_up and rsi >= 35 and rsi <= RSI_LONG_MAX_ENTRY
+                oversold_bounce = rsi <= RSI_LONG_ENTRY and (self._trend_flat or self._trend_up)
+                trend_continuation_long = self._trend_up and adx > ADX_NO_TRADE
+                hold_long_score = 0
+                if rsi <= RSI_LONG_MAX_ENTRY: hold_long_score += 1
+                if trend_pullback: hold_long_score += 4
+                if oversold_bounce: hold_long_score += 3
+                if trend_continuation_long: hold_long_score += 4
+                if long_near_ma: hold_long_score += 2
+                if rsi <= 30: hold_long_score += 1
+                chop_long = self._trend_flat and rsi >= 30 and rsi <= RSI_LONG_MAX_ENTRY and macdh > 0 and long_near_ma
+                if chop_long: hold_long_score += 3
+                self._signal_ctx = {"long_score": hold_long_score, "short_score": hold_short_score}
+            except Exception:
+                self._signal_ctx = {"long_score": 0, "short_score": 0}
             pass
 
         signal = "HOLD"
