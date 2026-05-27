@@ -324,14 +324,18 @@ function render(d){
 function renderOHLC(d){
   const container = document.getElementById('klineBar');
   const kh = d.kline_history||[];
+  console.log('renderOHLC: bars='+kh.length);
 
   if(kh.length>=2){
     const valid = kh.filter(b=>b.low>0 && b.high>0);
     if(valid.length<2){container.innerHTML='<div class="empty">Waiting for price data...</div>';return;}
+    console.log('renderOHLC: valid='+valid.length+', low='+valid[0].low.toFixed(1)+' high='+valid[0].high.toFixed(1));
 
-    // 用最后30根K线
     const bars = valid.slice(-30);
-    const w = container.clientWidth||Math.min(container.parentElement.clientWidth||360, 500);
+    // 强制容器可见 + 宽度回退
+    container.style.display='block';
+    container.style.minWidth='280px';
+    const w = Math.max(container.clientWidth||0, container.parentElement?.clientWidth||0, 280);
     const h = 180;
     const pad = {t:16,b:20,l:6,r:6};
     const cw = w-pad.l-pad.r, ch = h-pad.t-pad.b;
