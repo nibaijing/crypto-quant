@@ -518,6 +518,18 @@ def _parse_trades_from_log() -> list:
     return trades
 
 
+def _dedup_trades(trades: list) -> list:
+    """去除完全相同的交易行（相同时间+动作+价格）。"""
+    seen = set()
+    result = []
+    for t in trades:
+        key = (t.get("time", ""), t.get("action", ""), int(t.get("price", 0) * 100))
+        if key not in seen:
+            seen.add(key)
+            result.append(t)
+    return result
+
+
 # ===== 聚合 API =====
 
 def get_all_data() -> dict:
@@ -567,7 +579,7 @@ def get_all_data() -> dict:
 
     # 信号 & 交易历史 — 从日志解析
     result["signals"] = _parse_signals_from_log()
-    result["trades"] = _parse_trades_from_log()
+    result["trades"] = _dedup_trades(_parse_trades_from_log())
 
     # 更新 stats：如果日志中有交易数据，从日志取更准确的值
     if result["trades"]:

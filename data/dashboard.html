@@ -89,17 +89,7 @@ tr:hover td{background:rgba(89,194,255,0.03)}
 .sig-buy{color:var(--green)}.sig-sell{color:var(--red)}.sig-hold{color:var(--text-dim)}
 @media(min-width:480px){.sig{font-size:11px;max-height:100px}.sig span{padding:2px 6px}}
 
-/* ========== OHLC K线图 ========== */
-.ohlc-wrap{position:relative;height:140px;margin:8px 0;overflow-x:auto;overflow-y:hidden}
-.ohlc-canvas{display:flex;align-items:flex-end;height:100%;position:relative}
-.candle{position:relative;display:flex;flex-direction:column;align-items:center;flex-shrink:0;margin:0 0.5px}
-.candle-body{width:100%;min-height:2px;border-radius:1px;transition:height 0.3s}
-.candle-wick{width:1px;border-radius:1px;margin:0 auto;transition:height 0.3s}
-.candle-green .candle-body,.candle-green .candle-wick{background:var(--green)}
-.candle-red .candle-body,.candle-red .candle-wick{background:var(--red)}
-.ohlc-labels{display:flex;font-size:8px;color:var(--text-dim);margin-top:2px;overflow:hidden}
-.ohlc-labels span{flex-shrink:0;text-align:center}
-
+/* ========== Footer ========== */
 .footer{text-align:center;color:var(--text-dim);font-size:9px;padding:10px 0;border-top:1px solid var(--border);margin-top:10px}
 </style>
 </head>
@@ -153,8 +143,8 @@ tr:hover td{background:rgba(89,194,255,0.03)}
 
 <!-- OHLC K-line Chart -->
 <div class="panel" style="margin-bottom:6px">
-  <div class="panel-hdr"><span class="label">📊 OHLC · K-line Bars</span></div>
-  <div id="klineBar" class="ohlc-wrap"><div class="empty">Loading price bars...</div></div>
+  <div class="panel-hdr"><span class="label">📈 Price Trend</span></div>
+  <div id="klineBar"><div class="empty">Loading price trend...</div></div>
 </div>
 
 <!-- Signals -->
@@ -241,19 +231,25 @@ function render(d){
   const pp = document.getElementById('positionPanel');
   if(d.position){
     const pos = d.position;
-    pp.innerHTML = `<table><tr><th>Side</th><th>Size</th><th>Entry</th><th>Px</th><th>Lev</th></tr><tr>
+    const val = pos.size * pos.current_price;
+    const marginVal = pos.margin || (pos.size * pos.entry_price / pos.leverage);
+    pp.innerHTML = `<table><tr><th>Side</th><th>Size</th><th>Val</th><th>Entry</th><th>Px</th><th>Lev</th></tr><tr>
       <td class="${pos.side==='long'?'blue':'red'}" style="font-weight:600">${pos.side.toUpperCase()}</td>
-      <td>${pos.size}</td><td>$${fmt(pos.entry_price)}</td>
-      <td class="${pos.pnl>=0?'green':'red'}">$${fmt(pos.current_price)}</td>
+      <td>${pos.size.toFixed(4)}</td>
+      <td class="${pos.pnl>=0?'green':'red'}">$${fmt(val)}</td>
+      <td>$${fmt(pos.entry_price)}</td>
+      <td>$${fmt(pos.current_price)}</td>
       <td>${pos.leverage}x</td>
-    </tr></table>`;
+    </tr></table>${pos.margin ? `<div style="font-size:9px;color:var(--text-dim);margin-top:4px;text-align:right">Margin: $${fmt(pos.margin)}</div>` : ''}`;
   }else if(d.active_limit){
     const lo = d.active_limit;
     const sideLabel = lo.side==='buy'?'LONG':lo.side==='short_sell'?'SHORT':lo.side.toUpperCase();
+    const priceVal = lo.price || lo.limit_price || 0;
+    const ageStr = lo.placed_at ? `⏱ ${calcAge(lo.placed_at)}s` : '';
     pp.innerHTML = `<div style="text-align:center;padding:6px;font-size:11px">
       <span style="color:var(--yellow);font-weight:600">⏳ ${sideLabel} LIMIT PENDING</span><br>
-      <span style="color:var(--text)">$${fmt(lo.price)}</span>
-      <span class="dim"> × ${lo.size||'--'} | age: ${calcAge(lo.placed_at)}s</span>
+      <span style="font-size:15px;font-weight:700;color:var(--text-bright)">$${fmt(priceVal)}</span>
+      <span class="dim"> × ${lo.size||'--'} ${ageStr}</span>
     </div>`;
   }else{
     pp.innerHTML = '<div class="empty">No position 🏖️</div>';
@@ -322,36 +318,62 @@ function renderOHLC(d){
   const kh = d.kline_history||[];
 
   if(kh.length>=2){
-    // 过滤无效bar (low=0, high=0)
     const valid = kh.filter(b=>b.low>0 && b.high>0);
-    if(valid.length<2){container.innerHTML='<div class="empty">Waiting for K-line data...</div>';return;}
+    if(valid.length<2){container.innerHTML='<div class="empty">Waiting for price data...</div>';return;}
     const bars = valid.slice(-30);
-    const allPx = bars.flatMap(b=>[b.high,b.low]);
-    const min = Math.min(...allPx), max = Math.max(...allPx), range = max-min||1;
-    const h = 130, cw = Math.max(4, Math.min(10, 280/bars.length));
+    const px = bars.map(b=>b.close);
+    const min = Math.min(...px), max = Math.max(...px), range = max-min||1;
 
-    container.innerHTML = '<div class="ohlc-canvas">'+bars.map(b=>{
-      const isGreen = b.close >= b.open;
-      const bodyH = Math.max(2, ((Math.abs(b.close-b.open))/range)*h*0.7);
-      const topWick = Math.max(0, ((b.high-Math.max(b.open,b.close))/range)*h*0.7);
-      const botWick = Math.max(0, ((Math.min(b.open,b.close)-b.low)/range)*h*0.7);
-      return `<div class="candle ${isGreen?'candle-green':'candle-red'}" style="width:${cw}px;height:${topWick+bodyH+botWick}px;justify-content:flex-end">
-        <div class="candle-wick" style="height:${topWick}px"></div>
-        <div class="candle-body" style="height:${bodyH}px"></div>
-        <div class="candle-wick" style="height:${botWick}px"></div>
+    // SVG sparkline
+    const w = container.clientWidth||360, h = 70;
+    const pad = {t:4,b:4,l:2,r:2};
+    const sw = w-pad.l-pad.r, sh = h-pad.t-pad.b;
+    const xStep = sw/(px.length-1||1);
+    const pts = px.map((p,i)=>`${pad.l+i*xStep},${pad.t+sh-(p-min)/range*sh}`);
+    const poly = pts.join(' ');
+    const lastPx = px[px.length-1], firstPx = px[0];
+    const rise = lastPx >= firstPx;
+    const lineColor = rise?'#7fd962':'#f26d78';
+    const fillColor = rise?'rgba(127,217,98,0.12)':'rgba(242,109,120,0.12)';
+    const fillPts = `${pad.l},${pad.t+sh} ${poly} ${pad.l+xStep*(px.length-1)},${pad.t+sh}`;
+
+    // Indicator bars
+    const indH = 24;
+    const volMax = Math.max(...bars.map(b=>b.high-b.low), 1);
+    const rsiVal = d.indicators?.rsi||0;
+    const adxVal = d.indicators?.adx||0;
+    const macdhVal = d.indicators?.macd_hist||0;
+
+    container.innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:2px">
+        <svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block">
+          <polygon points="${fillPts}" fill="${fillColor}"/>
+          <polyline points="${poly}" fill="none" stroke="${lineColor}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div style="display:flex;gap:8px;font-size:10px;flex-wrap:wrap;align-items:center;padding:2px 0">
+          <span>↕ <b>$${fmt(min)}–$${fmt(max)}</b></span>
+          <span>${rise?'📈':'📉'} <b class="${rise?'green':'red'}">${((lastPx-firstPx)/firstPx*100).toFixed(2)}%</b></span>
+          <span style="color:var(--text-dim)">${bars.length} bars</span>
+        </div>
+        <div style="display:flex;gap:10px;font-size:10px;padding:4px 6px;background:var(--bg);border-radius:4px;flex-wrap:wrap">
+          <span>RSI <b class="${rsiVal>60?'green':rsiVal<35?'red':'dim'}">${rsiVal.toFixed(1)}</b>
+            <span style="font-size:8px;color:var(--text-dim)">${rsiVal>60?'overbought':rsiVal<35?'oversold':'neutral'}</span></span>
+          <span>ADX <b class="${adxVal>40?'yellow':adxVal>25?'blue':'dim'}">${adxVal.toFixed(1)}</b>
+            <span style="font-size:8px;color:var(--text-dim)">${adxVal>40?'strong':adxVal>25?'trending':'weak'}</span></span>
+          <span>MACDh <b class="${macdhVal>=0?'green':'red'}">${macdhVal.toFixed(1)}</b>
+            <span style="font-size:8px;color:var(--text-dim)">${macdhVal>=0?'↗':'↘'}</span></span>
+          <span>A/D <b class="${rise?'green':'red'}">${rise?'Bullish':'Bearish'}</b></span>
+        </div>
       </div>`;
-    }).join('')+'</div>';
   } else if(d.kline && d.kline.open > 0){
-    // 只有当前一根K线时，显示价格线
     const k = d.kline;
-    container.innerHTML = `<div style="display:flex;align-items:flex-end;height:130px;overflow-x:auto;justify-content:center">
-      <div class="candle ${k.close>=k.open?'candle-green':'candle-red'}" style="width:40px;height:130px;justify-content:flex-end">
-        <div class="candle-body" style="height:${Math.max(4,((Math.abs(k.close-k.open))/(k.high-k.low||1))*90)}px"></div>
-      </div>
-      <div style="margin-left:12px;font-size:10px;color:var(--text-dim)">O:$${fmt(k.open)} H:$${fmt(k.high)} L:$${fmt(k.low)} C:$${fmt(k.close)}</div>
+    container.innerHTML = `<div style="font-size:11px;padding:6px;text-align:center">
+      <span class="dim">Current bar: </span>
+      O=$${fmt(k.open)} H=$${fmt(k.high)} L=$${fmt(k.low)} C=$${fmt(k.close)}
+      <span class="dim"> | ${k.close>=k.open?'📈':'📉'}</span>
     </div>`;
   } else {
-    container.innerHTML = '<div class="empty">Waiting for K-line data...</div>';
+    container.innerHTML = '<div class="empty">Waiting for price data...</div>';
   }
 }
 
