@@ -54,6 +54,11 @@ RSI_LONG_EXIT_MIN_PROFIT_BP = 12  # RSI平仓需要至少12bp利润(原15)
 MIN_HOLD_TICK_SEC = 20     # 持仓最少持20秒(原30)
 STOP_LOSS_LONG_BP = 150    # 做多止损150bp
 
+# RSI超买强制做空 (P0)
+RSI_OVBOUGHT = 65          # RSI≥65视为超买区
+RSI_OVBOUGHT_FORCE_SHORT = 70  # RSI≥70时强制做空(不依赖trend_down)
+RSI_OVBOUGHT_EXIT_BUMP = 4     # 超买做空需价格回落至少4bp入场(防追高)
+
 # 通用阈值
 ADX_NO_TRADE = 12          # ADX<12才不开仓(原18 — 支持更多盘整交易)
 MIN_HOLD_BARS = 1          # 最少持仓1根K线(15分钟)
@@ -61,19 +66,19 @@ MAX_HOLD_BARS = 24         # 最长持仓24根K线(6小时)
 COOLDOWN_BARS = 4          # 亏损后冷却4根K线(原6)
 COOLDOWN_TICK_SEC = 180    # 亏损后tick级冷却3分钟(原300)
 
-# === 仓位管理 ===
+# 仓位管理
 MAX_POSITION_PCT = 0.12    # 单笔12%权益作保证金(原15%，更保守)
 RISK_PER_TRADE = 0.008     # 单笔风险0.8%(原1.5%)
 STOP_ATR_MULT = 2.5        # ATR止损倍数(容忍更大波动)
 
-# === 连续亏损保护 ===
+# 连续亏损保护
 MAX_CONSECUTIVE_LOSSES = 3 # 连续3笔亏损后暂停到下一根K线闭合
 
-# === 风险管理 ===
+# 风险管理
 MAX_DRAWDOWN_PCT = 0.30    # 30%回撤熔断
 INITIAL_CAPITAL = 1000
 
-# === 限价单参数 ===
+# 限价单参数
 LIMIT_OFFSET_BP = 6        # 限价单偏移6bp(原5，略多给确认空间)
 TP_ATR_MULT = 2.0           # 止盈 = ATR × 2.0(多给空间让利润跑，原1.5)
 TP_TRAIL_BP = 30            # 盈利30bp后移动止损到保本(原50，更早保护)
@@ -82,14 +87,19 @@ TP_LOCK_BP = 120           # 盈利120bp后移动止盈到ATR×1.0锁利
 # 限价单超时
 LIMIT_ORDER_TIMEOUT = 90   # 限价单90秒不成交撤单
 
-# 部分止盈
-TP_PARTIAL_MULT = 1.0      # 50%仓位在ATR×1.0时锁定(部分止盈)
-TP_PARTIAL_RATIO = 0.50    # 部分止盈比例
+# 部分止盈 (P1: 简化逻辑，不再分批)
+TP_PARTIAL_MULT = 1.0
+TP_PARTIAL_RATIO = 0.50    # 部分止盈比例 — 但改为在20bp利润时直接全平(P1)
 
-# === Tick 级评估参数 ===
+# Tick 级评估参数
 TICK_EVAL_INTERVAL = 0.5   # tick评估最小间隔(秒，原1.0 — 更高频)
 PRICE_REENTER_DELTA_BP = 8  # 撤单后价格变化>8bp才重新挂单(原12)
-MIN_PRICE_CHANGE_BP = 5    # Tick级信号: 价格变化<5bp不重复评估开仓(原8)
+MIN_PRICE_CHANGE_BP = 4    # Tick级信号: 价格变化>4bp才重复评估(原5，更灵敏)
+
+# === P2: 时效止损 ===
+MAX_HOLD_TIME_SEC_LOW_PROFIT = 7200   # 2小时PnL<20bp自动关仓
+MAX_HOLD_TIME_SEC_ANY = 14400         # 4小时强制关仓(不管盈亏)
+MIN_PROFIT_BP_BEFORE_TIME_LIMIT = 20  # 2小时后需至少20bp利润才允许继续持有
 
 
 class LimitOrder:
@@ -178,6 +188,9 @@ class OptimizedV6:
         self._partial_tp_done = False  # 部分止盈已执行
         self._consecutive_losses = 0   # 连续亏损计数器
         self._signal_ctx = {"long_score": 0, "short_score": 0}  # 评分缓存(供Dashboard日志)
+
+        # P0: Double-open保护 — 记录上次开仓的bar索引
+        self._last_opened_bar_index = -1
 
     def restore_state(self, state):
         if not state:
@@ -566,6 +579,18 @@ class OptimizedV6:
             # 保存评分供 Dashboard 日志使用
             self._signal_ctx = {"long_score": long_score, "short_score": short_score}
 
+            # === P0: RSI超买强制做空 ===
+            # 当RSI≥70时，不管trend状态，直接走超买逆势做空路径
+            rsi_overbought_force = rsi >= RSI_OVBOUGHT_FORCE_SHORT
+            if not has_position and not in_cooldown and rsi_overbought_force:
+                # 超买做空评分: base + RSI溢价
+                ob_short_score = 6  # 直接6分起步
+                if short_macd_dead: ob_short_score += 2
+                if adx > ADX_NO_TRADE: ob_short_score += 1
+                short_signal = True
+                short_score = max(short_score, ob_short_score)
+                short_reason = f"RSI={rsi:.0f}≥{RSI_OVBOUGHT_FORCE_SHORT}超买逆势"
+
             # 诊断日志 (每根闭合K线)
             log_parts = [
                 f"RSI={rsi:.0f} ADX={adx:.0f} MACDh={macdh:.1f}{'✗' if macdh<0 else ''}",
@@ -634,9 +659,25 @@ class OptimizedV6:
         if has_position:
             signal = "HOLD"
         elif short_signal:
-            signal = "SHORT"
+            # P0: Double-open保护 — 同一bar不重复开同向
+            if long_score >= short_score and self._signal_ctx.get("long_score", 0) >= 5:
+                # 多空评分接近，选trend方向
+                if self._trend_up:
+                    signal = "LONG"
+                elif self._trend_down:
+                    signal = "SHORT"
+                elif short_score >= 6:
+                    signal = "SHORT"
+                else:
+                    signal = "HOLD"
+            else:
+                signal = "SHORT"
         elif long_signal:
             signal = "LONG"
+
+        # P0: 记录开仓bar索引
+        if signal in ("LONG", "SHORT"):
+            self._last_opened_bar_index = idx
 
         return Report(signal)
 
@@ -685,15 +726,17 @@ class OptimizedV6:
                     self._reset_trade_state()
                     return result
 
-                # 部分止盈: ATR×1.0时锁定50%利润
-                if atr > 0 and pnl_bp > 0 and not self._partial_tp_done:
-                    tp_partial = entry_p + atr * TP_PARTIAL_MULT
-                    if current_price >= tp_partial:
-                        self._partial_tp_done = True
-                        partial_size = executor.position.size * TP_PARTIAL_RATIO if executor.position else 0
-                        if partial_size > 0 and hasattr(executor, 'sell'):
-                            logger.info(f"⚡ 部分止盈: SELL {partial_size:.6f} @{current_price:.0f} (TP@{tp_partial:.0f}) PnL={pnl_bp:.0f}bp")
-                            executor.sell("BTC-USDT", price=current_price, size=partial_size)
+                # P1: 简化止盈(多头) — 20bp利润直接全平(不分批)
+                if pnl_bp >= 20 and self._entry_time > 0:
+                    import time as _t
+                    hold_sec = _t.time() - self._entry_time
+                    if hold_sec >= MIN_HOLD_TICK_SEC:
+                        logger.info(f"⚡ 止盈(20bp): SELL @{current_price:.0f} PnL={pnl_bp:.0f}bp (hold={hold_sec:.0f}s)")
+                        result["action"] = "EXECUTE"
+                        result["side"] = "sell"
+                        result["message"] = f"TP20bp@{current_price:.0f} PnL={pnl_bp:.0f}bp"
+                        self._reset_trade_state()
+                        return result
 
                 # 追踪止损: 盈利30bp后移动止损到保本
                 if pnl_bp >= TP_TRAIL_BP and self._trailing_stop_price == 0:
@@ -771,15 +814,17 @@ class OptimizedV6:
                     self._reset_trade_state()
                     return result
 
-                # 部分止盈: ATR×1.0时锁定50%利润
-                if atr > 0 and pnl_bp > 0 and not self._partial_tp_done:
-                    tp_partial = entry_p - atr * TP_PARTIAL_MULT
-                    if current_price <= tp_partial:
-                        self._partial_tp_done = True
-                        partial_size = executor.position.size * TP_PARTIAL_RATIO if executor.position else 0
-                        if partial_size > 0 and hasattr(executor, 'short_cover'):
-                            logger.info(f"⚡ 部分止盈: COVER {partial_size:.6f} @{current_price:.0f} (TP@{tp_partial:.0f}) PnL={pnl_bp:.0f}bp")
-                            executor.short_cover("BTC-USDT", price=current_price, size=partial_size)
+                # P1: 简化止盈(空头) — 20bp利润直接全平(不分批)
+                if pnl_bp >= 20 and self._entry_time > 0:
+                    import time as _t
+                    hold_sec = _t.time() - self._entry_time
+                    if hold_sec >= MIN_HOLD_TICK_SEC:
+                        logger.info(f"⚡ 止盈(20bp): COVER @{current_price:.0f} PnL={pnl_bp:.0f}bp (hold={hold_sec:.0f}s)")
+                        result["action"] = "EXECUTE"
+                        result["side"] = "short_cover"
+                        result["message"] = f"TP20bp@{current_price:.0f} PnL={pnl_bp:.0f}bp"
+                        self._reset_trade_state()
+                        return result
 
                 # 追踪止损: 盈利30bp后移动止损到保本
                 if pnl_bp >= TP_TRAIL_BP and self._trailing_stop_price == 0:
@@ -830,6 +875,27 @@ class OptimizedV6:
                         result["message"] = f"ATR_TP@{current_price:.0f} PnL={pnl_bp:.0f}bp"
                         self._reset_trade_state()
                         return result
+
+            # ===== P2: 时效止损 =====
+            # 对所有持仓: 2小时后PnL<20bp关仓, 4小时强制关仓
+            if self._entry_time > 0:
+                hold_sec = time.time() - self._entry_time
+                if hold_sec >= MAX_HOLD_TIME_SEC_ANY:
+                    exit_side = 'sell' if side == 'long' else 'short_cover'
+                    logger.info(f"⏰ 时效止损({MAX_HOLD_TIME_SEC_ANY/3600:.0f}h): {exit_side.upper()} @{current_price:.0f} PnL={pnl_bp:.0f}bp")
+                    result["action"] = "EXECUTE"
+                    result["side"] = exit_side
+                    result["message"] = f"TIME_EXIT@{current_price:.0f} PnL={pnl_bp:.0f}bp"
+                    self._reset_trade_state()
+                    return result
+                elif hold_sec >= MAX_HOLD_TIME_SEC_LOW_PROFIT and pnl_bp < MIN_PROFIT_BP_BEFORE_TIME_LIMIT:
+                    exit_side = 'sell' if side == 'long' else 'short_cover'
+                    logger.info(f"⏰ 低利润时效({MAX_HOLD_TIME_SEC_LOW_PROFIT/3600:.0f}h PnL={pnl_bp:.0f}bp): {exit_side.upper()} @{current_price:.0f}")
+                    result["action"] = "EXECUTE"
+                    result["side"] = exit_side
+                    result["message"] = f"LOW_PROFIT_EXIT@{current_price:.0f} PnL={pnl_bp:.0f}bp"
+                    self._reset_trade_state()
+                    return result
 
         # ===== 无持仓: 检查限价单成交 + 新信号 =====
         if not has_position:
@@ -912,6 +978,27 @@ class OptimizedV6:
                 result["message"] = f"SHORT(chop) limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f} ADX={adx:.0f}"
                 short_placed = True
 
+            # === P0: RSI超买强制做空 (Tick级) ===
+            # 当RSI≥70时，不依赖trend方向，直接在价格从超买区回落时做空
+            if not short_placed and rsi >= RSI_OVBOUGHT_FORCE_SHORT:
+                # 计算价格回落: 当前价低于近期最高价至少RSI_OVBOUGHT_EXIT_BUMP bp
+                if current_price < self._last_signal_price * (1 - RSI_OVBOUGHT_EXIT_BUMP / 10000):
+                    size = self.get_position_size(executor.cash, current_price, 10, atr, "short")
+                    limit_price = self._get_limit_price(current_price, "short_sell")
+                    lo = LimitOrder("short_sell", limit_price, size, "entry")
+                    lo.placed_at = time.time()
+                    self.active_limit_order = lo
+                    self._last_entry_price = current_price
+                    self._last_entry_try = time.time()
+                    self._last_signal_price = current_price
+                    result["action"] = "PLACE_LIMIT"
+                    result["side"] = "short_sell"
+                    result["limit_price"] = limit_price
+                    result["size"] = size
+                    result["message"] = f"SHORT(overbought) limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f}"
+                    short_placed = True
+                    logger.info(f"📋 RSI超买强制做空: {result['message']} | size={size:.6f}")
+
             # === 做多入口 (上涨回踩/趋势延续/超卖反弹/盘整金叉) ===
             if not short_placed:
                 trend_pullback_long = self._trend_up and rsi >= 38 and rsi <= RSI_LONG_MAX_ENTRY
@@ -948,6 +1035,8 @@ class OptimizedV6:
         self._entry_time = 0
         self._position_side = None
         self._partial_tp_done = False
+        # P0: 重置后不重置_last_opened_bar_index，它由on_bar的open时设置
+        # P1: 分批平仓优化 — 重置部分止盈标记
 
     def record_trade_result(self, pnl_raw: float):
         """引擎平仓后调用, 记录盈亏和连续亏损计数"""

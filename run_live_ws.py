@@ -283,11 +283,11 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
     rsi_v = float(row.get("rsi", 50))
     adx_v = float(row.get("adx", 20))
     macdh = float(row.get("macd_hist", 0))
-    regime = strategy._detect_regime(row) if hasattr(strategy, '_detect_regime') else "neutral"
+    regime = strategy._regime if hasattr(strategy, '_regime') else "neutral"
     # 评分
     long_score = int(strategy._signal_ctx.get("long_score", 0)) if hasattr(strategy, '_signal_ctx') else 0
     short_score = int(strategy._signal_ctx.get("short_score", 0)) if hasattr(strategy, '_signal_ctx') else 0
-    trend = strategy._trend if hasattr(strategy, '_trend') else "neutral"
+    trend = "up" if strategy._trend_up else "down" if strategy._trend_down else "flat" if hasattr(strategy, '_trend_down') else "neutral"
     logger.info(
         f"📏 Kline(signal) | RSI={rsi_v:.0f} ADX={adx_v:.0f} MACDh={macdh:.1f}{'✗' if macdh<0 else '✓'}"
         f" | regime={regime} | trend={trend}"
