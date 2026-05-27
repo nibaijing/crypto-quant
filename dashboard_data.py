@@ -293,11 +293,12 @@ def _normalize_indicators(indicators):
 # ===== 从日志解析信号（精确匹配最新格式）=====
 
 def _dedup_signals(signals: list) -> list:
-    """去除重复信号行（相同time+price+signal+rsi的只保留第一个）。"""
+    """去除重复信号行（同一分钟内相同signal+price只保留第一个）。"""
     seen = set()
     result = []
     for s in signals:
-        key = (s["time"], s["price"], s["signal"],
+        minute_key = s["time"][:5] if len(s["time"]) >= 5 else s["time"]
+        key = (minute_key, s["price"], s["signal"],
                int(s.get("rsi") or 0), int(s.get("adx") or 0))
         if key not in seen:
             seen.add(key)
