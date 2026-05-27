@@ -595,15 +595,21 @@ def get_all_data() -> dict:
     result["signals"] = _parse_signals_from_log()
     result["trades"] = _dedup_trades(_parse_trades_from_log())
 
-    # 更新 stats：如果日志中有交易数据，从日志取更准确的值
+    # 更新 stats：优先用日志解析的交易数据覆盖旧状态
     if result["trades"]:
-        trade_actions = [t for t in result["trades"] if t["action"] in ("平多", "平空")]
-        if trade_actions:
-            win_trades = sum(1 for t in trade_actions if t.get("pnl", 0) > 0)
-            if win_trades > winning_trades:
-                result["stats"]["winning_trades"] = win_trades
-                result["stats"]["win_rate"] = round(win_trades / max(len(trade_actions), 1) * 100, 1)
-                result["stats"]["total_trades"] = len(trade_actions)
+        trade_all = result["trades"]
+        close_actions = [t for t in trade_all if t["action"] in ("平多", "平空")]
+        if close_actions:
+            win_trades = sum(1 for t in close_actions if t.get("pnl", 0) > 0)
+            result["stats"]["winning_trades"] = win_trades
+            result["stats"]["win_rate"] = round(win_trades / max(len(close_actions), 1) * 100, 1)
+            result["stats"]["total_trades"] = len(close_actions)
+        else:
+            # 还没有平仓记录 — 覆盖total_trades为开仓次数（不含挂单超时等）
+            open_count = len([t for t in trade_all if t["action"] in ("做多", "做空")])
+            result["stats"]["total_trades"] = open_count
+            result["stats"]["winning_trades"] = 0
+            result["stats"]["win_rate"] = 0.0
 
     return result
 
