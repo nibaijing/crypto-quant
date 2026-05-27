@@ -212,15 +212,16 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
                 notify_trade("LONG", close_price, f"开多仓 {executor._sim_leverage}x")
 
         elif signal == "SELL" and executor.position and executor.position.side == "long":
-            lev = executor.position.leverage
-            pnl_pct = (close_price - executor.position.entry_price) / executor.position.entry_price * 100 * lev
+            _entry = executor.position.entry_price
+            _lev = executor.position.leverage
+            pnl_pct = (close_price - _entry) / _entry * 100 * _lev
             result = executor.sell(symbol, price=close_price)
             if result:
                 # 记录平仓盈亏到策略(用于冷却+连续亏损保护)
-                raw_pnl = (close_price - executor.position.entry_price) / executor.position.entry_price
+                raw_pnl = (close_price - _entry) / _entry
                 if hasattr(strategy, 'record_trade_result'):
                     strategy.record_trade_result(raw_pnl)
-                notify_trade("SELL", close_price, f"平多仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
+                notify_trade("SELL", close_price, f"平多仓 | PnL={pnl_pct:+.2f}% ({_lev}x)")
                 if hasattr(strategy, 'last_exit_bar'):
                     strategy.last_exit_bar = latest_idx
 
@@ -234,41 +235,48 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
                 notify_trade("SHORT", close_price, f"开空仓 {executor._sim_leverage}x")
 
         elif signal == "COVER" and executor.position and executor.position.side == "short":
-            lev = executor.position.leverage
-            pnl_pct = (executor.position.entry_price - close_price) / executor.position.entry_price * 100 * lev
+            _entry = executor.position.entry_price
+            _lev = executor.position.leverage
+            pnl_pct = (_entry - close_price) / _entry * 100 * _lev
             result = executor.short_cover(symbol, price=close_price)
             if result:
                 # 记录平仓盈亏到策略(用于冷却+连续亏损保护)
-                raw_pnl = (executor.position.entry_price - close_price) / executor.position.entry_price
+                raw_pnl = (_entry - close_price) / _entry
                 if hasattr(strategy, 'record_trade_result'):
                     strategy.record_trade_result(raw_pnl)
-                notify_trade("COVER", close_price, f"平空仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
+                notify_trade("COVER", close_price, f"平空仓 | PnL={pnl_pct:+.2f}% ({_lev}x)")
                 if hasattr(strategy, 'last_exit_bar'):
                     strategy.last_exit_bar = latest_idx
 
         elif signal == "ADD_LONG" and executor.position and executor.position.side == "long":
             add_size = executor.position.size * 0.5  # 加仓50%
+            _entry_before = executor.position.entry_price
             result = executor.add_to_long(symbol, add_size, close_price)
             if result:
-                notify_trade("ADD_LONG", close_price, f"加多仓 +50% | 均价→{executor.position.entry_price:,.0f}")
+                _new_entry = executor.position.entry_price if executor.position else _entry_before
+                notify_trade("ADD_LONG", close_price, f"加多仓 +50% | 均价→{_new_entry:,.0f}")
 
         elif signal == "ADD_SHORT" and executor.position and executor.position.side == "short":
             add_size = executor.position.size * 0.5
+            _entry_before = executor.position.entry_price
             result = executor.add_to_short(symbol, add_size, close_price)
             if result:
-                notify_trade("ADD_SHORT", close_price, f"加空仓 +50% | 均价→{executor.position.entry_price:,.0f}")
+                _new_entry = executor.position.entry_price if executor.position else _entry_before
+                notify_trade("ADD_SHORT", close_price, f"加空仓 +50% | 均价→{_new_entry:,.0f}")
 
         elif signal == "REDUCE" and executor.position:
             reduce_size = executor.position.size * 0.5  # 减仓50%
+            _entry_before = executor.position.entry_price
             if executor.position.side == "long":
                 result = executor.sell(symbol, price=close_price, size=reduce_size)
                 if result:
-                    pnl = close_price - executor.position.entry_price
-                    notify_trade("REDUCE", close_price, f"减多仓 -50% | 均价→{executor.position.entry_price:,.0f}")
+                    _new_entry = executor.position.entry_price if executor.position else _entry_before
+                    notify_trade("REDUCE", close_price, f"减多仓 -50% | 均价→{_new_entry:,.0f}")
             else:
                 result = executor.short_cover(symbol, price=close_price, size=reduce_size)
                 if result:
-                    notify_trade("REDUCE", close_price, f"减空仓 -50% | 均价→{executor.position.entry_price:,.0f}")
+                    _new_entry = executor.position.entry_price if executor.position else _entry_before
+                    notify_trade("REDUCE", close_price, f"减空仓 -50% | 均价→{_new_entry:,.0f}")
 
     # === Kline(signal) 详情行 (供 Dashboard 解析) ===
     sig = report.raw_signal if report else "HOLD"
