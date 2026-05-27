@@ -519,13 +519,27 @@ def _parse_trades_from_log() -> list:
 
 
 def _dedup_trades(trades: list) -> list:
-    """去除完全相同的交易行（相同时间+动作+价格）。"""
-    seen = set()
+    """去除完全相同的交易行（按5秒窗口内同action+价格去重）。"""
+    seen = []
     result = []
     for t in trades:
-        key = (t.get("time", ""), t.get("action", ""), int(t.get("price", 0) * 100))
-        if key not in seen:
-            seen.add(key)
+        time_str = t.get("time", "")
+        action = t.get("action", "")
+        price_key = int(t.get("price", 0))
+        try:
+            # 解析秒数用于窗口判断
+            sec = int(time_str[-2:]) if len(time_str) >= 19 else 0
+            min_sec = int(time_str[14:16]) * 60 + sec  # 当日分钟*60+秒
+        except (ValueError, IndexError):
+            min_sec = 0
+        # 检查5秒窗口内是否有相同action+price
+        dup = False
+        for s_key, s_sec in seen:
+            if s_key == (action, price_key) and abs(min_sec - s_sec) <= 6:
+                dup = True
+                break
+        if not dup:
+            seen.append(((action, price_key), min_sec))
             result.append(t)
     return result
 

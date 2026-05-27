@@ -263,13 +263,21 @@ function render(d){
     const recent = trades.slice(-12).reverse();
     tp.innerHTML = recent.map(t=>{
       const isEntry = t.action==='做多'||t.action==='做空';
-      const pnl = t.pnl||0;
-      const pnlStr = t.pnl!==undefined?(pnl>0?'+'+pnl.toFixed(2):pnl.toFixed(2)):'--';
-      const pnlCls = pnl>0?'green':pnl<0?'red':'dim';
+      const pnlAmt = t.pnl || 0;
+      const pnlBp = t.pnl_bp;
+      let pnlStr = '';
+      if(pnlBp !== undefined){
+        pnlStr = (pnlBp>0?'+'+pnlBp:pnlBp)+'bp';
+      } else if(pnlAmt !== 0){
+        pnlStr = (pnlAmt>0?'+':'')+'$'+Math.abs(pnlAmt).toFixed(2);
+      } else {
+        pnlStr = '';
+      }
+      const pnlCls = pnlAmt>0?'green':pnlAmt<0?'red':'dim';
       return `<div class="trade-item">
         <span class="ta" style="color:${isEntry?'var(--green)':'var(--red)'}">${t.action}</span>
         <span class="tp">$${fmt(t.price)}</span>
-        <span class="${pnlCls}">${pnlStr}${t.pnl_bp!==undefined?t.pnl_bp+'bp':'$'}</span>
+        <span class="${pnlCls}" style="font-size:10px">${pnlStr}</span>
         <span class="tt">${(t.time||'').slice(11,19)}</span>
       </div>`;
     }).join('');
@@ -320,50 +328,86 @@ function renderOHLC(d){
   if(kh.length>=2){
     const valid = kh.filter(b=>b.low>0 && b.high>0);
     if(valid.length<2){container.innerHTML='<div class="empty">Waiting for price data...</div>';return;}
+
+    // 用最后30根K线
     const bars = valid.slice(-30);
-    const px = bars.map(b=>b.close);
-    const min = Math.min(...px), max = Math.max(...px), range = max-min||1;
+    const w = container.clientWidth||Math.min(container.parentElement.clientWidth||360, 500);
+    const h = 180;
+    const pad = {t:16,b:20,l:6,r:6};
+    const cw = w-pad.l-pad.r, ch = h-pad.t-pad.b;
 
-    // SVG sparkline
-    const w = container.clientWidth||360, h = 70;
-    const pad = {t:4,b:4,l:2,r:2};
-    const sw = w-pad.l-pad.r, sh = h-pad.t-pad.b;
-    const xStep = sw/(px.length-1||1);
-    const pts = px.map((p,i)=>`${pad.l+i*xStep},${pad.t+sh-(p-min)/range*sh}`);
-    const poly = pts.join(' ');
-    const lastPx = px[px.length-1], firstPx = px[0];
-    const rise = lastPx >= firstPx;
-    const lineColor = rise?'#7fd962':'#f26d78';
-    const fillColor = rise?'rgba(127,217,98,0.12)':'rgba(242,109,120,0.12)';
-    const fillPts = `${pad.l},${pad.t+sh} ${poly} ${pad.l+xStep*(px.length-1)},${pad.t+sh}`;
+    const allHigh = Math.max(...bars.map(b=>b.high));
+    const allLow = Math.min(...bars.map(b=>b.low));
+    const allRange = allHigh-allLow||1;
+    const step = cw / bars.length;
 
-    // Indicator bars
-    const indH = 24;
-    const volMax = Math.max(...bars.map(b=>b.high-b.low), 1);
-    const rsiVal = d.indicators?.rsi||0;
-    const adxVal = d.indicators?.adx||0;
-    const macdhVal = d.indicators?.macd_hist||0;
+    // 计算Y轴刻度
+    const ticks = 5;
+    const yTicks = [];
+    for(let i=0;i<=ticks;i++){
+      const val = allLow + (allRange*i/ticks);
+      yTicks.push({val, y: pad.t + ch - (val-allLow)/allRange*ch});
+    }
+
+    // 生成K线SVG
+    let lines = '';
+    bars.forEach((b,i)=>{
+      const x = pad.l + i*step + step*0.15;
+      const bw = step*0.55;
+      const ox = x + bw/2;
+      const o = pad.t + ch - (b.open-allLow)/allRange*ch;
+      const cl = pad.t + ch - (b.close-allLow)/allRange*ch;
+      const hh = pad.t + ch - (b.high-allLow)/allRange*ch;
+      const ll = pad.t + ch - (b.low-allLow)/allRange*ch;
+      const isUp = b.close >= b.open;
+      const col = isUp ? '#7fd962' : '#f26d78';
+      // 影线
+      lines += `<line x1="${ox}" y1="${hh}" x2="${ox}" y2="${ll}" stroke="${col}" stroke-width="1" stroke-opacity="0.6"/>`;
+      // 实体
+      const y0 = Math.min(o,cl), y1 = Math.abs(cl-o);
+      lines += `<rect x="${x}" y="${y0}" width="${bw}" height="${Math.max(y1,1)}" fill="${col}" fill-opacity="0.85" rx="0.5"/>`;
+      // 成交量（底部小条）
+      const vol = b.volume||0;
+      if(vol>0){
+        const vh = Math.min(vol*3, 14);
+        lines += `<rect x="${x}" y="${pad.t+ch+2}" width="${bw}" height="${vh}" fill="${col}" fill-opacity="0.15" rx="0.5"/>`;
+      }
+    });
+
+    // Y轴刻度
+    let yLabels = '';
+    yTicks.forEach(t=>{
+      yLabels += `<text x="${w-pad.r+2}" y="${t.y+3}" fill="#5c6773" font-size="9" text-anchor="start">${t.val.toFixed(0)}</text>`;
+      lines += `<line x1="${pad.l}" y1="${t.y}" x2="${w-pad.r}" y2="${t.y}" stroke="#1a2332" stroke-width="0.5" stroke-dasharray="2,3"/>`;
+    });
+
+    // X轴标签（每5根）
+    let xLabels = '';
+    bars.forEach((b,i)=>{
+      if(i%5===0||i===bars.length-1){
+        const x = pad.l + i*step + step/2;
+        xLabels += `<text x="${x}" y="${pad.t+ch+16}" fill="#5c6773" font-size="8" text-anchor="middle">${(b.time||'').slice(11,16)||'--'}</text>`;
+      }
+    });
+
+    const lastBar = bars[bars.length-1];
+    const pctChg = ((lastBar.close-bars[0].open)/bars[0].open*100);
 
     container.innerHTML = `
       <div style="display:flex;flex-direction:column;gap:2px">
-        <svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block">
-          <polygon points="${fillPts}" fill="${fillColor}"/>
-          <polyline points="${poly}" fill="none" stroke="${lineColor}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <div style="display:flex;gap:10px;font-size:10px;padding:2px 0;flex-wrap:wrap">
+          <span>O <b>$${fmt(lastBar.open)}</b></span>
+          <span>H <b style="color:var(--green)">$${fmt(lastBar.high)}</b></span>
+          <span>L <b style="color:var(--red)">$${fmt(lastBar.low)}</b></span>
+          <span>C <b class="${lastBar.close>=lastBar.open?'green':'red'}">$${fmt(lastBar.close)}</b></span>
+          <span class="dim">${bars.length} bars</span>
+          <span class="${pctChg>=0?'green':'red'}">${pctChg>=0?'+':''}${pctChg.toFixed(2)}%</span>
+        </div>
+        <svg width="${w}" height="${h+20}" viewBox="0 0 ${w} ${h+20}" style="display:block;background:var(--bg);border-radius:4px">
+          ${lines}
+          ${yLabels}
+          ${xLabels}
         </svg>
-        <div style="display:flex;gap:8px;font-size:10px;flex-wrap:wrap;align-items:center;padding:2px 0">
-          <span>↕ <b>$${fmt(min)}–$${fmt(max)}</b></span>
-          <span>${rise?'📈':'📉'} <b class="${rise?'green':'red'}">${((lastPx-firstPx)/firstPx*100).toFixed(2)}%</b></span>
-          <span style="color:var(--text-dim)">${bars.length} bars</span>
-        </div>
-        <div style="display:flex;gap:10px;font-size:10px;padding:4px 6px;background:var(--bg);border-radius:4px;flex-wrap:wrap">
-          <span>RSI <b class="${rsiVal>60?'green':rsiVal<35?'red':'dim'}">${rsiVal.toFixed(1)}</b>
-            <span style="font-size:8px;color:var(--text-dim)">${rsiVal>60?'overbought':rsiVal<35?'oversold':'neutral'}</span></span>
-          <span>ADX <b class="${adxVal>40?'yellow':adxVal>25?'blue':'dim'}">${adxVal.toFixed(1)}</b>
-            <span style="font-size:8px;color:var(--text-dim)">${adxVal>40?'strong':adxVal>25?'trending':'weak'}</span></span>
-          <span>MACDh <b class="${macdhVal>=0?'green':'red'}">${macdhVal.toFixed(1)}</b>
-            <span style="font-size:8px;color:var(--text-dim)">${macdhVal>=0?'↗':'↘'}</span></span>
-          <span>A/D <b class="${rise?'green':'red'}">${rise?'Bullish':'Bearish'}</b></span>
-        </div>
       </div>`;
   } else if(d.kline && d.kline.open > 0){
     const k = d.kline;
