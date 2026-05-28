@@ -153,6 +153,7 @@ tr:hover td{background:rgba(89,194,255,0.03)}
 <script>
 const API = '/api/data';
 let lastData = null;
+let lastPosition = null;
 
 async function fetchData(){
   const t = Date.now();
@@ -188,14 +189,16 @@ function render(d){
 
   // Position badge
   const pb = document.getElementById('posBadge');
-  if(d.position){
-    const side = d.position.side;
+  const position = d.position || lastPosition;
+  if(position && position.side){
+    const side = position.side;
     pb.textContent = side==='long'?'📈 LONG':'📉 SHORT';
     pb.style.color = side==='long'?'var(--green)':'var(--red)';
   }else if(d.active_limit){
     pb.textContent = '⏳ '+d.active_limit.side.toUpperCase()+' PENDING';
     pb.style.color = 'var(--yellow)';
   }else{pb.textContent='🏖️ FLAT';pb.style.color='var(--text-dim)';}
+  if(d.position) lastPosition = d.position;
 
   // Metrics
   const eq = d.equity||0;
@@ -210,10 +213,10 @@ function render(d){
 
   document.getElementById('cashVal').textContent = '$'+(d.cash||0).toFixed(2);
 
-  const uPnl = d.position?.pnl||0;
+  const uPnl = (position?.pnl)||0;
   const pnlEl = document.getElementById('pnlVal');
   let pnlStr = (uPnl>=0?'+':'')+'$'+uPnl.toFixed(2);
-  if(d.position) pnlStr += ' ('+(d.position.pnl_pct>=0?'+':'')+d.position.pnl_pct.toFixed(1)+'%)';
+  if(position) pnlStr += ' ('+(position.pnl_pct>=0?'+':'')+position.pnl_pct.toFixed(1)+'%)';
   pnlEl.textContent = pnlStr;
   pnlEl.style.color = uPnl>=0?'var(--green)':'var(--red)';
 
@@ -221,10 +224,10 @@ function render(d){
   document.getElementById('winrateVal').textContent = 'WR '+(d.stats?.win_rate||0)+'%';
 
   // Position table
-  document.getElementById('posCount').textContent = d.position?'1':(d.active_limit?'Pending':'0');
+  document.getElementById('posCount').textContent = position?'1':(d.active_limit?'Pending':'0');
   const pp = document.getElementById('positionPanel');
-  if(d.position){
-    const pos = d.position;
+  if(position && position.side){
+    const pos = position;
     const val = pos.size * pos.current_price;
     const marginVal = pos.margin || (pos.size * pos.entry_price / pos.leverage);
     pp.innerHTML = `<table><tr><th>Side</th><th>Size</th><th>Val</th><th>Entry</th><th>Px</th><th>Lev</th></tr><tr>
@@ -257,10 +260,11 @@ function render(d){
     const recent = trades.slice(-12).reverse();
     tp.innerHTML = recent.map(t=>{
       const isEntry = t.action==='做多'||t.action==='做空';
+      const sizeStr = t.size ? t.size.toFixed(4) : '';
       const pnlAmt = t.pnl || 0;
       const pnlBp = t.pnl_bp;
       let pnlStr = '';
-      if(pnlBp !== undefined){
+      if(pnlBp !== undefined && !isEntry){
         pnlStr = (pnlBp>0?'+'+pnlBp:pnlBp)+'bp';
       } else if(pnlAmt !== 0){
         pnlStr = (pnlAmt>0?'+':'')+'$'+Math.abs(pnlAmt).toFixed(2);
@@ -271,6 +275,10 @@ function render(d){
       return `<div class="trade-item">
         <span class="ta" style="color:${isEntry?'var(--green)':'var(--red)'}">${t.action}</span>
         <span class="tp">$${fmt(t.price)}</span>
+        <span style="font-size:10px;color:var(--text-dim)">${sizeStr}</span>
+        <span style="font-size:10px;color:${isEntry?'var(--yellow)':'var(--text-bright)'}">
+          ${isEntry ? `$${fmt(t.amount)}` : ''}
+        </span>
         <span class="${pnlCls}" style="font-size:10px">${pnlStr}</span>
         <span class="tt">${(t.time||'').slice(11,19)}</span>
       </div>`;

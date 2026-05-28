@@ -128,14 +128,14 @@ def run_backtest_with_params(params, label="backtest"):
 
         symbol = "BTC-USDT"
 
-            if signal and signal != "HOLD":
-                signal_log.append({
-                    "time": row["datetime"],
-                    "signal": signal,
-                    "price": close_price,
-                    "rsi": float(row.get("rsi", 50)) if pd.notna(row.get("rsi")) else 50,
-                    "adx": float(row.get("adx", 20)) if pd.notna(row.get("adx")) else 20,
-                })
+        if signal and signal != "HOLD":
+            signal_log.append({
+                "time": row["datetime"],
+                "signal": signal,
+                "price": close_price,
+                "rsi": float(row.get("rsi", 50)) if pd.notna(row.get("rsi")) else 50,
+                "adx": float(row.get("adx", 20)) if pd.notna(row.get("adx")) else 20,
+            })
 
             if signal == "LONG" and (not executor.position or executor.position.size == 0):
                 bars_since_exit = i - strat.last_exit_bar if strat.last_exit_bar >= 0 else COOLDOWN + 1

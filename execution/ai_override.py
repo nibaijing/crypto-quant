@@ -46,11 +46,11 @@ COOLDOWN_SECONDS = 900            # 同一决策类型15分钟冷却
 DRY_RUN = os.getenv("AI_OVERRIDE_DRY_RUN", "").lower() in ("1", "true", "yes")
 
 # 自动放行阈值 — 策略信号满足度达到此值, 不调 LLM
-AUTO_CLEAR_LONG_THRESHOLD = 0.75   # 4.5/6 (从0.83/5/6下调, 配合策略信号阈值)
-AUTO_CLEAR_SHORT_THRESHOLD = 0.75
+AUTO_CLEAR_LONG_THRESHOLD = 0.60   # 3.6/6 (从0.75/4.5/6下调, 配合策略6/10评分)
+AUTO_CLEAR_SHORT_THRESHOLD = 0.60
 
 # AI 主动介入阈值 — HOLD 时某方向达到此值, 调 LLM
-AI_INTERVENE_THRESHOLD = 0.60     # 与策略 SIGNAL_THRESHOLD 对齐 (从0.67下调)
+AI_INTERVENE_THRESHOLD = 0.50     # 3/6 (从0.60/3.6/6下调)
 
 # LLM API
 LLM_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
@@ -129,7 +129,16 @@ class DecisionEngine:
     # ── 主入口 ────────────────────────────────────────────────────────────
 
     def decide(self, report: SignalReport) -> FinalDecision:
-        """主决策入口 — if/else chain 代替 switch (Python 3.10- 兼容)。"""
+        """主决策入口 — 完整决策流水线。
+
+        流程:
+          0. 风控平仓 → 直通
+          1. 冷却期 → HOLD
+          2. 自动放行(极强信号) → 跳过LLM
+          3. LLM介入(模糊信号) → AI决策
+          4. 规则回退 → 加权评分决定
+          5. 默认HOLD
+        """
 
         # 0. 风控平仓直接放行 (EXIT_ATR / EXIT_TIME)
         if report.exit_signal in ("EXIT_ATR", "EXIT_TIME"):
@@ -153,26 +162,28 @@ class DecisionEngine:
                 reasoning="Cooldown period active", confidence=1.0,
             )
 
-        # 2. 开仓信号直通策略层
-        if report.raw_signal == "LONG":
-            _log("info", f"⚡ 策略开多(直通): score={report.long_score:.0%} | ${report.price:,.0f}")
-            return FinalDecision(
-                action="LONG", source="auto_clear",
-                reasoning=f"Strategy LONG signal (AI disabled, {report.long_score:.0%}/{report.short_score:.0%})",
-                confidence=report.long_score,
-            )
-        if report.raw_signal == "SHORT":
-            _log("info", f"⚡ 策略开空(直通): score={report.short_score:.0%} | ${report.price:,.0f}")
-            return FinalDecision(
-                action="SHORT", source="auto_clear",
-                reasoning=f"Strategy SHORT signal (AI disabled, {report.short_score:.0%}/{report.long_score:.0%})",
-                confidence=report.short_score,
-            )
+        # 2. 自动放行 (极强信号, 跳过LLM)
+        auto = self._auto_clear(report)
+        if auto:
+            return auto
 
-        # 3. HOLD → HOLD
+        # 3. LLM 介入 (模糊信号或HOLD+高分)
+        if self._should_call_llm(report):
+            llm_result = self._call_llm_decide(report)
+            if llm_result.action != "HOLD":
+                return llm_result
+
+        # 4. 规则回退 (LLM不可用或驳回时)
+        fallback = self._rule_based_decide(report)
+        if fallback:
+            return fallback
+
+        # 5. 默认HOLD
+        score_str = f"{report.long_score:.0%}/{report.short_score:.0%}"
+        _log("debug", f"⏸️ 无明确决策, 默认HOLD | score={score_str} | ${report.price:,.0f}")
         return FinalDecision(
             action="HOLD", source="auto_clear",
-            reasoning=f"Strategy HOLD (AI disabled, {report.long_score:.0%}/{report.short_score:.0%})",
+            reasoning=f"Strategy HOLD (scores {score_str})",
             confidence=0.9,
         )
 
@@ -241,21 +252,21 @@ class DecisionEngine:
 
         # HOLD 但 long_score 高分 → 开多
         if report.raw_signal == "HOLD":
-            if report.long_score_w >= 0.50 and report.long_score_w > report.short_score_w:
+            if report.long_score_w >= 0.40 and report.long_score_w > report.short_score_w:
                 reason = f"Rule-based: HOLD but LONG weighted {report.long_score_w:.2f} > SHORT, score OK"
                 _log("info", f"📐 {reason}")
                 return FinalDecision(action="LONG", source="auto_clear", reasoning=reason, confidence=report.long_score_w)
-            if report.short_score_w >= 0.50 and report.short_score_w > report.long_score_w:
+            if report.short_score_w >= 0.40 and report.short_score_w > report.long_score_w:
                 reason = f"Rule-based: HOLD but SHORT weighted {report.short_score_w:.2f} > LONG, score OK"
                 _log("info", f"📐 {reason}")
                 return FinalDecision(action="SHORT", source="auto_clear", reasoning=reason, confidence=report.short_score_w)
 
         # 非 HOLD 信号但不够 auto_clear → 按加权分决策
-        if report.long_score_w >= 0.45 and report.long_score_w > report.short_score_w:
+        if report.long_score_w >= 0.35 and report.long_score_w > report.short_score_w:
             reason = f"Rule-based: LONG weighted {report.long_score_w:.2f} > {report.short_score_w:.2f}"
             _log("info", f"📐 {reason}")
             return FinalDecision(action="LONG", source="auto_clear", reasoning=reason, confidence=report.long_score_w)
-        if report.short_score_w >= 0.45 and report.short_score_w > report.long_score_w:
+        if report.short_score_w >= 0.35 and report.short_score_w > report.long_score_w:
             reason = f"Rule-based: SHORT weighted {report.short_score_w:.2f} > {report.long_score_w:.2f}"
             _log("info", f"📐 {reason}")
             return FinalDecision(action="SHORT", source="auto_clear", reasoning=reason, confidence=report.short_score_w)
@@ -374,7 +385,7 @@ class DecisionEngine:
         if report.short_score >= AI_INTERVENE_THRESHOLD:
             reasons.append(f"hold_but_short_viable({report.short_score:.0%})")
         # LGB
-        if report.lgb_opinion and report.lgb_opinion.get("score", 0) > 0.5:
+        if isinstance(report.lgb_opinion, dict) and report.lgb_opinion.get("score", 0) > 0.5:
             reasons.append(f"lgb_{report.lgb_opinion.get('action', 'uncertain')}")
         return reasons if reasons else ["borderline_signal"]
 

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 import requests
 
 from core.config import get_config
+from execution.base_executor import BaseExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +72,9 @@ class LiveAccount:
     recent_trades: List[LiveOrder] = field(default_factory=list)
 
 
-class FuturesExecutor:
+class FuturesExecutor(BaseExecutor):
     """合约执行器 — 本地模拟
-    
+
     核心属性:
         cash: 可用现金 (不含保证金)
         equity: 总权益 = cash + margin + unrealized_pnl
@@ -118,6 +119,11 @@ class FuturesExecutor:
         if self._sim_position and self._sim_position.size > 0:
             return self._sim_cash + self._sim_position.margin + self._sim_position.unrealized_pnl
         return self._sim_cash
+
+    @property
+    def leverage(self) -> int:
+        """当前杠杆倍数"""
+        return self._sim_leverage
 
     @property
     def used_margin(self) -> float:
@@ -185,8 +191,14 @@ class FuturesExecutor:
                 "margin": self._sim_position.margin,
             }
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.state_file, "w") as f:
+        tmp = self.state_file.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
+        tmp.replace(self.state_file)
+
+    def save_state(self):
+        """公开持久化接口"""
+        self._save_state()
 
     # ==================== 杠杆 ====================
 

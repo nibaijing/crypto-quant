@@ -29,8 +29,10 @@ import pandas as pd
 import numpy as np
 
 from core.config import init_config
-from execution.executor_v2 import FuturesExecutor, LiveAccount, LivePosition, LiveOrder
+from execution.executor_v2 import FuturesExecutor, LivePosition
 from execution.signals import SignalReport
+from execution.ai_override import DecisionEngine
+from learning.self_learning_system import SelfLearningSystem
 from strategies.spot.optimized_v6 import OptimizedV6 as OptimizedStrategy
 import strategies.spot.optimized_v6 as strat_mod
 from data.ws_price_stream import SharedMarketState, BinanceWebSocket, create_price_stream
@@ -58,6 +60,8 @@ ws_client: BinanceWebSocket = None
 executor: FuturesExecutor = None
 strategy: OptimizedStrategy = None
 alpha_factors: AlphaFactors = None
+decision_engine: DecisionEngine = None
+self_learning: SelfLearningSystem = None
 running = True
 start_time: datetime = None
 kline_count = 0
@@ -66,6 +70,7 @@ _last_kline_key = None  # K线去重
 last_hist_retry = 0  # 历史K线重试计时器
 PRICE_SNAPSHOT = Path(__file__).parent / "data" / "ws_price_snapshot.json"
 TICK_HISTORY = Path(__file__).parent / "data" / "tick_history.jsonl"  # 每5秒追加tick行
+tick_write_count = 0  # tick历史写入计数器, 每500次清理一次
 
 
 def signal_handler(sig, frame):
@@ -181,20 +186,60 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
         strategy.peak_equity = 0
         return
 
-    # === 决策: 限价单模式 — K线闭合只更新指标, 入场由on_tick挂限价单 ===
+    # === K线指标 (用于AI决策 + 日志) ===
+    rsi_v = float(row.get("rsi", 50))
+    adx_v = float(row.get("adx", 20))
+    macdh = float(row.get("macd_hist", 0))
+    regime = strategy._regime if hasattr(strategy, '_regime') else "neutral"
+
+    # === 决策: AI决策引擎 (入场由on_tick挂限价单, 风控平仓直通) ===
     signal = "HOLD"
+    ai_source = "direct"
     if report is not None:
         raw = report.raw_signal or "HOLD"
-        if raw in ("LONG", "SHORT"):
-            # 开仓信号: 记录但不直接交易, 由on_tick挂限价单
-            logger.info(f"📡 信号: {raw} (限价单模式 — 由on_tick挂单)")
-        elif raw in ("SELL", "COVER"):
-            # 平仓信号: K线闭合时直接市价平仓(风控保护)
+        if raw in ("SELL", "COVER", "ADD_LONG", "ADD_SHORT", "REDUCE"):
+            # 风控平仓/加减仓: 不经过AI决策, 直接执行
             signal = raw
-        elif raw in ("ADD_LONG", "ADD_SHORT", "REDUCE"):
-            signal = raw
+        else:
+            # 开仓/HOLD: 经过AI决策引擎
+            try:
+                ls = float(strategy._signal_ctx.get("long_score", 0))
+                ss = float(strategy._signal_ctx.get("short_score", 0))
+                current_pos = {
+                    "side": executor.position.side,
+                    "entry_price": executor.position.entry_price,
+                    "size": executor.position.size,
+                    "leverage": executor.position.leverage,
+                    "unrealized_pnl": getattr(executor.position, 'unrealized_pnl_pct', 0),
+                } if executor.position else None
+                sig_report = SignalReport(
+                    timestamp=int(time.time() * 1000),
+                    price=close_price,
+                    raw_signal=raw,
+                    long_score=ls / 10.0,
+                    short_score=ss / 10.0,
+                    long_score_w=ls / 10.0,
+                    short_score_w=ss / 10.0,
+                    rsi=rsi_v,
+                    adx=adx_v,
+                    macd_hist=macdh,
+                    regime=regime,
+                    current_position=current_pos,
+                    position_pnl_pct=executor.position.unrealized_pnl_pct if executor.position else None,
+                    is_cooldown=(strategy._consecutive_losses >= 3) if hasattr(strategy, '_consecutive_losses') else False,
+                )
+                decision = decision_engine.decide(sig_report)
+                signal = decision.action
+                ai_source = decision.source
+                if raw == "HOLD" and signal in ("LONG", "SHORT"):
+                    logger.info(f"🤖 AI主动开仓: {signal} | {decision.reasoning[:80]}")
+            except Exception as e:
+                logger.warning(f"AI引擎异常, 使用原始信号: {e}")
+                signal = raw if raw in ("LONG", "SHORT") else "HOLD"
+
     if signal and signal != "HOLD":
-        logger.info(f"📡 信号: {signal} | close=${close_price:,.0f}")
+        source_tag = "AI" if ai_source in ("ai_decision",) else "rule" if ai_source in ("auto_clear", "rule_based", "risk_management") else "strategy"
+        logger.info(f"📡 信号: {signal} ({source_tag}) | close=${close_price:,.0f}")
 
         pos_side = executor.position.side if executor.position else None
         pos_size = executor.position.size if executor.position else 0
@@ -205,11 +250,11 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
         if signal == "LONG" and (not executor.position or executor.position.size == 0):
             gated_size = strategy.get_position_size(
                 cash=executor.cash, price=close_price,
-                leverage=executor._sim_leverage, atr=atr_val, side='long'
+                leverage=executor.leverage, atr=atr_val, side='long'
             )
             result = executor.buy(symbol, size=gated_size, price=close_price)
             if result:
-                notify_trade("LONG", close_price, f"开多仓 {executor._sim_leverage}x")
+                notify_trade("LONG", close_price, f"开多仓 {executor.leverage}x")
 
         elif signal == "SELL" and executor.position and executor.position.side == "long":
             _entry = executor.position.entry_price
@@ -217,10 +262,24 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
             pnl_pct = (close_price - _entry) / _entry * 100 * _lev
             result = executor.sell(symbol, price=close_price)
             if result:
-                # 记录平仓盈亏到策略(用于冷却+连续亏损保护)
                 raw_pnl = (close_price - _entry) / _entry
                 if hasattr(strategy, 'record_trade_result'):
                     strategy.record_trade_result(raw_pnl)
+                if hasattr(strategy, '_reset_trade_state'):
+                    strategy._reset_trade_state()
+                # 记录到自学习系统
+                if self_learning:
+                    try:
+                        _ls = float(strategy._signal_ctx.get("long_score", 0)) if hasattr(strategy, '_signal_ctx') else 0
+                        self_learning.record_decision(
+                            symbol=symbol, decision="SELL",
+                            conviction=_ls / 10.0,
+                            market_data={"rsi": rsi_v, "adx": adx_v, "macd": macdh, "market_sentiment": "NEUTRAL"},
+                            reasoning=f"K线平多 PnL={raw_pnl*100:+.2f}%",
+                            target_price=0, stop_loss=0,
+                        )
+                    except Exception:
+                        pass
                 notify_trade("SELL", close_price, f"平多仓 | PnL={pnl_pct:+.2f}% ({_lev}x)")
                 if hasattr(strategy, 'last_exit_bar'):
                     strategy.last_exit_bar = latest_idx
@@ -228,11 +287,11 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
         elif signal == "SHORT" and (not executor.position or executor.position.size == 0):
             gated_size = strategy.get_position_size(
                 cash=executor.cash, price=close_price,
-                leverage=executor._sim_leverage, atr=atr_val, side='short'
+                leverage=executor.leverage, atr=atr_val, side='short'
             )
             result = executor.short_sell(symbol, size=gated_size, price=close_price)
             if result:
-                notify_trade("SHORT", close_price, f"开空仓 {executor._sim_leverage}x")
+                notify_trade("SHORT", close_price, f"开空仓 {executor.leverage}x")
 
         elif signal == "COVER" and executor.position and executor.position.side == "short":
             _entry = executor.position.entry_price
@@ -240,10 +299,24 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
             pnl_pct = (_entry - close_price) / _entry * 100 * _lev
             result = executor.short_cover(symbol, price=close_price)
             if result:
-                # 记录平仓盈亏到策略(用于冷却+连续亏损保护)
                 raw_pnl = (_entry - close_price) / _entry
                 if hasattr(strategy, 'record_trade_result'):
                     strategy.record_trade_result(raw_pnl)
+                if hasattr(strategy, '_reset_trade_state'):
+                    strategy._reset_trade_state()
+                # 记录到自学习系统
+                if self_learning:
+                    try:
+                        _ss = float(strategy._signal_ctx.get("short_score", 0)) if hasattr(strategy, '_signal_ctx') else 0
+                        self_learning.record_decision(
+                            symbol=symbol, decision="COVER",
+                            conviction=_ss / 10.0,
+                            market_data={"rsi": rsi_v, "adx": adx_v, "macd": macdh, "market_sentiment": "NEUTRAL"},
+                            reasoning=f"K线平空 PnL={raw_pnl*100:+.2f}%",
+                            target_price=0, stop_loss=0,
+                        )
+                    except Exception:
+                        pass
                 notify_trade("COVER", close_price, f"平空仓 | PnL={pnl_pct:+.2f}% ({_lev}x)")
                 if hasattr(strategy, 'last_exit_bar'):
                     strategy.last_exit_bar = latest_idx
@@ -280,10 +353,6 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
 
     # === Kline(signal) 详情行 (供 Dashboard 解析) ===
     sig = report.raw_signal if report else "HOLD"
-    rsi_v = float(row.get("rsi", 50))
-    adx_v = float(row.get("adx", 20))
-    macdh = float(row.get("macd_hist", 0))
-    regime = strategy._regime if hasattr(strategy, '_regime') else "neutral"
     # 评分
     long_score = int(strategy._signal_ctx.get("long_score", 0)) if hasattr(strategy, '_signal_ctx') else 0
     short_score = int(strategy._signal_ctx.get("short_score", 0)) if hasattr(strategy, '_signal_ctx') else 0
@@ -321,7 +390,7 @@ def run_strategy_on_closed_bar(df: pd.DataFrame):
 
 
 def main():
-    global market_state, ws_client, executor, strategy, alpha_factors, start_time, kline_count, last_hist_retry, _last_kline_key
+    global market_state, ws_client, executor, strategy, alpha_factors, decision_engine, self_learning, start_time, kline_count, last_hist_retry, _last_kline_key, tick_write_count
 
     init_config()
     start_time = datetime.now()
@@ -346,6 +415,10 @@ def main():
     strategy.peak_equity = max(executor.equity, 500)
     logger.info(f"📊 初始权益: ${executor.equity:.0f} | peak_equity={strategy.peak_equity:.0f}")
     alpha_factors = AlphaFactors()
+    decision_engine = DecisionEngine()
+    logger.info(f"🧠 AI决策引擎: {'已启用' if decision_engine.llm_available else '仅规则模式(无API Key)'}")
+    self_learning = SelfLearningSystem()
+    logger.info("📚 自学习系统已初始化")
 
     # 加载 LightGBM 模型 (可选, 如果不存在则降级为纯信号驱动)
     lgb_adapter = LGBAdapter(horizon=24)
@@ -440,34 +513,37 @@ def main():
                 action = tick_decision.get("action", "HOLD")
 
                 if action in ("PLACE_LIMIT",):
-                    # 策略要求挂限价单 — 通过 executor 现有方法以指定价成交
+                    # 策略要求挂限价单 — 用当前市价成交(不等待)，
+                    # 但以当前市价(live_price)而非限价(lp)记录entry_price
                     side = tick_decision["side"]
-                    lp = tick_decision["limit_price"]
                     sz = tick_decision["size"]
                     if side == "short_sell":
-                        executor.short_sell("BTC-USDT", size=sz, price=lp)
+                        executor.short_sell("BTC-USDT", size=sz, price=live_price)
                         tick_count += 1
-                        logger.info(f"🔖 LIMIT SHORT {sz:.6f} @ ${lp:.0f}")
+                        logger.info(f"🔖 LIMIT SHORT {sz:.6f} @ ${live_price:.0f} (limit was ${tick_decision.get('limit_price',0):.0f})")
                     elif side == "buy":
-                        executor.buy("BTC-USDT", size=sz, price=lp)
+                        executor.buy("BTC-USDT", size=sz, price=live_price)
                         tick_count += 1
-                        logger.info(f"🔖 LIMIT LONG {sz:.6f} @ ${lp:.0f}")
+                        logger.info(f"🔖 LIMIT LONG {sz:.6f} @ ${live_price:.0f} (limit was ${tick_decision.get('limit_price',0):.0f})")
 
                 elif action in ("EXECUTE",):
                     # 策略要求直接平仓 (限价单成交 or 止损)
                     side = tick_decision["side"]
                     if side == "sell":
                         if executor.position and executor.position.side == "long":
+                            # 保存entry_price后再平仓 (平仓后executor.position=None)
+                            _entry = executor.position.entry_price
                             executor.sell("BTC-USDT", price=live_price)
                             tick_count += 1
-                            pnl_raw = (live_price - executor.position.entry_price) / executor.position.entry_price if executor.position else 0
+                            pnl_raw = (live_price - _entry) / _entry if _entry > 0 else 0
                             if hasattr(strategy, 'record_trade_result'):
                                 strategy.record_trade_result(pnl_raw)
                     elif side == "short_cover":
                         if executor.position and executor.position.side == "short":
+                            _entry = executor.position.entry_price
                             executor.short_cover("BTC-USDT", price=live_price)
                             tick_count += 1
-                            pnl_raw = (executor.position.entry_price - live_price) / executor.position.entry_price if executor.position else 0
+                            pnl_raw = (_entry - live_price) / _entry if _entry > 0 else 0
                             if hasattr(strategy, 'record_trade_result'):
                                 strategy.record_trade_result(pnl_raw)
 
@@ -494,8 +570,8 @@ def main():
             except:
                 pass
             # 同时更新 executor state（即使无持仓，保证 Dashboard 读到最新权益）
-            if hasattr(executor, '_save_state'):
-                executor._save_state()
+            if hasattr(executor, 'save_state'):
+                executor.save_state()
             # 追加tick历史行 (供 Dashboard 聚合OHLC K线)
             try:
                 k = market_state.get_kline() if hasattr(market_state, 'get_kline') else None
@@ -511,9 +587,20 @@ def main():
                     }) + "\n")
             except Exception:
                 pass
+            tick_write_count += 1
             last_snapshot = now
 
-        # 清理过旧tick历史 (>5000行)
+        # 清理过旧tick历史 (>10000行时截断至5000行, 每500次写入检查一次)
+        if TICK_HISTORY.exists() and tick_write_count > 0 and tick_write_count % 500 == 0:
+            try:
+                with open(TICK_HISTORY, 'r') as tf:
+                    lines = tf.readlines()
+                if len(lines) > 10000:
+                    with open(TICK_HISTORY, 'w') as tf:
+                        tf.writelines(lines[-5000:])
+                    logger.info(f"🧹 清理tick历史: {len(lines)}→5000行")
+            except Exception:
+                pass
 
         # 每5分钟心跳 (证明进程存活)
         if now - last_minute_log > 300:

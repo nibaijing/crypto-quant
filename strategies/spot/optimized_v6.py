@@ -30,6 +30,7 @@ BTC-USDT 限价单实时交易 | 高频信号评估
 """
 
 import logging
+import time
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
@@ -39,17 +40,17 @@ logger = logging.getLogger(__name__)
 
 # === 信号阈值（v7.7 — 高频盈利优化 + 盘整交易）===
 # 做空
-RSI_SHORT_ENTRY = 58       # RSI≥58超买区做空(原60)
-RSI_SHORT_MIN = 45         # RSI必须>45 (原50)
-RSI_SHORT_EXIT = 25        # RSI跌到25以下平空(原28)
-ADX_SHORT_MIN = 22         # ADX≥22即有趋势做空(原30，放宽)
-ADX_SHORT_STRONG = 38      # 强趋势确认(原45)
+RSI_SHORT_ENTRY = 56       # RSI≥56超买区做空(原58)
+RSI_SHORT_MIN = 42         # RSI必须>42 (原45)
+RSI_SHORT_EXIT = 28        # RSI跌到28以下平空(原25)
+ADX_SHORT_MIN = 18         # ADX≥18即有趋势做空(原22，继续放宽)
+ADX_SHORT_STRONG = 35      # 强趋势确认(原38)
 STOP_LOSS_SHORT_BP = 150   # 做空止损150bp
 
 # 做多
-RSI_LONG_ENTRY = 42        # RSI低于42可做回踩多/超卖反弹(原40)
-RSI_LONG_MAX_ENTRY = 52    # RSI不能>52还做多(原50)
-RSI_LONG_EXIT = 62         # RSI回到62以上才平多
+RSI_LONG_ENTRY = 45        # RSI低于45可做回踩多/超卖反弹(原42)
+RSI_LONG_MAX_ENTRY = 60    # RSI<60都可考虑做多(原52 — 关键是放开55-60区间)
+RSI_LONG_EXIT = 65         # RSI回到65以上才平多(原62)
 RSI_LONG_EXIT_MIN_PROFIT_BP = 12  # RSI平仓需要至少12bp利润(原15)
 MIN_HOLD_TICK_SEC = 20     # 持仓最少持20秒(原30)
 STOP_LOSS_LONG_BP = 150    # 做多止损150bp
@@ -65,6 +66,7 @@ MIN_HOLD_BARS = 1          # 最少持仓1根K线(15分钟)
 MAX_HOLD_BARS = 24         # 最长持仓24根K线(6小时)
 COOLDOWN_BARS = 4          # 亏损后冷却4根K线(原6)
 COOLDOWN_TICK_SEC = 180    # 亏损后tick级冷却3分钟(原300)
+COOLDOWN_EXIT_TICK_SEC = 60  # 任何平仓后至少60秒内禁止反手开仓(防同秒/同bar反手)
 
 # 仓位管理
 MAX_POSITION_PCT = 0.12    # 单笔12%权益作保证金(原15%，更保守)
@@ -109,7 +111,7 @@ class LimitOrder:
         self.price = price        # 限价
         self.size = size          # 数量
         self.order_type = order_type  # entry/take_profit/stop_loss
-        self.placed_at = 0
+        self.placed_at = time.time()
         self._filled = False
 
     @property
@@ -175,8 +177,6 @@ class OptimizedV6:
         # 限价单状态
         self._last_entry_price = 0  # 上次尝试入场价格
         self._last_entry_try = 0    # 上次尝试入场时间
-        self._entry_price = 0
-        self._position_side = None
 
         # V7.2 盈利优化: 追踪止盈 & 价格过滤
         self._trailing_stop_price = 0  # 当前追踪止损价
@@ -315,7 +315,6 @@ class OptimizedV6:
         lo = self.active_limit_order
 
         # 检查超时
-        import time
         if time.time() - lo.placed_at > LIMIT_ORDER_TIMEOUT and not lo.filled:
             logger.info(f"⏰ 限价单超时 {LIMIT_ORDER_TIMEOUT}s, 撤单: {lo.side} @ ${lo.price:.0f} (当前${current_price:.0f})")
             self.active_limit_order = None
@@ -359,16 +358,22 @@ class OptimizedV6:
                 result = executor.sell("BTC-USDT", price=current_price)
                 if result:
                     self.active_limit_order = None
-                    self._entry_price = 0
-                    self._position_side = None
+                    # 记录PnL后重置状态
+                    if self._entry_price > 0:
+                        pnl_raw = (current_price - self._entry_price) / self._entry_price
+                        self.record_trade_result(pnl_raw)
+                    self._reset_trade_state()
                     return "SELL_FILLED"
 
             elif lo.side == "short_cover":
                 result = executor.short_cover("BTC-USDT", price=current_price)
                 if result:
                     self.active_limit_order = None
-                    self._entry_price = 0
-                    self._position_side = None
+                    # 记录PnL后重置状态
+                    if self._entry_price > 0:
+                        pnl_raw = (self._entry_price - current_price) / self._entry_price
+                        self.record_trade_result(pnl_raw)
+                    self._reset_trade_state()
                     return "COVER_FILLED"
 
             self.active_limit_order = None
@@ -381,6 +386,56 @@ class OptimizedV6:
             return True
         delta_bp = abs(current_price - self._last_entry_price) / self._last_entry_price * 10000
         return delta_bp >= PRICE_REENTER_DELTA_BP
+
+    def _compute_scores(self, rsi: float, adx: float, macdh: float,
+                        price: float, ma20_val: float):
+        """统一评分: on_bar和on_tick共用, 不依赖DataFrame回看数据
+
+        Returns:
+            (short_score, long_score, short_base, chop_short,
+             trend_pullback, oversold_bounce, chop_long, long_near_ma)
+        """
+        # === 做空评分 ===
+        short_base = self._trend_down and adx >= ADX_SHORT_MIN
+        short_macd_dead = macdh < 0
+        short_rsi_overbought = rsi >= RSI_SHORT_ENTRY
+
+        short_score = 0
+        if short_base: short_score += 3
+        if short_macd_dead: short_score += 2
+        if adx >= ADX_SHORT_STRONG: short_score += 2
+        if short_rsi_overbought: short_score += 2
+
+        chop_short = self._trend_flat and rsi >= RSI_SHORT_ENTRY and short_macd_dead and price > ma20_val
+        if chop_short: short_score += 3
+
+        # P0: RSI超买强制做空 (不依赖trend方向)
+        if rsi >= RSI_OVBOUGHT_FORCE_SHORT:
+            ob_score = 6
+            if short_macd_dead: ob_score += 2
+            if adx > ADX_NO_TRADE: ob_score += 1
+            short_score = max(short_score, ob_score)
+
+        # === 做多评分 ===
+        long_near_ma = abs(price - ma20_val) / max(ma20_val, 1) < 0.02
+        trend_pullback = self._trend_up and rsi >= 35 and rsi <= RSI_LONG_MAX_ENTRY
+        oversold_bounce = rsi <= RSI_LONG_ENTRY and (self._trend_flat or self._trend_up)
+        # P: RSI 52-60上涨趋势跟多 (放开无人区)
+        up_trend_follow = self._trend_up and rsi > 52 and rsi <= RSI_LONG_MAX_ENTRY
+
+        long_score = 0
+        if rsi <= RSI_LONG_MAX_ENTRY: long_score += 1
+        if trend_pullback: long_score += 4
+        if up_trend_follow: long_score += 3  # RSI中性区跟趋势
+        if oversold_bounce: long_score += 3
+        if long_near_ma: long_score += 2
+        if rsi <= 30: long_score += 1
+
+        chop_long = self._trend_flat and rsi >= 30 and rsi <= RSI_LONG_MAX_ENTRY and macdh > 0 and long_near_ma
+        if chop_long: long_score += 3
+
+        return (short_score, long_score, short_base, chop_short,
+                trend_pullback, oversold_bounce, chop_long, long_near_ma)
 
     # ==================== K线闭合: 指标更新 ====================
 
@@ -408,6 +463,8 @@ class OptimizedV6:
         adx = self.latest_indicators["adx"]
 
         # === 持仓管理: 硬止损(K线闭合保护) ===
+        # 注意: PnL记录由上层(run_strategy_on_closed_bar)统一完成,
+        # 避免与record_trade_result双重调用导致连续亏损双计
         if has_position:
             if pos_side == 'long':
                 pnl_bp = (c - pos_entry) / pos_entry * 10000
@@ -415,19 +472,16 @@ class OptimizedV6:
                     logger.info(f"📡 K线: SELL (止损 | PnL={pnl_bp:.0f}bp)")
                     self.last_exit_bar = idx
                     self.active_limit_order = None
-                    self.record_trade_result((c - pos_entry) / pos_entry)
                     return Report("SELL")
                 if rsi > RSI_LONG_EXIT and bars_held >= MIN_HOLD_BARS:
                     logger.info(f"📡 K线: SELL (RSI={rsi:.0f}>{RSI_LONG_EXIT}超买)")
                     self.last_exit_bar = idx
                     self.active_limit_order = None
-                    self.record_trade_result((c - pos_entry) / pos_entry)
                     return Report("SELL")
                 if bars_held >= MAX_HOLD_BARS:
                     logger.info(f"📡 K线: SELL (超时| {bars_held}根)")
                     self.last_exit_bar = idx
                     self.active_limit_order = None
-                    self.record_trade_result((c - pos_entry) / pos_entry)
                     return Report("SELL")
             elif pos_side == 'short':
                 pnl_bp = (pos_entry - c) / pos_entry * 10000
@@ -435,19 +489,16 @@ class OptimizedV6:
                     logger.info(f"📡 K线: COVER (止损 | PnL={pnl_bp:.0f}bp)")
                     self.last_exit_bar = idx
                     self.active_limit_order = None
-                    self.record_trade_result((pos_entry - c) / pos_entry)
                     return Report("COVER")
                 if rsi < RSI_SHORT_EXIT and bars_held >= MIN_HOLD_BARS:
                     logger.info(f"📡 K线: COVER (RSI={rsi:.0f}<{RSI_SHORT_EXIT}超卖)")
                     self.last_exit_bar = idx
                     self.active_limit_order = None
-                    self.record_trade_result((pos_entry - c) / pos_entry)
                     return Report("COVER")
                 if bars_held >= MAX_HOLD_BARS:
                     logger.info(f"📡 K线: COVER (超时)")
                     self.last_exit_bar = idx
                     self.active_limit_order = None
-                    self.record_trade_result((pos_entry - c) / pos_entry)
                     return Report("COVER")
 
         # 冷却期
@@ -509,7 +560,7 @@ class OptimizedV6:
                     return 'short'
             return False
 
-        # === 信号评估 v7.7 (支持所有regime) ===
+        # === 统一评分 (使用 _compute_scores, on_bar和on_tick共用) ===
         short_signal = False
         long_signal = False
         short_reason = ""
@@ -518,80 +569,48 @@ class OptimizedV6:
         if not has_position and not in_cooldown:
             macdh = self.latest_indicators["macdh"]
             ma20_val = self.latest_indicators["ma20"]
-            long_near_ma = abs(c - ma20_val) / max(ma20_val, 1) < 0.02
+
+            # 回看数据: 连续K线确认 + 突破确认 (仅on_bar有df)
             long_continuation = _check_trend_continuation(df, idx, 'up')
             short_continuation = _check_trend_continuation(df, idx, 'down')
             short_breakout = _check_breakout(df, idx, 'short')
             long_breakout = _check_breakout(df, idx, 'long')
 
-            # === 做空评分 ===
-            short_base = self._trend_down and adx >= ADX_SHORT_MIN  # 趋势向下+ADX够高
-            short_rsi_overbought = rsi >= RSI_SHORT_ENTRY  # RSI超买
-            short_macd_dead = macdh < 0  # MACD死叉
-            short_score = 0
-            if short_base: short_score += 3
-            if short_macd_dead: short_score += 2
-            if adx >= ADX_SHORT_STRONG: short_score += 2
-            if short_rsi_overbought: short_score += 2
+            # 统一评分
+            (short_score, long_score, short_base, chop_short,
+             trend_pullback, oversold_bounce, chop_long, long_near_ma) = \
+                self._compute_scores(rsi, adx, macdh, c, ma20_val)
+
+            # on_bar特有大数据加分: 连续K线 + 突破
             if short_continuation: short_score += 2
             if short_breakout: short_score += 1
-
-            # 盘整做空路径: 无明确趋势但RSI超买+MACD死叉+价格在MA之上
-            chop_short = self._trend_flat and rsi >= RSI_SHORT_ENTRY and short_macd_dead and c > ma20_val
-            if chop_short: short_score += 3
-
-            if not short_base and not chop_short:
-                if not self._trend_down: short_reason += "not_trend_down "
-                if not short_macd_dead: short_reason += f"macdh={macdh:.1f}>=0 "
-                if not short_rsi_overbought: short_reason += f"rsi={rsi:.0f}<{RSI_SHORT_ENTRY} "
-
-            short_signal = (short_base or chop_short) and short_score >= 6 and rsi >= RSI_SHORT_MIN
-
-            # === 做多评分 ===
-            trend_pullback = self._trend_up and rsi >= 35 and rsi <= RSI_LONG_MAX_ENTRY
-            oversold_bounce = rsi <= RSI_LONG_ENTRY and (self._trend_flat or self._trend_up)
-            trend_continuation_long = self._trend_up and adx > ADX_NO_TRADE and long_continuation
-
-            long_score = 0
-            if rsi <= RSI_LONG_MAX_ENTRY: long_score += 1
-            if trend_pullback: long_score += 4
-            if oversold_bounce: long_score += 3
-            if trend_continuation_long: long_score += 4
-            if long_near_ma: long_score += 2
+            if long_continuation: long_score += 4  # 趋势延续确认加分 (需要DataFrame回看)
             if long_breakout: long_score += 1
-            if rsi <= 30: long_score += 1
-
-            # 盘整做多路径: MA附近+RSI中低+MACD金叉
-            chop_long = self._trend_flat and rsi >= 30 and rsi <= RSI_LONG_MAX_ENTRY and macdh > 0 and long_near_ma
-            if chop_long: long_score += 3
-
-            long_signal = (trend_pullback or oversold_bounce or trend_continuation_long or chop_long) and long_score >= 5
 
             # 盘整突破信号
             consolidation = _check_consolidation_breakout(df, idx, adx)
-            if consolidation == 'short' and not has_position and not in_cooldown:
+            if consolidation == 'short':
                 short_signal = True
                 short_score = max(short_score, 6)
-            elif consolidation == 'long' and not has_position and not in_cooldown:
+            elif consolidation == 'long':
                 long_signal = True
                 long_score = max(long_score, 5)
 
-            # 保存评分供 Dashboard 日志使用
+            # 信号判定 (阈值统一)
+            trend_continuation_long = self._trend_up and adx > ADX_NO_TRADE and long_continuation
+            long_ok = (trend_pullback or oversold_bounce or trend_continuation_long or chop_long or up_trend_follow)
+            short_signal = short_signal or ((short_base or chop_short) and short_score >= 6 and rsi >= RSI_SHORT_MIN)
+            long_signal = long_signal or (long_ok and long_score >= 5)
+
+            # 日志诊断
+            if not short_base and not chop_short:
+                if not self._trend_down: short_reason += "not_trend_down "
+                if not (macdh < 0): short_reason += f"macdh={macdh:.1f}>=0 "
+                if not (rsi >= RSI_SHORT_ENTRY): short_reason += f"rsi={rsi:.0f}<{RSI_SHORT_ENTRY} "
+
+            # 保存评分供 Dashboard
             self._signal_ctx = {"long_score": long_score, "short_score": short_score}
 
-            # === P0: RSI超买强制做空 ===
-            # 当RSI≥70时，不管trend状态，直接走超买逆势做空路径
-            rsi_overbought_force = rsi >= RSI_OVBOUGHT_FORCE_SHORT
-            if not has_position and not in_cooldown and rsi_overbought_force:
-                # 超买做空评分: base + RSI溢价
-                ob_short_score = 6  # 直接6分起步
-                if short_macd_dead: ob_short_score += 2
-                if adx > ADX_NO_TRADE: ob_short_score += 1
-                short_signal = True
-                short_score = max(short_score, ob_short_score)
-                short_reason = f"RSI={rsi:.0f}≥{RSI_OVBOUGHT_FORCE_SHORT}超买逆势"
-
-            # 诊断日志 (每根闭合K线)
             log_parts = [
                 f"RSI={rsi:.0f} ADX={adx:.0f} MACDh={macdh:.1f}{'✗' if macdh<0 else ''}",
                 f"regime={self._regime}",
@@ -613,7 +632,6 @@ class OptimizedV6:
                 elif self._trend_up:
                     short_signal = False
                 elif self._trend_flat:
-                    # 盘整: 选分数高的
                     if short_score >= long_score:
                         long_signal = False
                     else:
@@ -622,34 +640,11 @@ class OptimizedV6:
                     short_signal = False
                     long_signal = False
         elif has_position:
-            # 有持仓时也更新评分供 Dashboard 日志使用
-            # 使用最新价格/指标计算（不影响信号，只做显示）
+            # 有持仓时只更新评分供Dashboard
             try:
-                macdh = self.latest_indicators["macdh"]
                 ma20_val = self.latest_indicators["ma20"]
-                long_near_ma = abs(c - ma20_val) / max(ma20_val, 1) < 0.02
-                short_base = self._trend_down and adx >= ADX_SHORT_MIN
-                short_rsi_overbought = rsi >= RSI_SHORT_ENTRY
-                short_macd_dead = macdh < 0
-                hold_short_score = 0
-                if short_base: hold_short_score += 3
-                if short_macd_dead: hold_short_score += 2
-                if adx >= ADX_SHORT_STRONG: hold_short_score += 2
-                if short_rsi_overbought: hold_short_score += 2
-                chop_short = self._trend_flat and rsi >= RSI_SHORT_ENTRY and short_macd_dead and c > ma20_val
-                if chop_short: hold_short_score += 3
-                trend_pullback = self._trend_up and rsi >= 35 and rsi <= RSI_LONG_MAX_ENTRY
-                oversold_bounce = rsi <= RSI_LONG_ENTRY and (self._trend_flat or self._trend_up)
-                trend_continuation_long = self._trend_up and adx > ADX_NO_TRADE
-                hold_long_score = 0
-                if rsi <= RSI_LONG_MAX_ENTRY: hold_long_score += 1
-                if trend_pullback: hold_long_score += 4
-                if oversold_bounce: hold_long_score += 3
-                if trend_continuation_long: hold_long_score += 4
-                if long_near_ma: hold_long_score += 2
-                if rsi <= 30: hold_long_score += 1
-                chop_long = self._trend_flat and rsi >= 30 and rsi <= RSI_LONG_MAX_ENTRY and macdh > 0 and long_near_ma
-                if chop_long: hold_long_score += 3
+                (hold_short_score, hold_long_score, _, _, _, _, _, _) = \
+                    self._compute_scores(rsi, adx, self.latest_indicators.get("macdh", 0), c, ma20_val)
                 self._signal_ctx = {"long_score": hold_long_score, "short_score": hold_short_score}
             except Exception:
                 self._signal_ctx = {"long_score": 0, "short_score": 0}
@@ -695,7 +690,6 @@ class OptimizedV6:
         }
         """
         result = {"action": "HOLD", "side": "", "limit_price": 0, "size": 0, "message": ""}
-        import time
 
         rsi = self.latest_indicators.get("rsi", 50)
         adx = self.latest_indicators.get("adx", 20)
@@ -719,6 +713,7 @@ class OptimizedV6:
                 atr_stop_dist = max(atr * 1.0, entry_p * STOP_LOSS_LONG_BP / 10000)
                 atr_stop_price = entry_p - atr_stop_dist
                 if current_price <= atr_stop_price:
+                    self.record_trade_result(pnl_bp / 10000)
                     logger.info(f"⚡ ATR止损: SELL @{current_price:.0f} (ATR_stop@{atr_stop_price:.0f}) PnL={pnl_bp:.0f}bp")
                     result["action"] = "EXECUTE"
                     result["side"] = "sell"
@@ -728,9 +723,9 @@ class OptimizedV6:
 
                 # P1: 简化止盈(多头) — 20bp利润直接全平(不分批)
                 if pnl_bp >= 20 and self._entry_time > 0:
-                    import time as _t
-                    hold_sec = _t.time() - self._entry_time
+                    hold_sec = time.time() - self._entry_time
                     if hold_sec >= MIN_HOLD_TICK_SEC:
+                        self.record_trade_result(pnl_bp / 10000)
                         logger.info(f"⚡ 止盈(20bp): SELL @{current_price:.0f} PnL={pnl_bp:.0f}bp (hold={hold_sec:.0f}s)")
                         result["action"] = "EXECUTE"
                         result["side"] = "sell"
@@ -752,6 +747,7 @@ class OptimizedV6:
 
                 # 触发追踪止损
                 if self._trailing_stop_price > 0 and current_price <= self._trailing_stop_price:
+                    self.record_trade_result(pnl_bp / 10000)
                     logger.info(f"⚡ 追踪止损失效: SELL @{current_price:.0f} (追踪@{self._trailing_stop_price:.0f})")
                     result["action"] = "EXECUTE"
                     result["side"] = "sell"
@@ -761,6 +757,7 @@ class OptimizedV6:
 
                 # 触发追踪止盈
                 if self._trailing_tp_price > 0 and current_price >= self._trailing_tp_price:
+                    self.record_trade_result(pnl_bp / 10000)
                     logger.info(f"⚡ 追踪止盈: SELL @{current_price:.0f} (TP@{self._trailing_tp_price:.0f}) PnL={pnl_bp:.0f}bp")
                     result["action"] = "EXECUTE"
                     result["side"] = "sell"
@@ -771,25 +768,33 @@ class OptimizedV6:
                 # RSI 平仓 (超买 — 最后防线, 需要最少持有时间+利润覆盖手续费)
                 if rsi > RSI_LONG_EXIT:
                     hold_sec = time.time() - self._entry_time if self._entry_time > 0 else 0
-                    if hold_sec < MIN_HOLD_TICK_SEC and pnl_bp > 0:
-                        # 持有时间不够或利润不够手续费: 跳过RSI退出，等ATR止盈
+                    # 亏损时: 必须有足够持有时间才能退出(给ATR止盈时间)
+                    # 盈利时: 需要利润 ≥ 手续费 + 最短持有时间
+                    can_exit = False
+                    if pnl_bp >= RSI_LONG_EXIT_MIN_PROFIT_BP:
+                        # 利润足够覆盖手续费: 随时可以退出(无需hold_sec检查, 止盈不等待)
+                        can_exit = True
+                    elif pnl_bp > 0:
+                        # 微利(<12bp): 等ATR止盈, 不退出
                         pass
                     else:
-                        # 有利润但不够手续费时继续持有等ATR止盈
-                        if pnl_bp > 0 and pnl_bp < RSI_LONG_EXIT_MIN_PROFIT_BP:
-                            pass
-                        else:
-                            logger.info(f"⚡ Tick RSI={rsi:.0f}>{RSI_LONG_EXIT} → SELL (hold={hold_sec:.0f}s PnL={pnl_bp:.0f}bp)")
-                            result["action"] = "EXECUTE"
-                            result["side"] = "sell"
-                            result["message"] = f"RSI={rsi:.0f} PnL={pnl_bp:.0f}bp"
-                            self._reset_trade_state()
-                            return result
+                        # 亏损: 必须有足够持有时间才退出(否则等ATR止盈逆转)
+                        if hold_sec >= MIN_HOLD_TICK_SEC * 3:  # 至少60秒
+                            can_exit = True
+                    if can_exit:
+                        self.record_trade_result(pnl_bp / 10000)
+                        logger.info(f"⚡ Tick RSI={rsi:.0f}>{RSI_LONG_EXIT} → SELL (hold={hold_sec:.0f}s PnL={pnl_bp:.0f}bp)")
+                        result["action"] = "EXECUTE"
+                        result["side"] = "sell"
+                        result["message"] = f"RSI={rsi:.0f} PnL={pnl_bp:.0f}bp"
+                        self._reset_trade_state()
+                        return result
 
                 # ATR止盈 (部分TP后剩余仓位继续持有)
                 if atr > 0 and pnl_bp > 0:
                     tp_target = entry_p + atr * TP_ATR_MULT
                     if current_price >= tp_target:
+                        self.record_trade_result(pnl_bp / 10000)
                         logger.info(f"⚡ ATR止盈: SELL @{current_price:.0f} (TP@{tp_target:.0f}) PnL={pnl_bp:.0f}bp")
                         result["action"] = "EXECUTE"
                         result["side"] = "sell"
@@ -807,6 +812,7 @@ class OptimizedV6:
                 atr_stop_dist = max(atr * 1.0, entry_p * STOP_LOSS_SHORT_BP / 10000)
                 atr_stop_price = entry_p + atr_stop_dist
                 if current_price >= atr_stop_price:
+                    self.record_trade_result(pnl_bp / 10000)
                     logger.info(f"⚡ ATR止损: COVER @{current_price:.0f} (ATR_stop@{atr_stop_price:.0f}) PnL={pnl_bp:.0f}bp")
                     result["action"] = "EXECUTE"
                     result["side"] = "short_cover"
@@ -816,9 +822,9 @@ class OptimizedV6:
 
                 # P1: 简化止盈(空头) — 20bp利润直接全平(不分批)
                 if pnl_bp >= 20 and self._entry_time > 0:
-                    import time as _t
-                    hold_sec = _t.time() - self._entry_time
+                    hold_sec = time.time() - self._entry_time
                     if hold_sec >= MIN_HOLD_TICK_SEC:
+                        self.record_trade_result(pnl_bp / 10000)
                         logger.info(f"⚡ 止盈(20bp): COVER @{current_price:.0f} PnL={pnl_bp:.0f}bp (hold={hold_sec:.0f}s)")
                         result["action"] = "EXECUTE"
                         result["side"] = "short_cover"
@@ -838,8 +844,9 @@ class OptimizedV6:
                         self._trailing_tp_price = new_tp
                         logger.info(f"🔒 追踪止盈: PnL={pnl_bp:.0f}bp, TP@{new_tp:.0f}")
 
-                # 触发追踪止损
+# 触发追踪止损
                 if self._trailing_stop_price > 0 and current_price >= self._trailing_stop_price:
+                    self.record_trade_result(pnl_bp / 10000)
                     logger.info(f"⚡ 追踪止损失效: COVER @{current_price:.0f} (追踪@{self._trailing_stop_price:.0f})")
                     result["action"] = "EXECUTE"
                     result["side"] = "short_cover"
@@ -849,6 +856,7 @@ class OptimizedV6:
 
                 # 触发追踪止盈
                 if self._trailing_tp_price > 0 and current_price <= self._trailing_tp_price:
+                    self.record_trade_result(pnl_bp / 10000)
                     logger.info(f"⚡ 追踪止盈: COVER @{current_price:.0f} (TP@{self._trailing_tp_price:.0f}) PnL={pnl_bp:.0f}bp")
                     result["action"] = "EXECUTE"
                     result["side"] = "short_cover"
@@ -856,19 +864,32 @@ class OptimizedV6:
                     self._reset_trade_state()
                     return result
 
-                # RSI平仓 (超卖解除)
+# RSI平仓 (超卖解除)
                 if rsi > 0 and rsi < RSI_SHORT_EXIT:
-                    logger.info(f"⚡ Tick RSI={rsi:.0f}<{RSI_SHORT_EXIT} → COVER")
-                    result["action"] = "EXECUTE"
-                    result["side"] = "short_cover"
-                    result["message"] = f"RSI={rsi:.0f} PnL={pnl_bp:.0f}bp"
-                    self._reset_trade_state()
-                    return result
+                    hold_sec = time.time() - self._entry_time if self._entry_time > 0 else 0
+                    # 同LONG RSI退出逻辑: 亏损时需足够持有时间, 盈利时需覆盖手续费
+                    can_exit = False
+                    if pnl_bp >= RSI_LONG_EXIT_MIN_PROFIT_BP:
+                        can_exit = True
+                    elif pnl_bp > 0:
+                        pass  # 微利等ATR止盈
+                    else:
+                        if hold_sec >= MIN_HOLD_TICK_SEC * 3:  # 至少60秒
+                            can_exit = True
+                    if can_exit:
+                        self.record_trade_result(pnl_bp / 10000)
+                        logger.info(f"⚡ Tick RSI={rsi:.0f}<{RSI_SHORT_EXIT} → COVER (hold={hold_sec:.0f}s PnL={pnl_bp:.0f}bp)")
+                        result["action"] = "EXECUTE"
+                        result["side"] = "short_cover"
+                        result["message"] = f"RSI={rsi:.0f} PnL={pnl_bp:.0f}bp"
+                        self._reset_trade_state()
+                        return result
 
                 # ATR止盈 (全仓部分止盈后剩余的继续持有到ATR×1.5)
                 if atr > 0 and pnl_bp > 0:
                     tp_target = entry_p - atr * TP_ATR_MULT
                     if current_price <= tp_target:
+                        self.record_trade_result(pnl_bp / 10000)
                         logger.info(f"⚡ ATR止盈: COVER @{current_price:.0f} (TP@{tp_target:.0f}) PnL={pnl_bp:.0f}bp")
                         result["action"] = "EXECUTE"
                         result["side"] = "short_cover"
@@ -882,6 +903,7 @@ class OptimizedV6:
                 hold_sec = time.time() - self._entry_time
                 if hold_sec >= MAX_HOLD_TIME_SEC_ANY:
                     exit_side = 'sell' if side == 'long' else 'short_cover'
+                    self.record_trade_result(pnl_bp / 10000)
                     logger.info(f"⏰ 时效止损({MAX_HOLD_TIME_SEC_ANY/3600:.0f}h): {exit_side.upper()} @{current_price:.0f} PnL={pnl_bp:.0f}bp")
                     result["action"] = "EXECUTE"
                     result["side"] = exit_side
@@ -890,6 +912,7 @@ class OptimizedV6:
                     return result
                 elif hold_sec >= MAX_HOLD_TIME_SEC_LOW_PROFIT and pnl_bp < MIN_PROFIT_BP_BEFORE_TIME_LIMIT:
                     exit_side = 'sell' if side == 'long' else 'short_cover'
+                    self.record_trade_result(pnl_bp / 10000)
                     logger.info(f"⏰ 低利润时效({MAX_HOLD_TIME_SEC_LOW_PROFIT/3600:.0f}h PnL={pnl_bp:.0f}bp): {exit_side.upper()} @{current_price:.0f}")
                     result["action"] = "EXECUTE"
                     result["side"] = exit_side
@@ -900,13 +923,17 @@ class OptimizedV6:
         # ===== 无持仓: 检查限价单成交 + 新信号 =====
         if not has_position:
 
-            # 1. 检查现有限价单
+            # 1. 检查现有限价单 (限价单成交不受冷却限制)
             if self.active_limit_order is not None:
                 fill_action = self._check_fill_limits(executor, current_price)
                 if fill_action:
                     result["action"] = fill_action
                     return result
                 # 还在等成交，不用重复评估
+                return result
+
+            # P0: 平仓后冷却 — 任何平仓后60秒内禁止反手开仓(防同秒/同bar双向)
+            if self._last_trade_time > 0 and time.time() - self._last_trade_time < COOLDOWN_EXIT_TICK_SEC:
                 return result
 
 # 2. 亏损后冷却 — 亏损越大冷却越久(最多2400秒)
@@ -933,100 +960,67 @@ class OptimizedV6:
 
             macdh = self.latest_indicators.get("macdh", 0)
             ma20_val = self.latest_indicators.get("ma20", current_price)
-            long_near_ma = abs(current_price - ma20_val) / max(ma20_val, 1) < 0.02
 
-            # 多空互斥
+            # === 统一评分入口 (使用 _compute_scores, 与on_bar共用) ===
+            (short_score, long_score, short_base, chop_short,
+             trend_pullback, oversold_bounce, chop_long, long_near_ma) = \
+                self._compute_scores(rsi, adx, macdh, current_price, ma20_val)
+
+            # 方向限制 (仅供评分路径过滤)
             short_disabled = self._trend_up
-            long_disabled = self._trend_down or self._regime == "strong_trend"
 
-            # === 做空入口 (趋势+盘整两条路) ===
-            short_base = self._trend_down and adx >= ADX_SHORT_MIN
-            short_macd_dead = macdh < 0
             short_placed = False
 
-            # 趋势做空: trend_down + MACD死叉 + RSI超买
-            if not short_disabled and short_base and short_macd_dead and rsi >= RSI_SHORT_ENTRY and rsi >= RSI_SHORT_MIN:
-                size = self.get_position_size(executor.cash, current_price, 10, atr, "short")
-                limit_price = self._get_limit_price(current_price, "short_sell")
-                lo = LimitOrder("short_sell", limit_price, size, "entry")
+            # === 做空入口: 评分≥6 (统一处理趋势做空/盘整做空/超买逆势) ===
+            if short_score >= 6 and rsi >= RSI_SHORT_MIN:
+                p0_force = rsi >= RSI_OVBOUGHT_FORCE_SHORT
+                can_short = p0_force or not short_disabled  # P0绕过方向限制
+                if can_short:
+                    if p0_force and self._last_signal_price > 0:
+                        # P0额外检查: 价格需从近期高点回落至少4bp (防追高)
+                        # _last_signal_price=0时跳过(首次触发,无法计算回落)
+                        if current_price >= self._last_signal_price * (1 - RSI_OVBOUGHT_EXIT_BUMP / 10000):
+                            can_short = False
+                    if can_short:
+                        size = self.get_position_size(executor.cash, current_price, 10, atr, "short")
+                        limit_price = self._get_limit_price(current_price, "short_sell")
+                        lo = LimitOrder("short_sell", limit_price, size, "entry")
+                        lo.placed_at = time.time()
+                        self.active_limit_order = lo
+                        self._last_entry_price = current_price
+                        self._last_entry_try = time.time()
+                        self._last_signal_price = current_price
+                        result["action"] = "PLACE_LIMIT"
+                        result["side"] = "short_sell"
+                        result["limit_price"] = limit_price
+                        result["size"] = size
+                        short_placed = True
+                        tag = "P0" if p0_force else ("chop" if chop_short else "trend")
+                        result["message"] = f"SHORT({tag}) limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f} ADX={adx:.0f} score={short_score}"
+                        logger.info(f"📋 {result['message']} | size={size:.6f}")
+
+            # === 做多入口: 评分≥5 (移除 long_near_ma 硬限制, 趋势跟多不需要贴MA20) ===
+            if not short_placed and long_score >= 5:
+                size = self.get_position_size(executor.cash, current_price, 10, atr, "long")
+                limit_price = self._get_limit_price(current_price, "buy")
+                lo = LimitOrder("buy", limit_price, size, "entry")
                 lo.placed_at = time.time()
                 self.active_limit_order = lo
                 self._last_entry_price = current_price
                 self._last_entry_try = time.time()
                 self._last_signal_price = current_price
                 result["action"] = "PLACE_LIMIT"
-                result["side"] = "short_sell"
+                result["side"] = "buy"
                 result["limit_price"] = limit_price
                 result["size"] = size
-                result["message"] = f"SHORT limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) macdh={macdh:.1f} ADX={adx:.0f} RSI={rsi:.0f}"
-                short_placed = True
-
-            # 盘整做空: flat趋势 + RSI超买 + MACD死叉 + 价格>MA20
-            if not short_disabled and not short_placed and self._trend_flat and rsi >= RSI_SHORT_ENTRY and short_macd_dead and current_price > ma20_val:
-                size = self.get_position_size(executor.cash, current_price, 10, atr, "short")
-                limit_price = self._get_limit_price(current_price, "short_sell")
-                lo = LimitOrder("short_sell", limit_price, size, "entry")
-                lo.placed_at = time.time()
-                self.active_limit_order = lo
-                self._last_entry_price = current_price
-                self._last_entry_try = time.time()
-                self._last_signal_price = current_price
-                result["action"] = "PLACE_LIMIT"
-                result["side"] = "short_sell"
-                result["limit_price"] = limit_price
-                result["size"] = size
-                result["message"] = f"SHORT(chop) limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f} ADX={adx:.0f}"
-                short_placed = True
-
-            # === P0: RSI超买强制做空 (Tick级) ===
-            # 当RSI≥70时，不依赖trend方向，直接在价格从超买区回落时做空
-            if not short_placed and rsi >= RSI_OVBOUGHT_FORCE_SHORT:
-                # 计算价格回落: 当前价低于近期最高价至少RSI_OVBOUGHT_EXIT_BUMP bp
-                if current_price < self._last_signal_price * (1 - RSI_OVBOUGHT_EXIT_BUMP / 10000):
-                    size = self.get_position_size(executor.cash, current_price, 10, atr, "short")
-                    limit_price = self._get_limit_price(current_price, "short_sell")
-                    lo = LimitOrder("short_sell", limit_price, size, "entry")
-                    lo.placed_at = time.time()
-                    self.active_limit_order = lo
-                    self._last_entry_price = current_price
-                    self._last_entry_try = time.time()
-                    self._last_signal_price = current_price
-                    result["action"] = "PLACE_LIMIT"
-                    result["side"] = "short_sell"
-                    result["limit_price"] = limit_price
-                    result["size"] = size
-                    result["message"] = f"SHORT(overbought) limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f}"
-                    short_placed = True
-                    logger.info(f"📋 RSI超买强制做空: {result['message']} | size={size:.6f}")
-
-            # === 做多入口 (上涨回踩/趋势延续/超卖反弹/盘整金叉) ===
-            if not short_placed:
-                trend_pullback_long = self._trend_up and rsi >= 38 and rsi <= RSI_LONG_MAX_ENTRY
-                oversold_long = rsi <= RSI_LONG_ENTRY and (self._trend_flat or self._trend_up)
-                chop_golden_long = self._trend_flat and rsi >= 30 and rsi <= RSI_LONG_MAX_ENTRY and macdh > 0 and long_near_ma
-                strong_trend_long = self._trend_up and adx > 20 and rsi >= 35 and rsi < RSI_LONG_EXIT and long_near_ma
-
-                if not long_disabled and (trend_pullback_long or oversold_long or chop_golden_long or strong_trend_long) and long_near_ma:
-                    size = self.get_position_size(executor.cash, current_price, 10, atr, "long")
-                    limit_price = self._get_limit_price(current_price, "buy")
-                    lo = LimitOrder("buy", limit_price, size, "entry")
-                    lo.placed_at = time.time()
-                    self.active_limit_order = lo
-                    self._last_entry_price = current_price
-                    self._last_entry_try = time.time()
-                    self._last_signal_price = current_price
-                    result["action"] = "PLACE_LIMIT"
-                    result["side"] = "buy"
-                    result["limit_price"] = limit_price
-                    result["size"] = size
-                    result["message"] = f"LONG limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f} ADX={adx:.0f}"
-                    logger.info(f"📋 {result['message']} | size={size:.6f}")
+                tag = "chop" if chop_long else ("pullback" if trend_pullback else "oversold")
+                result["message"] = f"LONG({tag}) limit @ ${limit_price:.0f} (mkt=${current_price:,.0f}) RSI={rsi:.0f} ADX={adx:.0f} score={long_score}"
+                logger.info(f"📋 {result['message']} | size={size:.6f}")
 
         return result
 
     def _reset_trade_state(self):
         """平仓后重置交易状态"""
-        import time
         self._last_trade_time = time.time()
         self._trailing_stop_price = 0
         self._trailing_tp_price = 0
@@ -1041,6 +1035,7 @@ class OptimizedV6:
     def record_trade_result(self, pnl_raw: float):
         """引擎平仓后调用, 记录盈亏和连续亏损计数"""
         self._last_trade_pnl = pnl_raw
+        self._last_trade_time = time.time()  # 设置退出时间, 用于冷却计时
         if pnl_raw < 0:
             self._consecutive_losses += 1
         else:

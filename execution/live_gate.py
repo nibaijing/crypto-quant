@@ -148,20 +148,21 @@ class LiveGate:
         details["size_by_loss"] = round(size, 6)
         details["max_loss"] = round(abs(price - stop_loss) * size, 2)
 
-        # 6. 单笔上限
+        # 6. 单笔上限 (保证金占比约束)
         trade_value = size * price
-        max_single = equity * self.config.risk.max_single_position_pct
-        if trade_value > max_single:
+        margin = trade_value / leverage
+        max_single_margin = equity * self.config.risk.max_single_position_pct
+        if margin > max_single_margin:
             return GateResult(
                 False,
-                f"单笔仓位 ${trade_value:,.0f} 超过上限 ${max_single:,.0f} "
-                f"(equity ${equity:,.0f} × {self.config.risk.max_single_position_pct:.0%})",
+                f"保证金 ${margin:,.0f} (仓位 ${trade_value:,.0f}) 超过单笔上限 "
+                f"${max_single_margin:,.0f} (equity ${equity:,.0f} × {self.config.risk.max_single_position_pct:.0%}"
+                f" → 最大仓位 ${max_single_margin * leverage:,.0f})",
                 details=details,
             )
         details["single_limit"] = "ok"
 
         # 7. 保证金充足
-        margin = trade_value / leverage
         if margin > cash * 0.95:
             return GateResult(
                 False,

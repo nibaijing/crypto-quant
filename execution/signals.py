@@ -49,7 +49,7 @@ class SignalReport:
     bars_since_last_trade: int = 0
     is_cooldown: bool = False
     lgb_opinion: str = "no_opinion"  # agree | disagree | no_opinion
-    current_position: Optional[str] = None  # None | "long" | "short"
+    current_position: Optional[dict] = None  # None | {"side":..., "entry_price":..., ...}
     position_pnl_pct: Optional[float] = None  # 当前持仓未实现盈亏% (杠杆回报), 平仓决策时注入
 
     # === K线形态 ===
@@ -152,7 +152,9 @@ class SignalReport:
         lines.append("## Context")
         if self.current_position:
             pnl_str = f"{self.position_pnl_pct:+.1f}%" if self.position_pnl_pct is not None else "N/A"
-            lines.append(f"Current position: {self.current_position.upper()} | Unrealized PnL: {pnl_str}")
+            pos_side = self.current_position.get("side", "?")
+            pos_entry = self.current_position.get("entry_price", 0)
+            lines.append(f"Current position: {pos_side.upper()} @ ${pos_entry:,.0f} | Unrealized PnL: {pnl_str}")
         lines.append(f"Bars since last trade: {self.bars_since_last_trade}")
         if self.is_cooldown:
             lines.append("\u26a0\ufe0f In cooldown period (recently exited a position)")

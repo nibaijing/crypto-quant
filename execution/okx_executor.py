@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 
 from core.config import get_config
 from core.exchange_adapter import OKXAdapter, OrderSide, OrderType, PositionSide, AccountInfo, Position, Order
+from execution.base_executor import BaseExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class OKXAccount:
     risk_level: str = "SAFE"  # SAFE, WARNING, DANGER
 
 
-class OKXExecutor:
+class OKXExecutor(BaseExecutor):
     """OKX实盘执行器
     
     核心属性:
@@ -139,6 +140,11 @@ class OKXExecutor:
         return self._winning_trades
 
     @property
+    def leverage(self) -> int:
+        """当前杠杆倍数"""
+        return self._leverage
+
+    @property
     def api_connected(self) -> bool:
         return self._api_connected
 
@@ -188,7 +194,7 @@ class OKXExecutor:
             logger.error(f"同步持仓失败: {e}")
             return None
 
-    def _check_risk(self, symbol: str, side: str, size: float) -> tuple[bool, str]:
+    def _check_risk(self, symbol: str, side: str, size: float, price: float) -> tuple[bool, str]:
         """风控检查
         
         Returns:
@@ -203,17 +209,19 @@ class OKXExecutor:
             return False, f"连续亏损{self._consecutive_losses}次，暂停交易"
         
         # 检查单笔交易限制
-        trade_value = size * self._get_current_price(symbol)
-        max_trade = account.total_equity * self.config.risk.max_single_position_pct
-        if trade_value > max_trade:
-            return False, f"单笔交易${trade_value:.0f}超过限制${max_trade:.0f}"
+        trade_value = size * price
+        margin = trade_value / self._leverage
+        max_margin = account.total_equity * self.config.risk.max_single_position_pct
+        if margin > max_margin:
+            return False, f"保证金${margin:.0f}(仓位${trade_value:.0f})超过单笔上限${max_margin:.0f}"
         
-        # 检查总仓位
+        # 检查总仓位 (保证金占比约束)
         current_positions = account.positions
-        total_position = sum(p.size * p.mark_price for p in current_positions)
-        max_total = account.total_equity * self.config.risk.max_total_position_pct
-        if total_position + trade_value > max_total:
-            return False, f"总仓位${total_position + trade_value:.0f}超过限制${max_total:.0f}"
+        total_current_margin = sum(p.size * p.mark_price / self._leverage for p in current_positions)
+        total_margin = total_current_margin + margin
+        max_total_margin = account.total_equity * self.config.risk.max_total_position_pct
+        if total_margin > max_total_margin:
+            return False, f"总保证金${total_margin:.0f}超过上限${max_total_margin:.0f}"
         
         # 检查保证金充足性
         required_margin = trade_value / self._leverage
@@ -263,10 +271,14 @@ class OKXExecutor:
             "leverage": self._leverage,
             "updated_at": datetime.now().isoformat(),
         }
-        
+
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.state_file, "w") as f:
             json.dump(state, f, indent=2)
+
+    def save_state(self):
+        """公开持久化接口"""
+        self._save_state()
 
     def _save_order(self, order: OKXOrder):
         """保存订单记录"""
@@ -367,7 +379,7 @@ class OKXExecutor:
             size = max_pos
 
         # 风控检查
-        passed, reason = self._check_risk(symbol, "buy", size)
+        passed, reason = self._check_risk(symbol, "long", size, current_price)
         if not passed:
             logger.warning(f"风控拒绝: {reason}")
             return None
@@ -493,7 +505,7 @@ class OKXExecutor:
             size = max_pos
 
         # 风控检查
-        passed, reason = self._check_risk(symbol, "sell", size)
+        passed, reason = self._check_risk(symbol, "short", size, current_price)
         if not passed:
             logger.warning(f"风控拒绝: {reason}")
             return None

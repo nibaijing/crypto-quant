@@ -166,8 +166,10 @@ class SpotExecutor:
             }
         
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.state_file, "w") as f:
+        tmp = self.state_file.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
+        tmp.replace(self.state_file)
     
     def get_account(self) -> LiveAccount:
         """获取账户快照"""

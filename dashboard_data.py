@@ -454,7 +454,7 @@ def _parse_trades_from_log() -> list:
             })
             continue
 
-        # Tick 止损/止盈 (exit events)
+        # Tick 止损/止盈 (exit events) — 用bp显示
         m_sl = re.search(r'⚡\s*(?:Tick\s+)?(止损|追踪止损(?:失效)?|追踪止盈|ATR止盈|Tick\s+RSI)\S*\s*[→:]\s*(SELL|COVER)\s*@?\$?([\d.,]+).*?PnL=([+-]?[\d.]+)bp', line)
         if m_sl:
             exit_action = m_sl.group(2)
@@ -466,53 +466,61 @@ def _parse_trades_from_log() -> list:
                 "action": exit_map.get(exit_action, exit_action),
                 "price": price,
                 "size": 0,
-                "pnl": round(pnl_bp / 100 * 0.571, 2),  # 估算USD PnL
+                "pnl": 0.0,
                 "pnl_bp": pnl_bp,
             })
             continue
 
         # === v6 旧格式兼容 ===
-        m_open_long = re.search(r'✅\s*合约做多:\s*([\d.]+)\s+\S+\s+@\s*([\d.]+)\s*\|\s*([\d.]+)x', line)
+        m_open_long = re.search(r'✅\s*合约做多:\s*([\d.]+)\s+\S+\s+@\s*([\d.]+)\s*\|\s*([\d.]+)x(?:\s*\|\s*保证金=\$([\d.]+))?', line)
         if m_open_long:
+            margin = float(m_open_long.group(4)) if m_open_long.group(4) else 0.0
             trades.append({
                 "time": line[:19],
                 "action": "做多",
                 "price": float(m_open_long.group(2)),
                 "size": float(m_open_long.group(1)),
                 "leverage": float(m_open_long.group(3)),
+                "margin": margin,
+                "amount": round(float(m_open_long.group(1)) * float(m_open_long.group(2)), 2),  # 开仓金额
                 "pnl": 0.0,
             })
             continue
 
-        m_open_short = re.search(r'✅\s*合约做空:\s*([\d.]+)\s+\S+\s+@\s*([\d.]+)\s*\|\s*([\d.]+)x', line)
+        m_open_short = re.search(r'(?:✅|🔻)\s*合约做空:\s*([\d.]+)\s+\S+\s+@\s*([\d.]+)\s*\|\s*([\d.]+)x(?:\s*\|\s*保证金=\$([\d.]+))?', line)
         if m_open_short:
+            margin = float(m_open_short.group(4)) if m_open_short.group(4) else 0.0
             trades.append({
                 "time": line[:19],
                 "action": "做空",
                 "price": float(m_open_short.group(2)),
                 "size": float(m_open_short.group(1)),
                 "leverage": float(m_open_short.group(3)),
+                "margin": margin,
+                "amount": round(float(m_open_short.group(1)) * float(m_open_short.group(2)), 2),  # 开仓金额
                 "pnl": 0.0,
             })
             continue
 
-        m_close_long = re.search(r'✅\s*合约平多:.*?@\s*([\d.]+).*?净利=\$?([+-]?[\d.]+)', line)
+        m_close_long = re.search(r'✅\s*合约平多:\s*([\d.]+)\s+@\s*([\d.]+).*?净利=\$?([+-]?[\d.]+)', line)
         if m_close_long:
             trades.append({
                 "time": line[:19],
                 "action": "平多",
-                "price": float(m_close_long.group(1)),
-                "pnl": float(m_close_long.group(2)),
+                "price": float(m_close_long.group(2)),
+                "size": float(m_close_long.group(1)) if m_close_long.group(1) else 0,
+                "pnl": float(m_close_long.group(3)),
             })
             continue
 
-        m_close_short = re.search(r'✅\s*合约平空:.*?@\s*([\d.]+).*?净利=\$?([+-]?[\d.]+)', line)
+        m_close_short = re.search(r'✅\s*合约平空:\s*([\d.]+)\s+@\s*([\d.]+).*?净利=\$?([+-]?[\d.]+)', line)
         if m_close_short:
             trades.append({
                 "time": line[:19],
                 "action": "平空",
-                "price": float(m_close_short.group(1)),
-                "pnl": float(m_close_short.group(2)),
+                "price": float(m_close_short.group(2)),
+                "size": float(m_close_short.group(1)) if m_close_short.group(1) else 0,
+                "pnl": float(m_close_short.group(3)),
             })
             continue
 

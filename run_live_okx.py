@@ -33,9 +33,8 @@ import numpy as np
 
 from core.config import get_config, init_config
 from execution.okx_executor import OKXExecutor, OKXAccount
-from execution.signals import default_signal_handler
 from monitor.dashboard_enhanced import save_dashboard, generate_dashboard_html
-from strategies.spot.optimized_v6 import OptimizedStrategy
+from strategies.spot.optimized_v6 import OptimizedV6 as OptimizedStrategy
 from data.pipeline import DataPipeline
 from notifier import notify_trade
 
@@ -181,41 +180,44 @@ def process_tick():
             'leverage': pos.leverage,
         })()
     
-    # 运行策略
+# 运行策略
     try:
-        signal = strategy.on_bar(bar, executor)
+        report = strategy.on_bar(bar, executor)
         executor.update_bars_held()
     except Exception as e:
         logger.error(f"策略执行错误: {e}", exc_info=True)
-        signal = None
-    
+        report = None
+
+    # 提取原始信号
+    raw_signal = report.raw_signal if report else None
+
     # 记录信号
-    if signal and signal != "None" and signal != None:
+    if raw_signal and raw_signal != "HOLD":
         recent_signals.append(
-            f"[{datetime.now().strftime('%H:%M')}] {signal} @ ${close:,.2f}"
+            f"[{datetime.now().strftime('%H:%M')}] {raw_signal} @ ${close:,.2f}"
         )
         if len(recent_signals) > 20:
             recent_signals = recent_signals[-20:]
-    
-    # 执行信号
-    if signal and signal != "HOLD" and signal is not None:
-        logger.info(f"📡 信号: {signal} | close=${close:,.2f}")
 
-        if signal == "LONG" and (not executor.position or executor.position.size == 0):
+    # 执行信号
+    if raw_signal and raw_signal != "HOLD":
+        logger.info(f"📡 信号: {raw_signal} | close=${close:,.2f}")
+
+        if raw_signal == "LONG" and (not executor.position or executor.position.size == 0):
             result = executor.buy(symbol, price=close)
             if result:
-                notify_trade("LONG", close, f"开多仓 {executor._leverage}x")
-        elif signal == "SELL" and executor.position and executor.position.side == "long":
+                notify_trade("LONG", close, f"开多仓 {executor.leverage}x")
+        elif raw_signal == "SELL" and executor.position and executor.position.side == "long":
             lev = executor.position.leverage
             pnl_pct = (close - executor.position.entry_price) / executor.position.entry_price * 100 * lev
             result = executor.sell(symbol, price=close)
             if result:
                 notify_trade("SELL", close, f"平多仓 | PnL={pnl_pct:+.2f}% ({lev}x)")
-        elif signal == "SHORT" and (not executor.position or executor.position.size == 0):
+        elif raw_signal == "SHORT" and (not executor.position or executor.position.size == 0):
             result = executor.short_sell(symbol, price=close)
             if result:
-                notify_trade("SHORT", close, f"开空仓 {executor._leverage}x")
-        elif signal == "COVER" and executor.position and executor.position.side == "short":
+                notify_trade("SHORT", close, f"开空仓 {executor.leverage}x")
+        elif raw_signal == "COVER" and executor.position and executor.position.side == "short":
             lev = executor.position.leverage
             pnl_pct = (executor.position.entry_price - close) / executor.position.entry_price * 100 * lev
             result = executor.short_cover(symbol, price=close)
@@ -230,8 +232,8 @@ def process_tick():
     if executor.position:
         status_parts.append(f"Pos={executor.position.unrealized_pnl_pct:+.2f}%")
     
-    if signal:
-        status_parts.append(f"SIG={signal}")
+    if raw_signal:
+        status_parts.append(f"SIG={raw_signal}")
     
     logger.info(f"📊 {' | '.join(status_parts)}")
 
